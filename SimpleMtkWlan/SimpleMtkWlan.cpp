@@ -336,7 +336,9 @@ bool SimpleMtkWlan::startImpl(IOService *provider)
     pciNub->setBusMasterEnable(true);
     pciNub->setIOEnable(true);
     pciNub->setMemoryEnable(true);
-    pciNub->configWrite8(0x41, 0);
+    /* Intel-style retry timeout tweak; not for MT7927 (vendor config space). */
+    if (pciNub->configRead16(kIOPCIConfigDeviceID) != 0x7927)
+        pciNub->configWrite8(0x41, 0);
     if (pciNub->requestPowerDomainState(kIOPMPowerOn,
                                         (IOPowerConnection *) getParentEntry(gIOPowerPlane), IOPMLowestState) != IOPMNoErr) {
         XYLog("requestPowerDomainState failed\n");
@@ -381,28 +383,97 @@ bool SimpleMtkWlan::startImpl(IOService *provider)
         releaseAll();
         return false;
     }
+    if (pciNub->configRead16(kIOPCIConfigDeviceID) == 0x7927) {
+        /*
+         * MT7927: the firmware, and with it the MAC address, is read from
+         * the Data volume about a minute into boot. The network interface
+         * needs the address, so it is attached by a thread once the HAL
+         * has it.
+         */
+        fMt7927Stop = false;
+        fMt7927ThreadDone = false;
+        retain();
+        if (!mt7927_start_thread(&SimpleMtkWlan::mt7927AttachThread, this)) {
+            release();
+            XYLog("MT7927: could not start the attach thread\n");
+            fHalService->detach(pciNub);
+            super::stop(pciNub);
+            releaseAll();
+            return false;
+        }
+        fMt7927Thread = true;
+        XYLog("MT7927: interface attaches once the firmware is up\n");
+        return true;
+    }
+    return finishStart();
+}
+
+IOReturn SimpleMtkWlan::finishStartAction(OSObject *owner, void *, void *, void *, void *)
+{
+    SimpleMtkWlan *self = OSDynamicCast(SimpleMtkWlan, owner);
+
+    if (self == NULL || self->fMt7927Stop)
+        return kIOReturnAborted;
+    return self->finishStart() ? kIOReturnSuccess : kIOReturnError;
+}
+
+void SimpleMtkWlan::mt7927AttachThread(void *arg, wait_result_t)
+{
+    SimpleMtkWlan *self = (SimpleMtkWlan *)arg;
+    struct ieee80211com *ic = self->fHalService->get80211Controller();
+    int i;
+
+    /* Firmware wait (180 s) plus bring-up, with margin. */
+    for (i = 0; i < 480 && !self->fMt7927Stop; i++) {
+        if (!IEEE80211_ADDR_EQ(etheranyaddr, ic->ic_myaddr))
+            break;
+        IOSleep(500);
+    }
+    if (!self->fMt7927Stop) {
+        if (IEEE80211_ADDR_EQ(etheranyaddr, ic->ic_myaddr)) {
+            XYLog("MT7927: no MAC address from the firmware; no interface\n");
+        } else {
+            IOReturn ret = _fCommandGate != NULL ?
+                _fCommandGate->runAction(&SimpleMtkWlan::finishStartAction) :
+                kIOReturnNotReady;
+            XYLog("MT7927: interface attach -> 0x%x\n", ret);
+        }
+    }
+    mtk_dbg_publish();
+    self->fMt7927ThreadDone = true;
+    self->release();
+    mt7927_thread_exit();
+}
+
+bool SimpleMtkWlan::finishStartFailed()
+{
+    /*
+     * From the MT7927 attach thread (on the command gate) only report it:
+     * tearing down the gate from inside its own action is not possible.
+     */
+    if (fMt7927Thread)
+        return false;
+    fHalService->detach(pciNub);
+    super::stop(pciNub);
+    releaseAll();
+    return false;
+}
+
+bool SimpleMtkWlan::finishStart()
+{
     if (!attachInterface((IONetworkInterface **)&fNetIf, true)) {
         XYLog("attach to interface fail\n");
-        fHalService->detach(pciNub);
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return finishStartFailed();
     }
     fWatchdogWorkLoop = IOWorkLoop::workLoop();
     if (fWatchdogWorkLoop == NULL) {
         XYLog("init watchdog workloop fail\n");
-        fHalService->detach(pciNub);
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return finishStartFailed();
     }
     watchdogTimer = IOTimerEventSource::timerEventSource(this, OSMemberFunctionCast(IOTimerEventSource::Action, this, &SimpleMtkWlan::watchdogAction));
     if (!watchdogTimer) {
         XYLog("init watchdog fail\n");
-        fHalService->detach(pciNub);
-        super::stop(pciNub);
-        releaseAll();
-        return false;
+        return finishStartFailed();
     }
     fWatchdogWorkLoop->addEventSource(watchdogTimer);
     setLinkStatus(kIONetworkLinkValid);
@@ -516,6 +587,14 @@ void SimpleMtkWlan::stop(IOService *provider)
 {
     XYLog("stop\n");
     mtk_dbg_publish();
+    if (fMt7927Thread) {
+        int i;
+
+        fMt7927Stop = true;
+        for (i = 0; i < 100 && !fMt7927ThreadDone; i++)
+            IOSleep(50);
+        fMt7927Thread = false;
+    }
     XYLog("%s\n", __FUNCTION__);
     if (fWatchdogWorkLoop && watchdogTimer) {
         watchdogTimer->cancelTimeout();
@@ -531,7 +610,8 @@ void SimpleMtkWlan::stop(IOService *provider)
     setLinkStatus(kIONetworkLinkValid);
     ether_ifdetach(ifp);
     fHalService->detach(pciNub);
-    detachInterface(fNetIf, true);
+    if (fNetIf != NULL)
+        detachInterface(fNetIf, true);
     OSSafeReleaseNULL(fNetIf);
     releaseAll();
 }
@@ -748,17 +828,12 @@ tsleepHandler(OSObject* owner, void* arg0, void* arg1, void* arg2, void* arg3)
 
 /*
  * ---------------------------------------------------------------------------
- * MtkMt7927Bringup: MT7927 phase 1-3 bring-up driver.
- *
- * Matches 14c3:7927 (its own personality) only with -mtk7927probe. start()
- * returns at once; a kernel thread waits for the firmware files on the Data
- * volume (mounted well after this kext starts), then runs the HAL bring-up
- * (mt7927_bringup_run in MtkMwx.cpp) and tears the hardware back down. The
- * firmware is read from disk at runtime, never compiled into the kext:
+ * MT7927 helpers for the HAL (MtkMwx.cpp), which runs the chip as a third
+ * hardware type of this driver behind -mtk7927probe. The firmware is read
+ * from disk at runtime by a kernel thread once the Data volume is mounted,
+ * never compiled into the kext:
  *   /Library/Firmware/mediatek/mt7927/WIFI_MT6639_PATCH_MCU_2_1_hdr.bin
  *   /Library/Firmware/mediatek/mt7927/WIFI_RAM_CODE_MT6639_2_1.bin
- * Boot-arg mtk7927stage=1..5 stops after a stage (default 5: connac3 init).
- * Boot-arg mtk7927cc=XX sets the country sent with the channel domain.
  * ---------------------------------------------------------------------------
  */
 #include <sys/vnode.h>
@@ -766,16 +841,10 @@ tsleepHandler(OSObject* owner, void* arg0, void* arg1, void* arg2, void* arg3)
 #include <sys/fcntl.h>
 #include <kern/thread.h>
 
-OSDefineMetaClassAndStructors(MtkMt7927Bringup, IOService)
-
-#define MT7927_FW_DIR		"/Library/Firmware/mediatek/mt7927/"
-#define MT7927_FW_PATCH		MT7927_FW_DIR "WIFI_MT6639_PATCH_MCU_2_1_hdr.bin"
-#define MT7927_FW_RAM		MT7927_FW_DIR "WIFI_RAM_CODE_MT6639_2_1.bin"
 #define MT7927_FW_MAX_SIZE	(4 * 1024 * 1024)
-#define MT7927_FW_WAIT_SEC	180
 
-static int
-mt7927ReadFile(const char *path, uint8_t **out, size_t *outLen)
+int
+mt7927_read_file(const char *path, uint8_t **out, size_t *outLen)
 {
     vfs_context_t ctx = vfs_context_create(NULL);
     vnode_t vp = NULLVP;
@@ -830,180 +899,19 @@ mt7927ReadFile(const char *path, uint8_t **out, size_t *outLen)
     return 0;
 }
 
-IOService *MtkMt7927Bringup::probe(IOService *provider, SInt32 *score)
+bool
+mt7927_start_thread(void (*fn)(void *, wait_result_t), void *arg)
 {
-    uint32_t on = 0;
+    thread_t thread;
 
-    if (!PE_parse_boot_argn("-mtk7927probe", &on, sizeof(on)))
-        return NULL;
-    if (OSDynamicCast(IOPCIDevice, provider) == NULL)
-        return NULL;
-    return IOService::probe(provider, score);
-}
-
-bool MtkMt7927Bringup::start(IOService *provider)
-{
-    thread_t thread = NULL;
-    UInt8 msixCap = 0;
-
-    if (!IOService::start(provider))
+    if (kernel_thread_start(fn, arg, &thread) != KERN_SUCCESS)
         return false;
-    fPci = OSDynamicCast(IOPCIDevice, provider);
-    if (fPci == NULL)
-        return false;
-    mtk_dbg_set_nub(fPci);
-    mtk_dbg_log("MT7927 bring-up driver start (built %s %s)\n", __DATE__, __TIME__);
-
-    fPci->setMemoryEnable(true);
-    fPci->setBusMasterEnable(true);
-    /* Same as the front end: MSI-X off; IOPCIFamily enables MSI on registration. */
-    fPci->findPCICapability(PCI_CAP_ID_MSIX, &msixCap);
-    if (msixCap)
-        pciMsiXClearAndSet(fPci, msixCap, PCI_MSIX_FLAGS_ENABLE, 0);
-
-    fLock = IOLockAlloc();
-    fWorkLoop = IOWorkLoop::workLoop();
-    if (fLock == NULL || fWorkLoop == NULL)
-        goto fail;
-    fHal = mt7927_bringup_create(fPci, fWorkLoop);
-    if (fHal == NULL) {
-        mtk_dbg_log("MT7927 bring-up: HAL create failed\n");
-        goto fail;
-    }
-    retain();   /* held by the thread */
-    if (kernel_thread_start(&MtkMt7927Bringup::threadMain, this, &thread) !=
-        KERN_SUCCESS) {
-        release();
-        goto fail;
-    }
     thread_deallocate(thread);
-    fThreadStarted = true;
-    mtk_dbg_publish();
     return true;
-fail:
-    if (fHal != NULL) {
-        mt7927_bringup_destroy(fHal);
-        fHal = NULL;
-    }
-    OSSafeReleaseNULL(fWorkLoop);
-    if (fLock != NULL) {
-        IOLockFree(fLock);
-        fLock = NULL;
-    }
-    mtk_dbg_publish();
-    IOService::stop(provider);
-    return false;
 }
 
-void MtkMt7927Bringup::threadMain(void *arg, wait_result_t wr)
+void
+mt7927_thread_exit(void)
 {
-    MtkMt7927Bringup *self = (MtkMt7927Bringup *)arg;
-
-    self->runJob();
-    IOLockLock(self->fLock);
-    self->fDone = true;
-    IOLockWakeup(self->fLock, (void *)&self->fDone, false);
-    IOLockUnlock(self->fLock);
-    self->release();
     thread_terminate(current_thread());
-}
-
-void MtkMt7927Bringup::runJob()
-{
-    uint8_t *patch = NULL, *ram = NULL;
-    size_t patchLen = 0, ramLen = 0;
-    int stage = 5, passed, waited, e1 = 0, e2 = 0;
-    char cc[4] = { 0 };
-
-    if (PE_parse_boot_argn("mtk7927stage", &stage, sizeof(stage)))
-        mtk_dbg_log("MT7927 bring-up: mtk7927stage=%d\n", stage);
-    if (stage < 1)
-        stage = 1;
-    if (stage > 5)
-        stage = 5;
-    if (PE_parse_boot_argn("mtk7927cc", cc, sizeof(cc) - 1)) {
-        mtk_dbg_log("MT7927 bring-up: mtk7927cc=%s\n", cc);
-        mt7927_bringup_set_country(fHal, cc);
-    }
-
-    if (stage >= 3) {
-        for (waited = 0; waited <= MT7927_FW_WAIT_SEC && !fAbort; waited += 2) {
-            e1 = mt7927ReadFile(MT7927_FW_PATCH, &patch, &patchLen);
-            if (e1 == 0) {
-                e2 = mt7927ReadFile(MT7927_FW_RAM, &ram, &ramLen);
-                if (e2 == 0)
-                    break;
-                IOFree(patch, patchLen);
-                patch = NULL;
-            }
-            if (waited % 20 == 0) {
-                mtk_dbg_log("MT7927 bring-up: waiting for firmware (%ds, "
-                    "patch errno %d, ram errno %d)\n", waited, e1, e2);
-                mtk_dbg_publish();
-            }
-            IOSleep(2000);
-        }
-        if (patch == NULL || ram == NULL) {
-            mtk_dbg_log("MT7927 bring-up: firmware not found in " MT7927_FW_DIR
-                ", running stages 1-2 only\n");
-            fPci->setProperty("MT7927FirmwareFound", false);
-            stage = 2;
-        } else {
-            mtk_dbg_log("MT7927 bring-up: firmware read, patch %zu bytes, "
-                "ram %zu bytes (after %ds)\n", patchLen, ramLen, waited);
-            fPci->setProperty("MT7927FirmwareFound", true);
-        }
-    }
-
-    if (!fAbort) {
-        passed = mt7927_bringup_run(fHal, stage, patch, patchLen, ram, ramLen,
-            &fAbort);
-        mtk_dbg_log("MT7927 bring-up finished: stage %d of %d passed\n",
-            passed, stage);
-    }
-    if (patch != NULL)
-        IOFree(patch, patchLen);
-    if (ram != NULL)
-        IOFree(ram, ramLen);
-    mtk_dbg_publish();
-}
-
-void MtkMt7927Bringup::stop(IOService *provider)
-{
-    uint64_t deadline;
-
-    fAbort = true;
-    if (fThreadStarted && fLock != NULL) {
-        clock_interval_to_deadline(15, kSecondScale, &deadline);
-        IOLockLock(fLock);
-        while (!fDone) {
-            if (IOLockSleepDeadline(fLock, (void *)&fDone, deadline,
-                THREAD_UNINT) == THREAD_TIMED_OUT)
-                break;
-        }
-        IOLockUnlock(fLock);
-    }
-    if (fHal != NULL && (fDone || !fThreadStarted)) {
-        mt7927_bringup_destroy(fHal);
-        fHal = NULL;
-    } else if (fHal != NULL) {
-        mtk_dbg_log("MT7927 bring-up: thread still running at stop, "
-            "leaving HAL allocated\n");
-    }
-    mtk_dbg_publish();
-    IOService::stop(provider);
-}
-
-void MtkMt7927Bringup::free()
-{
-    if (fHal != NULL && (fDone || !fThreadStarted)) {
-        mt7927_bringup_destroy(fHal);
-        fHal = NULL;
-    }
-    OSSafeReleaseNULL(fWorkLoop);
-    if (fLock != NULL) {
-        IOLockFree(fLock);
-        fLock = NULL;
-    }
-    IOService::free();
 }

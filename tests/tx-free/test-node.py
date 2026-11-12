@@ -14,7 +14,9 @@ struct mbuf{ieee80211_node*node;};struct queue{mbuf*m=nullptr;};
 struct netstat{unsigned long long outputPackets=0,outputErrors=0;};
 struct ifnet {void*if_softc;int if_flags=3;queue if_snd;int if_oerrors=0,if_timer=0;netstat*netStat=nullptr;};
 struct ieee80211com {int ic_state=4,ic_xflags=0;queue ic_mgtq;};
-struct mwx_softc{ieee80211com sc_ic;unsigned sc_tx_full_cnt=0;};
+enum mwx_hw_type{MWX_HW_MT7921,MWX_HW_MT7922,MWX_HW_MT7927};
+struct mwx_softc{ieee80211com sc_ic;unsigned sc_tx_full_cnt=0;mwx_hw_type sc_hwtype=MWX_HW_MT7921;};
+int freed;void m_freem(mbuf*){freed++;}
 int room=1;
 int mwx_tx_has_room(mwx_softc*,unsigned){return room;}
 int paused;
@@ -22,6 +24,7 @@ void ifq_set_oactive(queue*){paused++;}struct ether_header{char bytes[14];};
 bool ifq_is_oactive(queue*){return false;}
 mbuf*mq_dequeue(queue*q){auto m=q->m;q->m=nullptr;return m;}
 mbuf*ifq_dequeue(queue*q){return mq_dequeue(q);}
+int purged;void mq_purge(queue*q){if(q->m){purged++;q->m=nullptr;}}
 void*mbuf_pkthdr_rcvif(mbuf*m){return m->node;}
 size_t mbuf_len(mbuf*){return 64;}
 mbuf*m_pullup(mbuf*m,size_t){return m;}
@@ -39,7 +42,10 @@ int main(){
  }
  {mwx_softc sc; ifnet ifp; ifp.if_softc=&sc;ieee80211_node ni;mbuf m{&ni};room=0;paused=0;ifp.if_snd.m=&m;
   mwx_start(&ifp);assert(ifp.if_snd.m==&m&&paused==1&&sc.sc_tx_full_cnt==1&&ni.refs==0);room=1;}
- puts("PASS: extracted mwx_start balances enqueue node references for data/management, success/failure; pauses without dropping when TX is full.");
+ {mwx_softc sc;sc.sc_hwtype=MWX_HW_MT7927;ifnet ifp;ifp.if_softc=&sc;ieee80211_node ni;mbuf m{&ni},m2{&ni};
+  sc.sc_ic.ic_mgtq.m=&m;ifp.if_snd.m=&m2;freed=purged=0;mwx_start(&ifp);
+  assert(!sc.sc_ic.ic_mgtq.m&&!ifp.if_snd.m&&purged==1&&freed==1&&ni.refs==0);}
+ puts("PASS: extracted mwx_start balances enqueue node references for data/management, success/failure; pauses without dropping when TX is full; MT7927 (no TX path yet) drops both queues.");
 }
 '''
 tmp=tempfile.TemporaryDirectory(prefix='mtk-tx-test-');art=Path(tmp.name)

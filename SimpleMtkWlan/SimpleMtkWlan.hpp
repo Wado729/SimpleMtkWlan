@@ -56,6 +56,13 @@ public:
     virtual bool start(IOService *provider) override;
     IOService* probeImpl(IOService* provider, SInt32* score);
     bool startImpl(IOService *provider);
+    bool finishStart();
+    bool finishStartFailed();
+    static IOReturn finishStartAction(OSObject *owner, void *, void *, void *, void *);
+    static void mt7927AttachThread(void *arg, wait_result_t wr);
+    volatile bool fMt7927Stop;
+    volatile bool fMt7927ThreadDone;
+    bool fMt7927Thread;
     IOReturn halDebugPollAction(void *arg0, void *arg1, void *arg2, void *arg3);
     virtual void stop(IOService *provider) override;
     virtual IOReturn getHardwareAddress(IOEthernetAddress* addrP) override;
@@ -130,29 +137,3 @@ public:
     struct ieee80211_nwid nwid;
 };
 
-/*
- * MT7927 bring-up driver (matches 14c3:7927 only with -mtk7927probe).
- * Stays attached; a thread waits for the firmware files on the Data volume,
- * then runs the bring-up stages and tears the hardware back down.
- */
-class MtkMt7927Bringup : public IOService {
-    OSDeclareDefaultStructors(MtkMt7927Bringup)
-
-public:
-    virtual IOService *probe(IOService *provider, SInt32 *score) override;
-    virtual bool start(IOService *provider) override;
-    virtual void stop(IOService *provider) override;
-    virtual void free() override;
-
-private:
-    static void threadMain(void *arg, wait_result_t wr);
-    void runJob();
-
-    IOPCIDevice *fPci;
-    IOWorkLoop *fWorkLoop;
-    IOLock *fLock;
-    struct mt7927_bringup *fHal;
-    volatile bool fAbort;
-    volatile bool fDone;
-    bool fThreadStarted;
-};

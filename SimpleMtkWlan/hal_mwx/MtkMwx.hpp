@@ -59,6 +59,7 @@ public:
     IOEthernetController *mwxController();
     int mwxSleepNsec(void *ident, int priority, const char *wmesg, uint64_t timo);
     void mwxWakeup(void *ident);
+    IOCommandGate *mwxGate() { return getMainCommandGate(); }
 
 private:
     void releaseAll();
@@ -69,15 +70,12 @@ private:
 };
 
 /*
- * MT7927 bring-up (phase 1 + 2), implemented in MtkMwx.cpp and driven by
- * MtkMt7927Bringup in SimpleMtkWlan.cpp. Independent of the MT7921 HAL.
+ * MT7927: the chip runs as a third hardware type of this HAL (MtkMwx.cpp),
+ * only with -mtk7927probe. These helpers live in SimpleMtkWlan.cpp, where
+ * the VFS and thread headers are available.
  */
-struct mt7927_bringup;
-struct mt7927_bringup *mt7927_bringup_create(IOPCIDevice *dev, IOWorkLoop *wl);
-int mt7927_bringup_run(struct mt7927_bringup *b, int stage,
-    const uint8_t *patch, size_t patch_len, const uint8_t *ram, size_t ram_len,
-    volatile bool *abort);
-void mt7927_bringup_set_country(struct mt7927_bringup *b, const char *cc);
-void mt7927_bringup_destroy(struct mt7927_bringup *b);
+int mt7927_read_file(const char *path, uint8_t **out, size_t *outLen);
+bool mt7927_start_thread(void (*fn)(void *, wait_result_t), void *arg);
+void mt7927_thread_exit(void);
 
 #endif /* MtkMwx_hpp */
