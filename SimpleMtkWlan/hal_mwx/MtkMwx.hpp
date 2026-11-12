@@ -77,6 +77,7 @@ struct mt7927_bringup *mt7927_bringup_create(IOPCIDevice *dev, IOWorkLoop *wl);
 int mt7927_bringup_run(struct mt7927_bringup *b, int stage,
     const uint8_t *patch, size_t patch_len, const uint8_t *ram, size_t ram_len,
     volatile bool *abort);
+void mt7927_bringup_set_country(struct mt7927_bringup *b, const char *cc);
 void mt7927_bringup_destroy(struct mt7927_bringup *b);
 
 #endif /* MtkMwx_hpp */

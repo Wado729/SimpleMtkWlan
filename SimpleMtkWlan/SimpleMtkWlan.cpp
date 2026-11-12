@@ -748,7 +748,7 @@ tsleepHandler(OSObject* owner, void* arg0, void* arg1, void* arg2, void* arg3)
 
 /*
  * ---------------------------------------------------------------------------
- * MtkMt7927Bringup: MT7927 phase 1/2 bring-up driver.
+ * MtkMt7927Bringup: MT7927 phase 1-3 bring-up driver.
  *
  * Matches 14c3:7927 (its own personality) only with -mtk7927probe. start()
  * returns at once; a kernel thread waits for the firmware files on the Data
@@ -757,7 +757,8 @@ tsleepHandler(OSObject* owner, void* arg0, void* arg1, void* arg2, void* arg3)
  * firmware is read from disk at runtime, never compiled into the kext:
  *   /Library/Firmware/mediatek/mt7927/WIFI_MT6639_PATCH_MCU_2_1_hdr.bin
  *   /Library/Firmware/mediatek/mt7927/WIFI_RAM_CODE_MT6639_2_1.bin
- * Boot-arg mtk7927stage=1..4 stops after a stage (default 4).
+ * Boot-arg mtk7927stage=1..5 stops after a stage (default 5: connac3 init).
+ * Boot-arg mtk7927cc=XX sets the country sent with the channel domain.
  * ---------------------------------------------------------------------------
  */
 #include <sys/vnode.h>
@@ -911,14 +912,19 @@ void MtkMt7927Bringup::runJob()
 {
     uint8_t *patch = NULL, *ram = NULL;
     size_t patchLen = 0, ramLen = 0;
-    int stage = 4, passed, waited, e1 = 0, e2 = 0;
+    int stage = 5, passed, waited, e1 = 0, e2 = 0;
+    char cc[4] = { 0 };
 
     if (PE_parse_boot_argn("mtk7927stage", &stage, sizeof(stage)))
         mtk_dbg_log("MT7927 bring-up: mtk7927stage=%d\n", stage);
     if (stage < 1)
         stage = 1;
-    if (stage > 4)
-        stage = 4;
+    if (stage > 5)
+        stage = 5;
+    if (PE_parse_boot_argn("mtk7927cc", cc, sizeof(cc) - 1)) {
+        mtk_dbg_log("MT7927 bring-up: mtk7927cc=%s\n", cc);
+        mt7927_bringup_set_country(fHal, cc);
+    }
 
     if (stage >= 3) {
         for (waited = 0; waited <= MT7927_FW_WAIT_SEC && !fAbort; waited += 2) {

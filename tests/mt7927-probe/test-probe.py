@@ -77,7 +77,8 @@ struct Chip {
   /* firmware model */
   int sem_state = 0; bool patch_done = false, n9_ready = false, pwr_on = false;
   uint32_t dl_addr = 0, dl_len = 0, dl_got = 0; std::vector<std::pair<uint32_t, std::vector<uint8_t>>> regions;
-  std::vector<std::string> cmds; bool mute = false; int mute_cmd = -1;
+  std::vector<std::string> cmds; bool mute = false; int mute_cmd = -1, mute_uni = -1;
+  std::vector<std::string> chip_cfg; std::vector<uint8_t> domain; int fw_log = -1, dbdc = -1; uint32_t rts = 0;
   uint32_t fw_start_option = 0xffff, fw_start_addr = 0xffff;
   size_t accesses = 0; int wfsys_resets = 0; bool dma_ever_enabled = false;
 } chip;
@@ -150,7 +151,7 @@ static int mt7927_irq_setup(struct mt7927_bringup *b) {
 static void mt7927_irq_teardown(struct mt7927_bringup *b) { if (b->ih_cookie) { irq_registered = false; b->ih_cookie = nullptr; } }
 
 /* ---- the firmware model: post an MCU event into RX ring 6 ---- */
-static void post_event(uint8_t seq, uint8_t eid, uint8_t ext_eid, const std::vector<uint8_t> &payload) {
+static void post_event(uint8_t seq, uint8_t eid, uint8_t ext_eid, const std::vector<uint8_t> &payload, uint8_t opt = 0) {
   uint32_t base = MT7927_RING_REG(MT7927_RX_RING_BASE, 6);
   uint32_t n = chip.bar[base + 4], cpu = chip.bar[base + 8], dma = chip.bar[base + 12];
   assert(n && dma != cpu && "RX ring 6 has no free buffer");
@@ -160,7 +161,7 @@ static void post_event(uint8_t seq, uint8_t eid, uint8_t ext_eid, const std::vec
   assert(len <= cap);
   uint8_t *p = pa2va(d->buf0, len); memset(p, 0, 44);
   uint32_t rxd0 = (7u << 27) | len; memcpy(p, &rxd0, 4);
-  uint16_t l = len - 32; memcpy(p + 32, &l, 2); p[32 + 4] = eid; p[32 + 5] = seq; p[32 + 8] = ext_eid;
+  uint16_t l = len - 32; memcpy(p + 32, &l, 2); p[32 + 4] = eid; p[32 + 5] = seq; p[32 + 6] = opt; p[32 + 8] = ext_eid;
   if (!payload.empty()) memcpy(p + 44, payload.data(), payload.size());
   d->ctrl = MT_DMA_CTL_DMA_DONE | MT_DMA_CTL_LAST_SEC0 | (len << 16);
   chip.bar[base + 12] = (dma + 1) % n;
@@ -176,18 +177,56 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
   assert(m->pkt_type == MCU_PKT_ID && m->seq != 0 && m->seq < 16);
   char e[64]; bool uni = false; uint16_t ucid = 0; uint8_t opt = 0;
   if (len >= sizeof(struct mwx_uni_txd)) { const struct mwx_uni_txd *u = (const struct mwx_uni_txd *)buf;
-    if (u->cid == 0x0e && u->option != 0) { uni = true; ucid = u->cid; opt = u->option; } }
+    if (u->option & MCU_CMD_UNI) { uni = true; ucid = u->cid; opt = u->option; } }
   const uint8_t *pl = buf + (uni ? sizeof(struct mwx_uni_txd) : sizeof(struct mwx_mcu_txd));
+  uint32_t plen = len - (uni ? sizeof(struct mwx_uni_txd) : sizeof(struct mwx_mcu_txd));
+  if (uni && ucid != 0x0e) {
+    snprintf(e, sizeof e, "uni%02x%s", ucid, opt == MCU_CMD_UNI_QUERY_ACK ? "q" : ""); chip.cmds.push_back(e);
+    assert(((const struct mwx_uni_txd *)buf)->len == len - 32 && ((const struct mwx_uni_txd *)buf)->s2d_index == CMD_S2D_IDX_H2N);
+    uint16_t tag, tl; memcpy(&tag, pl + 4, 2); memcpy(&tl, pl + 6, 2);
+    bool query = opt == MCU_CMD_UNI_QUERY_ACK;
+    assert((query || opt == MCU_CMD_UNI_EXT_ACK) && "UNI set: EXT_ACK, query: QUERY_ACK");
+    if (chip.mute || ucid == chip.mute_uni) return;
+    std::vector<uint8_t> r;
+    switch (ucid) {
+    case 0x2d:                                            /* EFUSE_CTRL */
+      if (query) { assert(tag == 1 && tl == 28 && plen == 32); uint32_t a; memcpy(&a, pl + 8, 4); assert(a % 16 == 0);
+        r.assign(80, 0); r[4] = 1; uint8_t *d = r.data() + 48;
+        if (a == 0) { d[0] = 0x39; d[1] = 0x66; d[2] = 2; d[4] = 0x40; d[5] = 0xed; d[6] = 0; d[7] = 0x11; d[8] = 0x22; d[9] = 0x33; }
+        if (a == 0xa70) d[1] = 0x01;
+      } else { assert(tag == 2 && tl == 8 && plen == 12 && pl[8] == 0 && pl[9] == 1 && pl[10] == 0 && pl[11] == 0); }
+      break;
+    case 0x0b: assert(!query && tag == 0 && tl == 8 && plen == 12); chip.fw_log = pl[8]; break;   /* WSYS_CONFIG */
+    case 0x28: assert(!query && tag == 0 && tl == 8 && plen == 12); chip.dbdc = pl[8]; break;     /* SET_DBDC_PARMS */
+    case 0x15: assert(!query && plen >= 16); chip.domain.assign(pl, pl + plen); break;           /* SET_DOMAIN_INFO */
+    case 0x08: assert(!query && pl[0] == 0 && tag == 8 && tl == 12); memcpy(&chip.rts, pl + 8, 4);   /* BAND_CONFIG */
+      { uint32_t pk; memcpy(&pk, pl + 12, 4); assert(pk == 2); } break;
+    case 0x35: assert(query && tag == 0 && tl == 8 && plen == 12);      /* THERMAL */
+      r = {0,0,0,0, 0,0,12,0, 0,0,0,0, 45,0,0,0}; break;
+    default: assert(!"unexpected UNI command");
+    }
+    post_event(m->seq, 0x01, 0, r);
+    if (ucid == 0x0b && chip.fw_log == 1) {               /* a firmware text log line */
+      const char *t = "(test) wifi firmware log line\n"; std::vector<uint8_t> lg(12, 0);
+      lg.insert(lg.end(), t, t + strlen(t)); post_event(0, MT7927_UNI_EVENT_FW_LOG, 0, lg, MT7927_RXD_OPT_UNSOLICITED); }
+    if (ucid == 0x28) post_event(0, 0x28, 0, {0,0,0,0, 0,0,8,0, 1,0,0,0}, MT7927_RXD_OPT_UNSOLICITED);
+    return;
+  }
   if (uni) {
     snprintf(e, sizeof e, "uni%02x", ucid); chip.cmds.push_back(e);
     assert(opt == MCU_CMD_UNI_EXT_ACK - MCU_CMD_ACK && "CHIP_CONFIG: UNI|SET, ACK cleared (mt7925_mcu_fill_message)");
     assert(((const struct mwx_uni_txd *)buf)->len == len - 32);
     if (chip.mute) return;
-    uint16_t tag; memcpy(&tag, pl + 4, 2); assert(tag == 3);
+    uint16_t tag; memcpy(&tag, pl + 4, 2);
+    if (tag == 2) {                                       /* CHIP_CFG text, no response */
+      uint16_t tl, ds; memcpy(&tl, pl + 6, 2); memcpy(&ds, pl + 12, 2);
+      assert(plen == 336 && tl == 332 && ds == strlen((const char *)pl + 16) + 1);
+      chip.chip_cfg.push_back((const char *)pl + 16); return; }
+    assert(tag == 3);
     std::vector<uint8_t> r = { 3, 0, 0, 0 };            /* n_element=3 */
     auto tlv = [&](uint16_t t, std::vector<uint8_t> d) { uint16_t L = 4 + d.size();
       r.push_back(t & 0xff); r.push_back(t >> 8); r.push_back(L & 0xff); r.push_back(L >> 8); r.insert(r.end(), d.begin(), d.end()); };
-    tlv(5, {0x27, 0x79, 0, 0}); tlv(7, {0x40, 0xed, 0x00, 0x11, 0x22, 0x33, 0, 0}); tlv(0x18, {1, 0, 0, 0});
+    r[0] = 4; tlv(0x20, {0x10, 0, 0, 0, 0, 0, 0, 0x80}); tlv(5, {0x27, 0x79, 0, 0}); tlv(7, {0x40, 0xed, 0x00, 0x11, 0x22, 0x33, 0, 0}); tlv(0x18, {1, 0, 0, 0});
     post_event(m->seq, 0x01, 0, r); return;
   }
   assert(m->len == len - 32);
@@ -304,7 +343,7 @@ int main() {
   assert(chip.cmds.front() == "cmd04");                    /* NIC_POWER_CTRL first */
   assert(r->dev->props["MT7927FWReady"] == 1 && r->dev->sprops["MT7927FWVersion"] == "____010000");
   assert(r->dev->sprops["MT7927MACAddress"] == "40:ed:00:11:22:33" && r->dev->props["MT7927NicHas6G"] == 1);
-  assert(r->dev->props["MT7927NicCapElements"] == 3);
+  assert(r->dev->props["MT7927NicCapElements"] == 4);
   /* interrupts went through the MT7927 map */
   assert(r->b.intr_count > 0 && (r->b.intr_seen & MT7927_INT_RX_DONE_WM) && (r->b.intr_seen & MT7927_INT_TX_DONE_FWDL));
   assert(r->dev->props["MT7927InterruptBits"] & MT7927_INT_RX_DONE_WM);
@@ -370,10 +409,107 @@ int main() {
   assert(chip.accesses <= 4 && live_allocs == 0);   /* only the teardown's interrupt-off writes */
   rm(r);
 
+  /* map: every MAC register phase 3 touches is reachable without L2 */
+  for (uint32_t a : {MT7927_MDP_DCR0, MT7927_MDP_DCR1, MT7927_WTBL_UPDATE, MT7927_WTBL_ITCR, MT7927_WTBL_ITDR0,
+                     MT7927_WTBL_ITDR1, MT7927_TMAC_CTCR0(0), MT7927_TMAC_CTCR0(1), MT7927_RMAC_MIB_TIME0(0),
+                     MT7927_RMAC_MIB_TIME0(1), MT7927_RMAC_MIB_AIRTIME0(0), MT7927_RMAC_MIB_AIRTIME0(1),
+                     MT7927_MIB_SCR1(0), MT7927_MIB_SCR1(1), MT7927_DMA_DCR0(0), MT7927_DMA_DCR0(1),
+                     MT7927_WTBLOFF_RSCR(0), MT7927_WTBLOFF_RSCR(1)})
+    assert(mt7927_map(a, &off) == MT7927_MAP_FIXED);
+  assert(mt7927_map(MT7927_MDP_DCR1, &off) == MT7927_MAP_FIXED && off == 0x00e804);
+
+  /* 8: stage 5, connac3 init, in Linux order */
+  r = mk(); chip.bar[0x021e00] = 0x00800000 | 0x1234;   /* DMA_DCR0 band 0: RXD_G5_EN set, junk RX len */
+  passed = mt7927_bringup_run(&r->b, 5, patch.data(), patch.size(), ram.data(), ram.size(), &abort_flag);
+  if (getenv("SHOWLOG")) fputs(logbuf.c_str(), stdout);
+  assert(passed == 5);
+  {
+    std::vector<std::string> want = {"uni0e", "uni2dq", "uni2dq", "uni0b", "uni2d", "uni28", "uni0e", "uni0e", "uni0e",
+                                     "uni15", "uni08", "uni35q"};
+    std::vector<std::string> got; bool on = false;
+    for (auto &c : chip.cmds) { if (c == "uni0e") on = true; if (on) got.push_back(c); }
+    if (got != want) { for (auto &c : got) fprintf(stderr, "%s ", c.c_str()); fputc('\n', stderr); }
+    assert(got == want);
+  }
+  assert(chip.chip_cfg.size() == 3 && chip.chip_cfg[0] == "ThermalProtGband 0 100 90 80 30 1 1 115 105 5" &&
+         chip.chip_cfg[1] == "ThermalProtAband 1 100 90 80 30 1 1 115 105 5" && chip.chip_cfg[2] == "KeepFullPwr 1");
+  assert(chip.fw_log == 1 && chip.dbdc == 1 && chip.rts == 0x92b);
+  {   /* SET_DOMAIN_INFO: hdr(alpha2[4] bw 0/3/3 pad) + tlv(tag 2) n 14/25/59 + 8-byte channels */
+    auto &d = chip.domain; assert(d.size() == 16 + 8 * (14 + 25 + 59));
+    assert(d[0] == 0 && d[1] == 0 && d[4] == 0 && d[5] == 3 && d[6] == 3);
+    assert(d[8] == 2 && d[9] == 0 && (d[10] | d[11] << 8) == 8 + 8 * 98 && d[12] == 14 && d[13] == 25 && d[14] == 59);
+    auto ch = [&](int i, uint32_t *fl) { uint32_t f; memcpy(&f, d.data() + 16 + 8 * i + 4, 4); *fl = f; return d[16 + 8 * i]; };
+    uint32_t fl;
+    assert(ch(0, &fl) == 1 && fl == 0); assert(ch(10, &fl) == 11 && fl == 0);
+    assert(ch(11, &fl) == 12 && fl == MT7927_CHAN_NO_IR); assert(ch(13, &fl) == 14 && fl == (MT7927_CHAN_NO_IR | MT7927_CHAN_NO_OFDM));
+    assert(ch(14, &fl) == 36 && fl == MT7927_CHAN_NO_IR); assert(ch(18, &fl) == 52 && fl == (MT7927_CHAN_NO_IR | MT7927_CHAN_RADAR));
+    assert(ch(33, &fl) == 144 && (fl & MT7927_CHAN_RADAR)); assert(ch(34, &fl) == 149 && fl == MT7927_CHAN_NO_IR);
+    assert(ch(38, &fl) == 165); assert(ch(39, &fl) == 1 && fl == MT7927_CHAN_NO_IR); assert(ch(97, &fl) == 233);
+  }
+  /* mac init through the fixed map */
+  assert((chip.bar[0x00e804] & MT7927_MAX_RX_LEN_MASK) == MT7927_MAX_RX_LEN && (chip.bar[0x00e800] & MT7927_MDP_DCR0_DAMSDU_EN));
+  assert(chip.bar[0x021e00] == ((0x1234u & ~MT7927_MAX_RX_LEN_MASK) | MT7927_MAX_RX_LEN));   /* G5 cleared, len set */
+  assert((chip.bar[0x0a1e00] & MT7927_MAX_RX_LEN_MASK) == MT7927_MAX_RX_LEN);
+  assert(chip.bar[0x0210f4] == (0x3f | MT7927_CTCR0_DDLMT_EN | MT7927_CTCR0_VHT_SMPDU_EN) && chip.bar[0x0a10f4] == chip.bar[0x0210f4]);
+  assert(chip.bar[0x0217c4] == MT7927_RMAC_MIB_RXTIME_EN && chip.bar[0x021780] == MT7927_RMAC_MIB_RXTIME_EN);
+  assert(chip.bar[0x024804] == (MT7927_MIB_TXDUR_EN | MT7927_MIB_RXDUR_EN) && chip.bar[0x0a4804] == chip.bar[0x024804]);
+  assert(chip.bar[0x023408] == MT7927_RSCR_RCPI_SET && chip.bar[0x0a3408] == MT7927_RSCR_RCPI_SET);
+  assert((chip.bar[0x034380] & 0xfff) == 19 && (chip.bar[0x034380] & MT7927_WTBL_UPDATE_ADM_CLR));
+  assert(chip.bar[0x0343b0] == (MT7927_WTBL_ITCR_WR | MT7927_WTBL_ITCR_EXEC | 25) && chip.bar[0x0343b8] == ((1 << 6) | 0x0c));
+  assert(chip.bar[0x0343bc] == MT7927_WTBL_SPE_IDX_SEL && r->b.wtbl_busy == 0);
+  /* results */
+  assert(r->dev->props["MT7927EfuseHwType"] == 1 && r->dev->props["MT7927EfuseChipID"] == 0x6639);
+  assert(r->dev->sprops["MT7927EfuseMAC"] == "40:ed:00:11:22:33" && logbuf.find("(matches firmware)") != std::string::npos);
+  assert(r->dev->props["MT7927TemperatureC"] == 45 && r->dev->props["MT7927NicChipCap"] == 0x10);
+  assert(r->b.chip_cap == 0x8000000000000010ull && r->dev->props["MT7927NicHwVer"] == 0x7927);
+  assert(r->dev->props["MT7927P3Fatal"] == 0 && r->dev->props["MT7927MCUTimeouts"] == 0 && r->dev->props["MT7927CLCRecords"] == 0);
+  assert(r->b.fw_log_events == 1 && r->b.fw_log_lines == 1 && r->b.unsol_events == 2);
+  assert(logbuf.find("MT7927 fw: (test) wifi firmware log line\n") != std::string::npos);
+  assert(logbuf.find("phase 3 PASS") != std::string::npos);
+  assert(!irq_registered && !r->dev->busmaster && live_allocs == 0 && chip.wfsys_resets == 2);
+  assert(chip.bar[MT7925_HIF_REMAP_L1] == (0x18450000 | 0x1234));
+  assert(logbuf.find("refused") == std::string::npos);
+  rm(r);
+
+  /* 9: DBDC never answered: Linux only warns, but it is an MCU timeout -> stage 5 not passed */
+  r = mk(); chip.mute_uni = 0x28;
+  assert(mt7927_bringup_run(&r->b, 5, patch.data(), patch.size(), ram.data(), ram.size(), &abort_flag) == 4);
+  assert(r->b.p3_warn == 1 && r->b.p3_fatal == 0 && r->b.mcu_timeouts == 1 && count("uni15") == 1);
+  assert(!irq_registered && live_allocs == 0); rm(r);
+
+  /* 10: channel domain never answered -> fatal, rest still attempted, clean teardown */
+  r = mk(); chip.mute_uni = 0x15;
+  assert(mt7927_bringup_run(&r->b, 5, patch.data(), patch.size(), ram.data(), ram.size(), &abort_flag) == 4);
+  assert(r->b.p3_fatal == 1 && count("uni08") == 1 && live_allocs == 0); rm(r);
+
+  /* 11: country code */
+  r = mk(); mt7927_bringup_set_country(&r->b, "DE");
+  assert(mt7927_bringup_run(&r->b, 5, patch.data(), patch.size(), ram.data(), ram.size(), &abort_flag) == 5);
+  assert(chip.domain[0] == 'D' && chip.domain[1] == 'E' && chip.domain[2] == 0); rm(r);
+  r = mk(); mt7927_bringup_set_country(&r->b, "de"); assert(r->b.alpha2[0] == 0);
+  mt7927_bringup_set_country(&r->b, "DEU"); assert(r->b.alpha2[0] == 0); rm(r);
+
+  /* 12: a RAM image with a CLC region: records are found and counted */
+  {
+    std::vector<uint8_t> clc(48, 0); clc[0] = 32; clc[4] = 0; clc[5] = 2; clc[32] = 16; clc[36] = 3;
+    std::vector<RamReg> regs = {{0x00100000, 10000, 0x01}, {0, (uint32_t)clc.size(), FW_FEATURE_NON_DL},
+                                {0xe0003000, 6000, FW_FEATURE_OVERRIDE_ADDR}};
+    auto ram2 = make_ram(regs);
+    memcpy(ram2.data() + 10000, clc.data(), clc.size());
+    auto *g = (mwx_fw_region *)(ram2.data() + ram2.size() - sizeof(mwx_fw_trailer) - 2 * sizeof(mwx_fw_region));
+    g->reserved1[0] = MT7927_FW_TYPE_CLC;
+    r = mk();
+    assert(mt7927_bringup_run(&r->b, 5, patch.data(), patch.size(), ram2.data(), ram2.size(), &abort_flag) == 5);
+    assert(r->dev->props["MT7927CLCRecords"] == 2 && chip.regions.size() == 4); rm(r);
+  }
+
   puts("PASS MT7927 bring-up: address map, phase 1 reset, MT7927 rings/prefetch/WFDMA flags, MSI-style "
        "interrupts on bits 14/26, connac3 MCU TXD, patch+RAM download byte-exact (NON_DL skipped, OVERRIDE "
        "start), FW_N9_RDY, NIC capability (MAC), stage limits, timeout, patch-already-loaded, bad header, "
-       "teardown order (IRQ off, DMA off, WFSYS reset, bus master off, memory freed). Simulated chip, not hardware.");
+       "teardown order (IRQ off, DMA off, WFSYS reset, bus master off, memory freed); phase 3 connac3 init in Linux "
+       "order (eFuse, fw log, set_eeprom, mac init registers, DBDC, thermal, KeepFullPwr, channel domain, RTS, "
+       "temperature), unsolicited firmware log events, DBDC/domain timeouts, country code, CLC scan. "
+       "Simulated chip, not hardware.");
   return 0;
 }
 '''

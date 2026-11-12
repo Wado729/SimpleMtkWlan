@@ -4139,6 +4139,70 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 #define	MT7927_NIC_CAP_6G		0x18
 #define	MT7927_NIC_CAP_CHIP_CAP		0x20
 
+/* Phase 3 (connac3 init): UNI commands and tags (mt76_connac_mcu.h, mt7925/mcu.h). */
+#define	MT7927_UNI_CMD(id)		(MCU_CMD_FIELD_UNI | (id))
+#define	MT7927_UNI_BAND_CONFIG		MT7927_UNI_CMD(0x08)
+#define	MT7927_UNI_SET_DOMAIN_INFO	MT7927_UNI_CMD(0x15)
+#define	MT7927_UNI_SET_DBDC_PARMS	MT7927_UNI_CMD(0x28)
+#define	MT7927_UNI_THERMAL		MT7927_UNI_CMD(0x35)
+#define	MT7927_WM_UNI_QUERY(c)		((c) | MCU_CMD_FIELD_QUERY | MCU_CMD_FIELD_WM)
+#define	MT7927_UNI_CHIP_CONFIG_CHIP_CFG	0x2
+#define	MT7927_UNI_BAND_CONFIG_RTS	0x08
+#define	MT7927_UNI_WSYS_FW_LOG_CTRL	0
+#define	MT7927_UNI_EFUSE_ACCESS		1
+#define	MT7927_UNI_EFUSE_BUFFER_MODE	2
+#define	MT7927_UNI_MBMC_SETTING		0
+#define	MT7927_EE_MODE_EFUSE		0
+#define	MT7927_EE_FORMAT_WHOLE		1
+#define	MT7927_EEPROM_BLOCK		16		/* MT7925_EEPROM_BLOCK_SIZE */
+#define	MT7927_EE_HW_TYPE		0xa71
+#define	MT7927_EE_HW_TYPE_ENCAP		0x03
+#define	MT7927_UNI_EVENT_FW_LOG		0x04		/* MCU_UNI_EVENT_FW_LOG_2_HOST */
+#define	MT7927_RXD_OPT_UNSOLICITED	0x04		/* MCU_UNI_CMD_UNSOLICITED_EVENT */
+#define	MT7927_FW_FEATURE_NON_DL	0x40
+#define	MT7927_FW_TYPE_CLC		2
+#define	MT7927_RTS_THRESH		0x92b		/* __mt7925_start */
+#define	MT7927_FW_LOG_LINES		64
+
+/* cfg80211 channel flags carried in SET_DOMAIN_INFO (enum ieee80211_channel_flags). */
+#define	MT7927_CHAN_NO_IR		(1U << 1)
+#define	MT7927_CHAN_RADAR		(1U << 3)
+#define	MT7927_CHAN_NO_OFDM		(1U << 6)
+
+/* MAC registers touched by mt7925_mac_init() (mt7925/regs.h, mt792x_regs.h). */
+#define	MT7927_MDP_DCR0			0x820cc800
+#define	MT7927_MDP_DCR0_DAMSDU_EN	(1U << 15)
+#define	MT7927_MDP_DCR1			0x820cc804
+#define	MT7927_MAX_RX_LEN_MASK		0x0000fff8	/* GENMASK(15, 3) */
+#define	MT7927_MAX_RX_LEN		(1536U << 3)
+#define	MT7927_WTBL_UPDATE		0x820d4380	/* MT7925_WTBL_UPDATE */
+#define	MT7927_WTBL_UPDATE_IDX_MASK	0x00000fff
+#define	MT7927_WTBL_UPDATE_ADM_CLR	(1U << 14)
+#define	MT7927_WTBL_UPDATE_BUSY		(1U << 31)
+#define	MT7927_WTBL_ITCR		0x820d43b0
+#define	MT7927_WTBL_ITCR_WR		(1U << 16)
+#define	MT7927_WTBL_ITCR_EXEC		(1U << 31)
+#define	MT7927_WTBL_ITDR0		0x820d43b8
+#define	MT7927_WTBL_ITDR1		0x820d43bc
+#define	MT7927_WTBL_SPE_IDX_SEL		(1U << 6)
+#define	MT7927_WTBL_SIZE		20		/* MT792x_WTBL_SIZE */
+#define	MT7927_BASIC_RATES_TBL		14		/* MT792x_BASIC_RATES_TBL */
+#define	MT7927_TMAC_CTCR0(b)		((b) ? 0x820f40f4U : 0x820e40f4U)
+#define	MT7927_CTCR0_REFTIME_MASK	0x0000003f
+#define	MT7927_CTCR0_DDLMT_EN		(1U << 17)
+#define	MT7927_CTCR0_VHT_SMPDU_EN	(1U << 18)
+#define	MT7927_RMAC_MIB_TIME0(b)	((b) ? 0x820f53c4U : 0x820e53c4U)
+#define	MT7927_RMAC_MIB_AIRTIME0(b)	((b) ? 0x820f5380U : 0x820e5380U)
+#define	MT7927_RMAC_MIB_RXTIME_EN	(1U << 30)
+#define	MT7927_MIB_SCR1(b)		((b) ? 0x820fd004U : 0x820ed004U)
+#define	MT7927_MIB_TXDUR_EN		(1U << 8)
+#define	MT7927_MIB_RXDUR_EN		(1U << 9)
+#define	MT7927_DMA_DCR0(b)		((b) ? 0x820f7000U : 0x820e7000U)
+#define	MT7927_DMA_DCR0_RXD_G5_EN	(1U << 23)
+#define	MT7927_WTBLOFF_RSCR(b)		((b) ? 0x820f9008U : 0x820e9008U)
+#define	MT7927_RSCR_RCPI_MASK		0xc3000000	/* RCPI_MODE 31:30, RCPI_PARAM 25:24 */
+#define	MT7927_RSCR_RCPI_SET		0x03000000	/* mode 0, param 3 */
+
 struct mt7927_dmamem {
 	void		*va;
 	uint32_t	pa;
@@ -4195,6 +4259,27 @@ struct mt7927_bringup {
 	uint8_t			mac[6];
 	bool			mac_valid;
 	uint32_t		nic_elements;
+	uint64_t		chip_cap;
+	bool			chip_cap_valid;
+
+	/* phase 3 */
+	uint8_t			txbuf[2048] __attribute__((aligned(8))); /* MCU TXD + payload */
+	char			alpha2[2];	/* country for SET_DOMAIN_INFO, 0 = unset */
+	uint32_t		mcu_timeouts;
+	uint32_t		mcu_max_ms;
+	uint32_t		fw_log_events;
+	uint32_t		fw_log_lines;
+	uint32_t		unsol_events;
+	uint8_t			hw_type;
+	bool			hw_type_valid;
+	uint16_t		ee_chip_id;
+	uint8_t			ee_mac[6];
+	bool			ee_valid;
+	int32_t			temperature;
+	bool			temp_valid;
+	uint32_t		wtbl_busy;
+	uint32_t		p3_fatal;
+	uint32_t		p3_warn;
 };
 
 static bool mt7927_bar_fault;
@@ -4964,6 +5049,53 @@ mt7927_intr(void *arg)
 /* ---- MCU messages ---- */
 
 /*
+ * Unsolicited firmware event (rxd option has MCU_UNI_CMD_UNSOLICITED_EVENT),
+ * mt7925_mcu_uni_rx_unsolicited_event(). Firmware text log lines (FW_LOG_2_HOST,
+ * id 0x28) are copied to the debug log like mt7925_mcu_uni_debug_msg_event();
+ * everything else is counted and the first few are logged.
+ */
+static void
+mt7927_unsolicited(struct mt7927_bringup *b, struct mt7927_ring *r,
+    const uint8_t *p, uint32_t len)
+{
+	uint8_t eid = p[32 + 4];
+
+	b->unsol_events++;
+	if (eid == MT7927_UNI_EVENT_FW_LOG) {
+		/* rxd(44) + rsv(4) + tag(2) len(2) fmt(1) rsv(3), then id */
+		const uint32_t id_off = MT7927_MCU_RXD_LEN + 4 + 8;
+		char line[161];
+		uint32_t i, n;
+
+		b->fw_log_events++;
+		if (len <= id_off || p[id_off] != 0x28 ||
+		    b->fw_log_lines >= MT7927_FW_LOG_LINES)
+			return;
+		n = len - id_off;
+		if (n > sizeof(line) - 1)
+			n = sizeof(line) - 1;
+		for (i = 0; i < n; i++) {
+			uint8_t c = p[id_off + i];
+
+			if (c == 0)
+				break;
+			line[i] = (c >= 0x20 && c < 0x7f) ? (char)c : ' ';
+		}
+		while (i > 0 && line[i - 1] == ' ')
+			i--;
+		line[i] = '\0';
+		if (i == 0)
+			return;
+		b->fw_log_lines++;
+		MWX_DEV_LOG(b->sc, "MT7927 fw: %s\n", line);
+		return;
+	}
+	if (b->unsolicited++ < 16)
+		MWX_DEV_LOG(b->sc, "MT7927 unsolicited event on %s: eid=0x%02x "
+		    "len=%u\n", r->name, eid, len);
+}
+
+/*
  * Drain completed RX descriptors on all three rings. An event whose seq
  * matches want_seq is copied to b->resp (payload after the 44-byte MCU RXD)
  * and *matched is set. Re-enables the host interrupt mask afterwards, like
@@ -4990,9 +5122,11 @@ mt7927_service(struct mt7927_bringup *b, uint8_t want_seq, bool *matched)
 			if (len >= MT7927_MCU_RXD_LEN - 4 &&
 			    type == MT7927_PKT_TYPE_RX_EVENT) {
 				uint8_t eid = p[32 + 4], seq = p[32 + 5];
-				uint8_t ext_eid = p[32 + 8];
+				uint8_t opt = p[32 + 6], ext_eid = p[32 + 8];
 
-				if (want_seq != 0 && seq == want_seq &&
+				if (opt & MT7927_RXD_OPT_UNSOLICITED) {
+					mt7927_unsolicited(b, r, p, len);
+				} else if (want_seq != 0 && seq == want_seq &&
 				    matched != NULL && !*matched) {
 					b->resp_status = ext_eid;
 					b->resp_len = len > MT7927_MCU_RXD_LEN ?
@@ -5027,7 +5161,7 @@ static int
 mt7927_mcu_send(struct mt7927_bringup *b, uint32_t cmd, const void *data,
     uint32_t len, bool wait)
 {
-	uint8_t buf[sizeof(struct mwx_mcu_txd) + 512];
+	uint8_t *buf = b->txbuf;
 	uint32_t txd_len, tot_len, mcu_cmd = cmd & MCU_CMD_FIELD_ID_MASK;
 	uint32_t *txd = (uint32_t *)buf;
 	bool matched = false;
@@ -5039,7 +5173,7 @@ mt7927_mcu_send(struct mt7927_bringup *b, uint32_t cmd, const void *data,
 
 	txd_len = (cmd & MCU_CMD_FIELD_UNI) ? sizeof(struct mwx_uni_txd) :
 	    sizeof(struct mwx_mcu_txd);
-	if (len > sizeof(buf) - txd_len)
+	if (len > sizeof(b->txbuf) - txd_len)
 		return EINVAL;
 	tot_len = txd_len + len;
 
@@ -5096,8 +5230,11 @@ mt7927_mcu_send(struct mt7927_bringup *b, uint32_t cmd, const void *data,
 
 	for (waited = 0; waited <= MT7927_MCU_TIMEOUT_MS; waited++) {
 		mt7927_service(b, seq, &matched);
-		if (matched)
+		if (matched) {
+			if ((uint32_t)waited > b->mcu_max_ms)
+				b->mcu_max_ms = waited;
 			return 0;
+		}
 		if (mt7927_aborted(b))
 			return ECANCELED;
 		mt7927_wait(b, 1);
@@ -5106,6 +5243,7 @@ mt7927_mcu_send(struct mt7927_bringup *b, uint32_t cmd, const void *data,
 	    "intr_seen=0x%08x mcu_tx dma_idx=%u)\n", cmd, seq, b->intr_count,
 	    b->intr_seen, mt7927_rr(b->sc,
 	    b->tx[MT7927_TX_MCU].regbase + MT_DMA_DMA_IDX));
+	b->mcu_timeouts++;
 	return ETIMEDOUT;
 }
 
@@ -5630,8 +5768,37 @@ mt7927_nic_capability(struct mt7927_bringup *b)
 				mt7927_publish(b->pci, "MT7927NicHas6G", data[0]);
 			break;
 		case MT7927_NIC_CAP_HW_VER:
-		case MT7927_NIC_CAP_SW_VER:
+		case MT7927_NIC_CAP_SW_VER: {
+			char hex[3 * 16 + 1];
+			uint16_t k, m = dlen < 16 ? dlen : 16;
+
+			for (k = 0; k < m; k++)
+				snprintf(hex + 3 * k, 4, "%02x ", data[k]);
+			hex[3 * m] = '\0';
+			MWX_DEV_LOG(sc, "MT7927   %s: %s\n",
+			    tag == MT7927_NIC_CAP_HW_VER ? "HW_VER" : "SW_VER", hex);
+			if (tag == MT7927_NIC_CAP_HW_VER && dlen >= 4)
+				mt7927_publish(b->pci, "MT7927NicHwVer",
+				    (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+				    ((uint32_t)data[2] << 16) |
+				    ((uint32_t)data[3] << 24));
+			break;
+		}
 		case MT7927_NIC_CAP_CHIP_CAP:
+			if (dlen >= 8) {
+				uint64_t v = 0;
+				int k;
+
+				for (k = 7; k >= 0; k--)
+					v = (v << 8) | data[k];
+				b->chip_cap = v;
+				b->chip_cap_valid = true;
+				MWX_DEV_LOG(sc, "MT7927   CHIP_CAP: 0x%016llx\n",
+				    (unsigned long long)v);
+				mt7927_publish(b->pci, "MT7927NicChipCap",
+				    (uint32_t)v);
+			}
+			break;
 		default:
 			break;
 		}
@@ -5650,6 +5817,453 @@ mt7927_nic_capability(struct mt7927_bringup *b)
 		MWX_DEV_LOG(sc, "MT7927 MAC address from firmware: %s\n", mac);
 		mt7927_publish_str(b->pci, "MT7927MACAddress", mac);
 	}
+	return 0;
+}
+
+/* ---- Phase 3: connac3 init (__mt7925_init_hardware and friends) ---- */
+
+static void
+mt7927_le32enc(uint8_t *p, uint32_t v)
+{
+	p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+}
+
+static uint32_t
+mt7927_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+	    ((uint32_t)p[3] << 24);
+}
+
+/* Record a phase 3 step result. fatal steps fail the stage, others warn. */
+static int
+mt7927_p3_step(struct mt7927_bringup *b, const char *what, int rv, bool fatal)
+{
+	if (rv == 0) {
+		MWX_DEV_LOG(b->sc, "MT7927 p3 %-22s ok\n", what);
+		return 0;
+	}
+	MWX_DEV_LOG(b->sc, "MT7927 p3 %-22s FAILED (%d)%s\n", what, rv,
+	    fatal ? "" : " - warning only, as in Linux");
+	if (fatal)
+		b->p3_fatal++;
+	else
+		b->p3_warn++;
+	return rv;
+}
+
+/*
+ * mt7925_mcu_read_eeprom(): UNI EFUSE_CTRL query, tag ACCESS. Returns the
+ * 16-byte block containing offset in blk.
+ */
+static int
+mt7927_efuse_read(struct mt7927_bringup *b, uint32_t offset, uint8_t *blk)
+{
+	struct {
+		uint8_t		rsv[4];
+		uint16_t	tag, len;
+		uint32_t	addr, valid;
+		uint8_t		data[MT7927_EEPROM_BLOCK];
+	} __packed req;
+	/* event: rsv[4] tag len ver addr valid size magic type rsv1[4x4] data[32] */
+	const uint32_t data_off = 4 + 4 + 6 * 4 + 16;
+	int rv;
+
+	memset(&req, 0, sizeof(req));
+	req.tag = htole16(MT7927_UNI_EFUSE_ACCESS);
+	req.len = htole16(sizeof(req) - 4);
+	req.addr = htole32(offset & ~(uint32_t)(MT7927_EEPROM_BLOCK - 1));
+	if ((rv = mt7927_mcu_send(b, MT7927_WM_UNI_QUERY(MCU_UNI_CMD_EFUSE_CTRL),
+	    &req, sizeof(req), true)) != 0)
+		return rv;
+	if (b->resp_len < data_off + 32) {
+		MWX_DEV_LOG(b->sc, "MT7927 EFUSE read reply too short (%u)\n",
+		    b->resp_len);
+		return EINVAL;
+	}
+	memcpy(blk, b->resp + data_off, MT7927_EEPROM_BLOCK);
+	return 0;
+}
+
+/*
+ * mt7925_load_clc() front half: HW_TYPE from eFuse, then look for the CLC
+ * region (FW_FEATURE_NON_DL, type CLC) in the RAM image. Linux keeps the
+ * records for later SET_POWER_LIMIT calls from the regulatory code; here we
+ * only report what is there.
+ */
+static int
+mt7927_load_clc(struct mt7927_bringup *b, const uint8_t *fw, size_t size)
+{
+	const struct mwx_fw_trailer *hdr;
+	const struct mwx_fw_region *region;
+	uint8_t blk[MT7927_EEPROM_BLOCK];
+	size_t offset = 0;
+	int i, rv, records = 0;
+
+	if ((rv = mt7927_efuse_read(b, MT7927_EE_HW_TYPE, blk)) != 0)
+		return rv;
+	b->hw_type = blk[MT7927_EE_HW_TYPE % MT7927_EEPROM_BLOCK];
+	b->hw_type_valid = true;
+	MWX_DEV_LOG(b->sc, "MT7927 eFuse HW_TYPE 0x%02x (encap %u)\n", b->hw_type,
+	    b->hw_type & MT7927_EE_HW_TYPE_ENCAP);
+	mt7927_publish(b->pci, "MT7927EfuseHwType", b->hw_type);
+
+	if (fw == NULL || size < sizeof(*hdr))
+		return 0;
+	hdr = (const struct mwx_fw_trailer *)(fw + size - sizeof(*hdr));
+	if (size < sizeof(*hdr) + hdr->n_region * sizeof(*region))
+		return 0;
+	for (i = 0; i < hdr->n_region; i++) {
+		size_t len;
+
+		region = (const struct mwx_fw_region *)((const uint8_t *)hdr -
+		    (hdr->n_region - i) * sizeof(*region));
+		len = le32toh(region->len);
+		if ((region->feature_set & MT7927_FW_FEATURE_NON_DL) &&
+		    region->reserved1[0] == MT7927_FW_TYPE_CLC) {	/* type */
+			size_t o = 0;
+
+			if (offset + len > size)
+				break;
+			while (o + 16 <= len) {
+				uint32_t clen = mt7927_le32(fw + offset + o);
+
+				if (clen < 16 || clen > len - o)
+					break;
+				MWX_DEV_LOG(b->sc, "MT7927 CLC record idx %u ver %u "
+				    "len %u\n", fw[offset + o + 4],
+				    fw[offset + o + 5], clen);
+				records++;
+				o += clen;
+			}
+			break;
+		}
+		offset += len;
+	}
+	MWX_DEV_LOG(b->sc, "MT7927 CLC: %d record(s) in the RAM image%s\n",
+	    records, records ? " (not sent: no regulatory database yet)" :
+	    " (Linux then skips CLC and the regdb query)");
+	mt7927_publish(b->pci, "MT7927CLCRecords", records);
+	return 0;
+}
+
+/* mt7925_mcu_fw_log_2_host(): UNI WSYS_CONFIG, tag FW_LOG_CTRL. */
+static int
+mt7927_fw_log_2_host(struct mt7927_bringup *b, uint8_t ctrl)
+{
+	struct {
+		uint8_t		rsv[4];
+		uint16_t	tag, len;
+		uint8_t		ctrl, interval, rsv2[2];
+	} __packed req;
+
+	memset(&req, 0, sizeof(req));
+	req.tag = htole16(MT7927_UNI_WSYS_FW_LOG_CTRL);
+	req.len = htole16(sizeof(req) - 4);
+	req.ctrl = ctrl;
+	return mt7927_mcu_send(b, MCU_UNI_CMD_WSYS_CONFIG, &req, sizeof(req), true);
+}
+
+/* mt7925_mcu_set_eeprom(): eFuse mode, whole format, no buffer. */
+static int
+mt7927_set_eeprom(struct mt7927_bringup *b)
+{
+	struct {
+		uint8_t		rsv[4];
+		uint16_t	tag, len;
+		uint8_t		buffer_mode, format;
+		uint16_t	buf_len;
+	} __packed req;
+
+	memset(&req, 0, sizeof(req));
+	req.tag = htole16(MT7927_UNI_EFUSE_BUFFER_MODE);
+	req.len = htole16(sizeof(req) - 4);
+	req.buffer_mode = MT7927_EE_MODE_EFUSE;
+	req.format = MT7927_EE_FORMAT_WHOLE;
+	return mt7927_mcu_send(b, MCU_UNI_CMD_EFUSE_CTRL, &req, sizeof(req), true);
+}
+
+/* mt7925_mcu_chip_config(): text command, sent without waiting. */
+static int
+mt7927_chip_config(struct mt7927_bringup *b, const char *cmd)
+{
+	struct {
+		uint8_t		rsv[4];
+		uint16_t	tag, len;
+		uint16_t	id;
+		uint8_t		type, resp_type;
+		uint16_t	data_size, resv;
+		uint8_t		data[320];
+	} __packed req;
+	size_t n = strlen(cmd) + 1;
+
+	if (n > sizeof(req.data))
+		return EINVAL;
+	memset(&req, 0, sizeof(req));
+	req.tag = htole16(MT7927_UNI_CHIP_CONFIG_CHIP_CFG);
+	req.len = htole16(sizeof(req) - 4);
+	req.data_size = htole16(n);
+	memcpy(req.data, cmd, n);
+	MWX_DEV_LOG(b->sc, "MT7927 chip config \"%s\"\n", cmd);
+	return mt7927_mcu_send(b, MCU_UNI_CMD_CHIP_CONFIG, &req, sizeof(req), false);
+}
+
+/* mt7925_mac_wtbl_update() */
+static bool
+mt7927_wtbl_update(struct mwx_softc *sc, int idx, uint32_t mask)
+{
+	mt7927_rmw(sc, MT7927_WTBL_UPDATE, MT7927_WTBL_UPDATE_IDX_MASK,
+	    ((uint32_t)idx & MT7927_WTBL_UPDATE_IDX_MASK) | mask);
+	return mt7927_poll(sc, MT7927_WTBL_UPDATE, MT7927_WTBL_UPDATE_BUSY, 0, 5,
+	    false, NULL);
+}
+
+/*
+ * mt7925_mac_init(): MDP max RX length and de-aggregation, clear the WTBL
+ * admission counters, mt792x_mac_init_band() for both bands, basic rate
+ * table. Pure register writes; Linux ignores the WTBL poll result.
+ */
+static void
+mt7927_mac_init(struct mt7927_bringup *b)
+{
+	/* mt76_rates[] hw_value: (MT_PHY_TYPE_CCK 0 | OFDM 1) << 8 | idx */
+	static const uint16_t rates[] = {
+		0x000, 0x001, 0x002, 0x003,
+		0x10b, 0x10f, 0x10a, 0x10e, 0x109, 0x10d, 0x108, 0x10c,
+	};
+	struct mwx_softc *sc = b->sc;
+	uint32_t i, band;
+
+	mt7927_rmw(sc, MT7927_MDP_DCR1, MT7927_MAX_RX_LEN_MASK, MT7927_MAX_RX_LEN);
+	mt7927_set(sc, MT7927_MDP_DCR0, MT7927_MDP_DCR0_DAMSDU_EN);
+
+	b->wtbl_busy = 0;
+	for (i = 0; i < MT7927_WTBL_SIZE; i++)
+		if (!mt7927_wtbl_update(sc, i, MT7927_WTBL_UPDATE_ADM_CLR))
+			b->wtbl_busy++;
+
+	for (band = 0; band < 2; band++) {
+		mt7927_rmw(sc, MT7927_TMAC_CTCR0(band), MT7927_CTCR0_REFTIME_MASK,
+		    0x3f);
+		mt7927_set(sc, MT7927_TMAC_CTCR0(band),
+		    MT7927_CTCR0_VHT_SMPDU_EN | MT7927_CTCR0_DDLMT_EN);
+		mt7927_set(sc, MT7927_RMAC_MIB_TIME0(band),
+		    MT7927_RMAC_MIB_RXTIME_EN);
+		mt7927_set(sc, MT7927_RMAC_MIB_AIRTIME0(band),
+		    MT7927_RMAC_MIB_RXTIME_EN);
+		mt7927_set(sc, MT7927_MIB_SCR1(band), MT7927_MIB_TXDUR_EN);
+		mt7927_set(sc, MT7927_MIB_SCR1(band), MT7927_MIB_RXDUR_EN);
+		mt7927_rmw(sc, MT7927_DMA_DCR0(band), MT7927_MAX_RX_LEN_MASK,
+		    MT7927_MAX_RX_LEN);
+		mt7927_clear(sc, MT7927_DMA_DCR0(band), MT7927_DMA_DCR0_RXD_G5_EN);
+		mt7927_rmw(sc, MT7927_WTBLOFF_RSCR(band), MT7927_RSCR_RCPI_MASK,
+		    MT7927_RSCR_RCPI_SET);
+	}
+
+	for (i = 0; i < nitems(rates); i++) {
+		uint16_t rate = ((rates[i] >> 8) << 6) | (rates[i] & 0x3f);
+
+		mt7927_wr(sc, MT7927_WTBL_ITDR0, rate);
+		mt7927_wr(sc, MT7927_WTBL_ITDR1, MT7927_WTBL_SPE_IDX_SEL);
+		mt7927_wr(sc, MT7927_WTBL_ITCR, MT7927_WTBL_ITCR_WR |
+		    MT7927_WTBL_ITCR_EXEC | (MT7927_BASIC_RATES_TBL + i));
+	}
+
+	MWX_DEV_LOG(sc, "MT7927 mac init: MDP_DCR0 0x%08x MDP_DCR1 0x%08x "
+	    "DMA_DCR0 0x%08x/0x%08x TMAC_CTCR0 0x%08x/0x%08x, WTBL busy %u/%u\n",
+	    mt7927_rr(sc, MT7927_MDP_DCR0), mt7927_rr(sc, MT7927_MDP_DCR1),
+	    mt7927_rr(sc, MT7927_DMA_DCR0(0)), mt7927_rr(sc, MT7927_DMA_DCR0(1)),
+	    mt7927_rr(sc, MT7927_TMAC_CTCR0(0)), mt7927_rr(sc, MT7927_TMAC_CTCR0(1)),
+	    b->wtbl_busy, MT7927_WTBL_SIZE);
+}
+
+/* mt7925_mcu_set_dbdc(): UNI SET_DBDC_PARMS, tag MBMC_SETTING. */
+static int
+mt7927_set_dbdc(struct mt7927_bringup *b, bool enable)
+{
+	struct {
+		uint8_t		pad[4];
+		uint16_t	tag, len;
+		uint8_t		mbmc_en, band, pad2[2];
+	} __packed req;
+
+	memset(&req, 0, sizeof(req));
+	req.tag = htole16(MT7927_UNI_MBMC_SETTING);
+	req.len = htole16(sizeof(req) - 4);
+	req.mbmc_en = enable;
+	return mt7927_mcu_send(b, MT7927_UNI_SET_DBDC_PARMS, &req, sizeof(req), true);
+}
+
+/*
+ * mt7925_mcu_set_channel_domain() with the mt76 channel lists. There is no
+ * cfg80211 here, so channel flags follow the world regulatory domain:
+ * active scan only on 2.4 GHz 1-11, everything else passive, DFS marked,
+ * 5 GHz 169-177 dropped (disabled).
+ */
+static int
+mt7927_set_channel_domain(struct mt7927_bringup *b)
+{
+	static const uint8_t ch5[] = {
+		36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124,
+		128, 132, 136, 140, 144, 149, 153, 157, 161, 165,
+	};
+	uint32_t n2 = 0, n5 = 0, n6 = 0, len, i;
+	uint8_t msg[16 + 8 * (14 + 25 + 59)];
+	uint8_t *c = msg + 16;
+
+#define	MT7927_ADD_CH(hw, fl) do {					\
+	c[0] = (hw); c[1] = 0; c[2] = 0; c[3] = 0;			\
+	mt7927_le32enc(c + 4, (fl));					\
+	c += 8;								\
+} while (0)
+	for (i = 1; i <= 14; i++, n2++)
+		MT7927_ADD_CH(i, i <= 11 ? 0 : i <= 13 ? MT7927_CHAN_NO_IR :
+		    MT7927_CHAN_NO_IR | MT7927_CHAN_NO_OFDM);
+	for (i = 0; i < nitems(ch5); i++, n5++)
+		MT7927_ADD_CH(ch5[i], MT7927_CHAN_NO_IR |
+		    (ch5[i] >= 52 && ch5[i] <= 144 ? MT7927_CHAN_RADAR : 0));
+	for (i = 1; i <= 233; i += 4, n6++)
+		MT7927_ADD_CH(i, MT7927_CHAN_NO_IR);
+#undef MT7927_ADD_CH
+
+	memset(msg, 0, 16);
+	msg[0] = b->alpha2[0];
+	msg[1] = b->alpha2[1];
+	msg[4] = 0;		/* bw_2g: BW_20_40M */
+	msg[5] = 3;		/* bw_5g: BW_20_40_80_160M */
+	msg[6] = 3;		/* bw_6g */
+	len = 8 + (n2 + n5 + n6) * 8;
+	msg[8] = 2;		/* tag */
+	msg[9] = 0;
+	msg[10] = len & 0xff;
+	msg[11] = len >> 8;
+	msg[12] = n2;
+	msg[13] = n5;
+	msg[14] = n6;
+	MWX_DEV_LOG(b->sc, "MT7927 channel domain \"%c%c\": %u+%u+%u channels\n",
+	    b->alpha2[0] ? b->alpha2[0] : '-', b->alpha2[1] ? b->alpha2[1] : '-',
+	    n2, n5, n6);
+	return mt7927_mcu_send(b, MT7927_UNI_SET_DOMAIN_INFO, msg,
+	    (uint32_t)(c - msg), true);
+}
+
+/* mt7925_mcu_set_rts_thresh(): UNI BAND_CONFIG, tag RTS_THRESHOLD, band 0. */
+static int
+mt7927_set_rts_thresh(struct mt7927_bringup *b, uint32_t val)
+{
+	struct {
+		uint8_t		band_idx, rsv[3];
+		uint16_t	tag, len;
+		uint32_t	len_thresh, pkt_thresh;
+	} __packed req;
+
+	memset(&req, 0, sizeof(req));
+	req.tag = htole16(MT7927_UNI_BAND_CONFIG_RTS);
+	req.len = htole16(sizeof(req) - 4);
+	req.len_thresh = htole32(val);
+	req.pkt_thresh = htole32(2);
+	return mt7927_mcu_send(b, MT7927_UNI_BAND_CONFIG, &req, sizeof(req), true);
+}
+
+/* mt7925_mcu_get_temperature(): UNI THERMAL query, tag 0. */
+static int
+mt7927_get_temperature(struct mt7927_bringup *b)
+{
+	struct {
+		uint8_t		rsv[4];
+		uint16_t	tag, len;
+		uint8_t		rsv2[4];
+	} __packed req;
+	int rv;
+
+	memset(&req, 0, sizeof(req));
+	req.len = htole16(sizeof(req) - 4);
+	if ((rv = mt7927_mcu_send(b, MT7927_WM_UNI_QUERY(MT7927_UNI_THERMAL),
+	    &req, sizeof(req), true)) != 0)
+		return rv;
+	if (b->resp_len < 4 + 4 + 8)
+		return EINVAL;
+	b->temperature = (int32_t)mt7927_le32(b->resp + 4 + 4 + 4);
+	b->temp_valid = true;
+	MWX_DEV_LOG(b->sc, "MT7927 temperature %d C\n", b->temperature);
+	mt7927_publish(b->pci, "MT7927TemperatureC", (uint32_t)b->temperature);
+	return 0;
+}
+
+/*
+ * Phase 3, in Linux order:
+ *   mt7925_run_firmware tail: load_clc (eFuse HW_TYPE), fw_log_2_host(1)
+ *   __mt7925_init_hardware:   set_eeprom, mac_init, set_dbdc(true) (MT7927)
+ *   mt7925_init_work:         thermal protect, KeepFullPwr (no deep sleep on MT7927)
+ *   __mt7925_start:           channel domain, RTS threshold
+ * plus two read-only checks: eFuse block 0 (chip ID, MAC) and temperature.
+ * Fatal steps are the ones whose failure fails init in Linux.
+ */
+static int
+mt7927_connac3_init(struct mt7927_bringup *b, const uint8_t *ram, size_t ram_len)
+{
+	struct mwx_softc *sc = b->sc;
+	uint8_t blk[MT7927_EEPROM_BLOCK];
+	uint32_t t0 = b->mcu_timeouts;
+	int rv, i;
+
+	b->p3_fatal = b->p3_warn = 0;
+
+	mt7927_p3_step(b, "load_clc/eFuse HW_TYPE", mt7927_load_clc(b, ram, ram_len),
+	    true);
+	rv = mt7927_efuse_read(b, 0, blk);
+	if (rv == 0) {
+		char mac[18];
+
+		b->ee_chip_id = (uint16_t)(blk[0] | (blk[1] << 8));
+		memcpy(b->ee_mac, blk + 4, 6);
+		b->ee_valid = true;
+		snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+		    blk[4], blk[5], blk[6], blk[7], blk[8], blk[9]);
+		MWX_DEV_LOG(sc, "MT7927 eFuse chip id 0x%04x version 0x%04x MAC %s%s\n",
+		    b->ee_chip_id, blk[2] | (blk[3] << 8), mac,
+		    b->mac_valid && memcmp(b->mac, blk + 4, 6) == 0 ?
+		    " (matches firmware)" : "");
+		mt7927_publish(b->pci, "MT7927EfuseChipID", b->ee_chip_id);
+		mt7927_publish_str(b->pci, "MT7927EfuseMAC", mac);
+	}
+	mt7927_p3_step(b, "eFuse block 0 (check)", rv, false);
+	mt7927_p3_step(b, "fw_log_2_host(1)", mt7927_fw_log_2_host(b, 1), true);
+	mt7927_p3_step(b, "set_eeprom", mt7927_set_eeprom(b), true);
+	mt7927_mac_init(b);
+	mt7927_p3_step(b, "set_dbdc(true)", mt7927_set_dbdc(b, true), false);
+	if (mt7927_aborted(b))
+		return ECANCELED;
+	mt7927_p3_step(b, "thermal protect 2G", mt7927_chip_config(b,
+	    "ThermalProtGband 0 100 90 80 30 1 1 115 105 5"), true);
+	mt7927_p3_step(b, "thermal protect 5G", mt7927_chip_config(b,
+	    "ThermalProtAband 1 100 90 80 30 1 1 115 105 5"), true);
+	mt7927_p3_step(b, "KeepFullPwr 1", mt7927_chip_config(b, "KeepFullPwr 1"),
+	    false);
+	mt7927_p3_step(b, "channel domain", mt7927_set_channel_domain(b), true);
+	mt7927_p3_step(b, "RTS threshold", mt7927_set_rts_thresh(b,
+	    MT7927_RTS_THRESH), true);
+	mt7927_p3_step(b, "temperature (check)", mt7927_get_temperature(b), false);
+
+	/* Let late events (firmware log lines, MBMC) arrive and be counted. */
+	for (i = 0; i < 300 && !mt7927_aborted(b); i++) {
+		mt7927_service(b, 0, NULL);
+		mt7927_wait(b, 1);
+	}
+	mt7927_service(b, 0, NULL);
+
+	MWX_DEV_LOG(sc, "MT7927 phase 3: %u fatal, %u warnings, %u MCU timeouts, "
+	    "slowest reply %u ms, %u unsolicited events (%u firmware log, %u lines)\n",
+	    b->p3_fatal, b->p3_warn, b->mcu_timeouts - t0, b->mcu_max_ms,
+	    b->unsol_events, b->fw_log_events, b->fw_log_lines);
+	mt7927_publish(b->pci, "MT7927P3Fatal", b->p3_fatal);
+	mt7927_publish(b->pci, "MT7927P3Warnings", b->p3_warn);
+	mt7927_publish(b->pci, "MT7927MCUTimeouts", b->mcu_timeouts);
+	mt7927_publish(b->pci, "MT7927MCUSlowestMs", b->mcu_max_ms);
+	mt7927_publish(b->pci, "MT7927FwLogEvents", b->fw_log_events);
+	mt7927_publish(b->pci, "MT7927WtblBusy", b->wtbl_busy);
+	if (b->p3_fatal != 0 || b->mcu_timeouts != t0)
+		return EIO;
 	return 0;
 }
 
@@ -5808,6 +6422,18 @@ mt7927_bringup_destroy(struct mt7927_bringup *b)
  * capability query. Always tears down before returning. Returns the last
  * stage that passed.
  */
+/* Country code for SET_DOMAIN_INFO (two letters), NULL or "" for unset. */
+void
+mt7927_bringup_set_country(struct mt7927_bringup *b, const char *cc)
+{
+	b->alpha2[0] = b->alpha2[1] = 0;
+	if (cc != NULL && cc[0] >= 'A' && cc[0] <= 'Z' && cc[1] >= 'A' &&
+	    cc[1] <= 'Z' && cc[2] == '\0') {
+		b->alpha2[0] = cc[0];
+		b->alpha2[1] = cc[1];
+	}
+}
+
 int
 mt7927_bringup_run(struct mt7927_bringup *b, int stage, const uint8_t *patch,
     size_t patch_len, const uint8_t *ram, size_t ram_len, volatile bool *abort)
@@ -5854,6 +6480,16 @@ mt7927_bringup_run(struct mt7927_bringup *b, int stage, const uint8_t *patch,
 	}
 	passed = 4;
 	MWX_DEV_LOG(sc, "MT7927 phase 2 PASS: firmware answers MCU queries\n");
+	if (stage < 5 || mt7927_aborted(b))
+		goto done;
+
+	if ((rv = mt7927_connac3_init(b, ram, ram_len)) != 0) {
+		MWX_DEV_LOG(sc, "MT7927 phase 3 (connac3 init) failed (%d)\n", rv);
+		goto done;
+	}
+	passed = 5;
+	MWX_DEV_LOG(sc, "MT7927 phase 3 PASS: connac3 init complete, no MCU "
+	    "timeouts\n");
 done:
 	mt7927_publish(b->pci, "MT7927InterruptCount", b->intr_count);
 	mt7927_publish(b->pci, "MT7927InterruptBits", b->intr_seen);
