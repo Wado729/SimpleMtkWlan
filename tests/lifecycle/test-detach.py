@@ -13,10 +13,9 @@ pre=r'''
 #define IFF_RUNNING 1
 #define MT_WFDMA0_HOST_INT_ENA 0
 struct IOPCIDevice {};
-enum mwx_hw_type { MWX_HW_MT7921, MWX_HW_MT7922, MWX_HW_MT7927 };
 struct ifnet { int if_flags=0; };
 struct IC { ifnet ic_if; };
-struct Soft { IC sc_ic; bool sc_detaching=false,sc_net_attached=false; void *sc_reset_to=nullptr,*sc_nswq=nullptr,*sc_ih=nullptr; int sc_memh=0,sc_st=0,sc_mems=0; mwx_hw_type sc_hwtype=MWX_HW_MT7921; };
+struct Soft { IC sc_ic; bool sc_detaching=false,sc_net_attached=false; void *sc_reset_to=nullptr,*sc_nswq=nullptr,*sc_ih=nullptr; int sc_memh=0,sc_st=0,sc_mems=0; };
 struct PCI { int pa_pc=0; };
 std::vector<int> events; void *systq=(void*)1;
 void taskq_destroy(void *q) { if(q) events.push_back(8); }
@@ -52,14 +51,7 @@ int main(){
   events.clear();h.detach(nullptr);assert(events.size()==1&&events[0]==12);
  }
  MtkMwx h;h.taskQueueOwned=true;events.clear();h.detach(nullptr);assert(!h.taskQueueOwned&&events[0]==8);
- {
-  /* MT7927 probe-only attach: BAR mapped, no connac2 WFDMA to quiesce. */
-  events.clear();MtkMwx m;m.com=new Soft;m.pci=new PCI;m.taskQueueOwned=true;
-  m.com->sc_memh=1;m.com->sc_hwtype=MWX_HW_MT7927;
-  m.detach(nullptr);assert(!m.com&&!m.pci);
-  assert(index(6)==-1);assert(index(11)>=0&&index(10)<index(11));
- }
- puts("PASS actual HAL detach body: 16 partial/full resource combinations, repeated detach, IRQ/queue/timer-before-buffer ordering, MT7927 probe-only detach skips WFDMA. Mocks do not prove kernel scheduling.");
+ puts("PASS actual HAL detach body: 16 partial/full resource combinations, repeated detach, IRQ/queue/timer-before-buffer ordering. Mocks do not prove kernel scheduling.");
 }
 '''
 f=out/'test-detach.cpp';f.write_text(pre+'void MtkMwx::detach(IOPCIDevice *device)\n{'+body+'\n}\n'+post)

@@ -27,6 +27,21 @@
 	<string>$(MODULE_VERSION)</string>
 	<key>IOKitPersonalities</key>
 	<dict>
+		<key>MT7927Bringup</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.laobamac.SimpleMtkWlan</string>
+			<key>IOClass</key>
+			<string>MtkMt7927Bringup</string>
+			<key>IOMatchCategory</key>
+			<string>IODefaultMatchCategory</string>
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x792714c3</string>
+			<key>IOProbeScore</key>
+			<integer>2000</integer>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+		</dict>
 		<key>SimpleMtkWlan</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
@@ -36,7 +51,7 @@
 			<key>IOMatchCategory</key>
 			<string>IODefaultMatchCategory</string>
 			<key>IOPCIPrimaryMatch</key>
-			<string>0x796114c3 0x060814c3 0x792214c3 0x792714c3</string>
+			<string>0x796114c3 0x060814c3 0x792214c3</string>
 			<key>IOProbeScore</key>
 			<integer>2000</integer>
 			<key>IOProviderClass</key>

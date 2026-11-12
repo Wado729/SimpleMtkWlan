@@ -68,4 +68,15 @@ private:
     struct pci_attach_args *pci;
 };
 
+/*
+ * MT7927 bring-up (phase 1 + 2), implemented in MtkMwx.cpp and driven by
+ * MtkMt7927Bringup in SimpleMtkWlan.cpp. Independent of the MT7921 HAL.
+ */
+struct mt7927_bringup;
+struct mt7927_bringup *mt7927_bringup_create(IOPCIDevice *dev, IOWorkLoop *wl);
+int mt7927_bringup_run(struct mt7927_bringup *b, int stage,
+    const uint8_t *patch, size_t patch_len, const uint8_t *ram, size_t ram_len,
+    volatile bool *abort);
+void mt7927_bringup_destroy(struct mt7927_bringup *b);
+
 #endif /* MtkMwx_hpp */

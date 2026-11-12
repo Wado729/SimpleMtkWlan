@@ -378,6 +378,52 @@
 #define	MT7927_SEMA_OWN_STA			0x40000
 #define	MT7927_SEMA_OWN_STA_REP			0x40400
 
+/*
+ * MT7927 WFDMA (connac3 host side), from Linux mt792x_regs.h / mt7925/regs.h.
+ * Ring layout: TX 0 (data), 15 (MCU WM), 16 (firmware download);
+ * RX 4 (data), 6 (MCU events), 7 (second data / WM2).
+ */
+#define	MT7927_TX_RING_BASE			0xd4300
+#define	MT7927_RX_RING_BASE			0xd4500
+#define	MT7927_RING_REG(base, idx)		((base) + (idx) * 0x10)
+#define	MT7927_TXQ_BAND0			0
+#define	MT7927_TXQ_MCU_WM			15
+#define	MT7927_TXQ_FWDL				16
+#define	MT7927_RXQ_BAND0			4
+#define	MT7927_RXQ_MCU_WM			6
+#define	MT7927_RXQ_DATA2			7
+
+#define	MT7927_WFDMA0_RX_RING4_EXT_CTRL		0xd4690
+#define	MT7927_WFDMA0_RX_RING6_EXT_CTRL		0xd4698
+#define	MT7927_WFDMA0_RX_RING7_EXT_CTRL		0xd469c
+#define	MT7927_WFDMA0_GLO_CFG_EXT1		0xd42b4
+#define	MT7927_WFDMA_PREFETCH_CTRL		0xd7030
+#define	MT7927_WFDMA_PREFETCH_CFG0		0xd70f0
+#define	MT7927_WFDMA_PREFETCH_CFG1		0xd70f4
+#define	MT7927_WFDMA_PREFETCH_CFG2		0xd70f8
+#define	MT7927_WFDMA_PREFETCH_CFG3		0xd70fc
+#define	MT7927_GLO_CFG_FW_DWLD_BYPASS_DMASHDL	(1U << 9)
+#define	MT7927_GLO_CFG_CSR_LBK_RX_Q_SEL_EN	(1U << 20)
+#define	MT7927_GLO_CFG_ADDR_EXT_EN		(1U << 26)
+
+/* Interrupt map (mt7927_irq_map). */
+#define	MT7927_INT_RX_DONE_DATA			(1U << 12)	/* RX ring 4 */
+#define	MT7927_INT_RX_DONE_WM			(1U << 14)	/* RX ring 6 */
+#define	MT7927_INT_RX_DONE_WM2			(1U << 15)	/* RX ring 7 */
+#define	MT7927_INT_RX_DONE_ALL			(MT7927_INT_RX_DONE_DATA | \
+						 MT7927_INT_RX_DONE_WM | \
+						 MT7927_INT_RX_DONE_WM2)
+#define	MT7927_INT_TX_DONE_MCU_WM		((1U << 25) | (1U << 27))
+#define	MT7927_INT_TX_DONE_FWDL			(1U << 26)
+#define	MT7927_INT_TX_DONE_BAND0		(1U << 4)
+#define	MT7927_INT_TX_DONE_ALL			(MT7927_INT_TX_DONE_MCU_WM | \
+						 MT7927_INT_TX_DONE_FWDL | \
+						 MT7927_INT_TX_DONE_BAND0 | \
+						 0x0007fff0 /* GENMASK(18, 4) */)
+
+#define	MT7927_TOP_MISC_FW_STATE		0x7
+#define	MT7927_TOP_MISC2_FW_PWR_ON		0x1
+
 #define	MT_TOP_BASE			0x18060000
 #define	MT_TOP_LPCR_HOST_BAND0		0x18060010
 #define	MT_TOP_LPCR_HOST_FW_OWN		0x0001
