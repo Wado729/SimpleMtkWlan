@@ -626,6 +626,7 @@ struct mwx_softc {
 	struct mbuf_list	sc_7927_rxml;		/* RX batch for if_input */
 	uint32_t		sc_7927_rxml_frames;	/* 802.11 frames in it */
 	uint32_t		sc_7927_rx_batches, sc_7927_rx_batched;
+	uint32_t		sc_7927_rx_csum;	/* frames with chip-checked checksums */
 	uint32_t		sc_7927_depth_tok;	/* max tokens out, last 5 s */
 	uint32_t		sc_7927_tf_ev, sc_7927_tf_ms, sc_7927_tf_re;
 	uint32_t		sc_7927_depth_ring;	/* max undone descriptors */
@@ -4598,7 +4599,15 @@ enum { MT7927_TX_BAND0, MT7927_TX_MCU, MT7927_TX_FWDL, MT7927_NTX };
 enum { MT7927_RX_BAND0, MT7927_RX_MCU, MT7927_RX_DATA2, MT7927_NRX };
 #define MT7927_STAGE_N		64	/* rx6 frame staging slots */
 #define MT7927_RX_BATCH		64	/* 802.11 frames per if_input() */
-#define MT7927_TX_TOKENS	256	/* data TX payload buffers (msdu ids) */
+/*
+ * Data TX payload buffers (msdu ids). Linux allows 8192 and limits latency
+ * with mac80211's airtime queue limit, which we do not have: 1024 is about
+ * 15 ms of 2x2 VHT80 airtime.
+ */
+#define MT7927_TX_TOKENS	1024
+#define MT7927_TOK_PER_CHUNK	(MT7927_CHUNK_SZ / MT7927_TX_TOKEN_SZ)
+#define MT7927_TOK_CHUNKS	((MT7927_TX_TOKENS + MT7927_TOK_PER_CHUNK - 1) / \
+				    MT7927_TOK_PER_CHUNK)
 #define MT7927_TX_TOKEN_SZ	2304
 /* no TX free event for this many watchdog seconds: tokens may be reclaimed */
 #define MT7927_RECLAIM_TICKS	3
@@ -4666,6 +4675,7 @@ struct mt7927_bringup {
 	void			*cb_arg;
 	void			(*cb_rx)(void *, const uint8_t *, uint32_t);
 	void			(*cb_rx_done)(void *);	/* end of an RX batch */
+	uint32_t		rx_cur_info;	/* DMA descriptor info of the frame in cb_rx */
 	void			(*cb_event)(void *, uint8_t, const uint8_t *,
 				    uint32_t);
 	void			(*cb_txroom)(void *);
@@ -4705,7 +4715,7 @@ struct mt7927_bringup {
 	uint32_t		roc_grant_ms;
 	uint32_t		roc_events;
 	/* phase 4b: data TX tokens (payload buffers named by msdu id) */
-	struct mt7927_dmamem	tok_mem;
+	struct mt7927_dmamem	tok_chunk[MT7927_TOK_CHUNKS];
 	volatile uint8_t	tok_busy[MT7927_TX_TOKENS];
 	uint32_t		tok_when[MT7927_TX_TOKENS];
 	uint32_t		tok_seq;
@@ -5739,7 +5749,10 @@ mt7927_drain(struct mt7927_bringup *b, struct mt7927_ring *r, bool deliver,
 		    (type == PKT_TYPE_NORMAL ||
 		    type == MT7927_PKT_TYPE_NORMAL_MCU)) {
 			b->rx_frames++;
+			/* checksum status (mt76_dma_get_buf: desc->info) */
+			b->rx_cur_info = le32toh(r->desc[r->tail].info);
 			b->cb_rx(b->cb_arg, p, len);
+			b->rx_cur_info = 0;
 		} else if (!deliver && b->running && b->cb_rx != NULL &&
 		    (type == PKT_TYPE_NORMAL ||
 		    type == MT7927_PKT_TYPE_NORMAL_MCU)) {
@@ -6098,7 +6111,7 @@ mt7927_dma_init(struct mt7927_bringup *b)
 
 	b->rings_alloc = true;
 	if ((rv = mt7927_ring_alloc(b, &b->tx[MT7927_TX_BAND0], "tx0", false,
-	    MT7927_TXQ_BAND0, 256, 128)) != 0 ||
+	    MT7927_TXQ_BAND0, MT7927_TX_TOKENS, 128)) != 0 ||
 	    (rv = mt7927_ring_alloc(b, &b->tx[MT7927_TX_MCU], "tx15-mcu", false,
 	    MT7927_TXQ_MCU_WM, 32, 2048)) != 0 ||
 	    (rv = mt7927_ring_alloc(b, &b->tx[MT7927_TX_FWDL], "tx16-fwdl", false,
@@ -7883,16 +7896,27 @@ mt7927_roc_event(struct mt7927_bringup *b, const uint8_t *p, uint32_t len)
 
 /* ---- data TX: connac3 TXD + hw TXP on ring 0, payload in a token buffer ---- */
 
+static void mt7927_tx_free_mem(struct mt7927_bringup *);
+
 static int
 mt7927_tx_alloc(struct mt7927_bringup *b)
 {
 	int rv;
 
-	if (b->tok_mem.va != NULL)
+	if (b->tok_chunk[0].va != NULL)
 		return 0;
-	rv = mt7927_dmamem_alloc(&b->tok_mem,
-	    (size_t)MT7927_TX_TOKENS * MT7927_TX_TOKEN_SZ, true);
-	if (rv == 0) {
+	rv = 0;
+	for (uint32_t i = 0; i < MT7927_TOK_CHUNKS && rv == 0; i++) {
+		uint32_t n = MT7927_TX_TOKENS - i * MT7927_TOK_PER_CHUNK;
+
+		if (n > MT7927_TOK_PER_CHUNK)
+			n = MT7927_TOK_PER_CHUNK;
+		rv = mt7927_dmamem_alloc(&b->tok_chunk[i],
+		    (size_t)n * MT7927_TX_TOKEN_SZ, true);
+	}
+	if (rv != 0) {
+		mt7927_tx_free_mem(b);
+	} else {
 		memset((void *)b->tok_busy, 0, sizeof(b->tok_busy));
 		b->tok_seq = 0;
 	}
@@ -7902,8 +7926,9 @@ mt7927_tx_alloc(struct mt7927_bringup *b)
 static void
 mt7927_tx_free_mem(struct mt7927_bringup *b)
 {
-	if (b->tok_mem.va != NULL)
-		mt7927_dmamem_free(&b->tok_mem);
+	for (uint32_t i = 0; i < MT7927_TOK_CHUNKS; i++)
+		if (b->tok_chunk[i].va != NULL)
+			mt7927_dmamem_free(&b->tok_chunk[i]);
 	memset((void *)b->tok_busy, 0, sizeof(b->tok_busy));
 }
 
@@ -8090,7 +8115,7 @@ mt7927_tx_frame(struct mt7927_bringup *b, const struct mt7927_txinfo *ti,
 	struct mwx_desc *d;
 	uint8_t fc0;
 
-	if (!b->running || b->tok_mem.va == NULL || r->desc == NULL)
+	if (!b->running || b->tok_chunk[0].va == NULL || r->desc == NULL)
 		return ENXIO;
 	if (len < 10 || len > MT7927_TX_TOKEN_SZ)
 		return EINVAL;
@@ -8139,9 +8164,14 @@ mt7927_tx_frame(struct mt7927_bringup *b, const struct mt7927_txinfo *ti,
 	b->tok_busy[tok] = 1;
 	b->tok_when[tok] = ++b->tok_seq;
 	b->tok_next = (tok + 1) % MT7927_TX_TOKENS;
-	memcpy((uint8_t *)b->tok_mem.va + (size_t)tok * MT7927_TX_TOKEN_SZ,
-	    frame, len);
-	pa = b->tok_mem.pa + tok * MT7927_TX_TOKEN_SZ;
+	{
+		const struct mt7927_dmamem *c =
+		    &b->tok_chunk[tok / MT7927_TOK_PER_CHUNK];
+		uint32_t off = (tok % MT7927_TOK_PER_CHUNK) * MT7927_TX_TOKEN_SZ;
+
+		memcpy((uint8_t *)c->va + off, frame, len);
+		pa = c->pa + off;
+	}
 
 	/* mt7925_mac_write_txwi() + _80211() */
 	w[0] = MT7927_TXD0_TX_BYTES(len + MT7927_TXD_SIZE) |
@@ -8680,6 +8710,13 @@ void
 mt7927_engine_set_txroom(struct mt7927_bringup *b, void (*fn)(void *))
 {
 	b->cb_txroom = fn;
+}
+
+/* DMA descriptor info word of the frame being handed to cb_rx (else 0). */
+uint32_t
+mt7927_engine_rx_info(struct mt7927_bringup *b)
+{
+	return b->rx_cur_info;
 }
 
 /* Called after each pass over the RX rings, so frames can go up in batches. */
@@ -10051,12 +10088,45 @@ mt7927_hal_rx_done(void *arg)
 	if_input(ifp, &sc->sc_7927_rxml);
 }
 
+/*
+ * RX checksum offload (mt7925_mac_fill_rx with NETIF_F_RXCSUM): the chip
+ * checked the IP and TCP/UDP checksums when RXD3 has both SUM bits and the
+ * descriptor reports no checksum error. Not for an A-MSDU (one result for
+ * several packets). The flags ride on the mbuf through net80211's decap.
+ */
+#define	MT7927_RXD3_CSUM	((1U << 26) | (1U << 27))
+
+static void
+mt7927_rx_csum(struct mwx_softc *sc, struct mbuf *m, bool ok)
+{
+	const struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
+
+	if (!ok || mbuf_len(m) < sizeof(struct ieee80211_qosframe))
+		return;
+	if ((wh->i_fc[0] & (IEEE80211_FC0_TYPE_MASK |
+	    IEEE80211_FC0_SUBTYPE_QOS)) == (IEEE80211_FC0_TYPE_DATA |
+	    IEEE80211_FC0_SUBTYPE_QOS)) {
+		uint32_t hl = (uint32_t)ieee80211_get_hdrlen(wh);
+
+		if (hl < 2 || hl > mbuf_len(m) ||
+		    (mtod(m, const uint8_t *)[hl - 2] & 0x80))	/* A-MSDU */
+			return;
+	} else if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) !=
+	    IEEE80211_FC0_TYPE_DATA) {
+		return;
+	}
+	mbuf_set_csum_performed(m, MBUF_CSUM_DID_IP | MBUF_CSUM_IP_GOOD |
+	    MBUF_CSUM_DID_DATA | MBUF_CSUM_PSEUDO_HDR, 0xffff);
+	sc->sc_7927_rx_csum++;
+}
+
 static int
 mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
     struct ieee80211_rxinfo *rxi)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct mt7927_rxi ri;
+	bool csum_ok;
 	int rv;
 
 	rv = mt7927_rx_parse(mtod(m, const uint8_t *), (uint32_t)mbuf_len(m),
@@ -10065,6 +10135,9 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		sc->sc_7927_rx_drop[rv & 7]++;
 		return -1;
 	}
+	csum_ok = !(mt7927_engine_rx_info(sc->sc_7927) & 0xd) &&
+	    (mt7927_le32(mtod(m, const uint8_t *) + 12) & MT7927_RXD3_CSUM) ==
+	    MT7927_RXD3_CSUM;
 	if (ri.band == 6 || ri.chan == 0 || ri.chan > IEEE80211_CHAN_MAX ||
 	    ic->ic_channels[ri.chan].ic_flags == 0) {
 		sc->sc_7927_rx_drop[0]++;
@@ -10102,6 +10175,7 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 			    IEEE80211_FC1_PROTECTED;
 			rxi->rxi_flags |= IEEE80211_RXI_HWDEC;
 			sc->sc_7927_rx_hwdec++;
+			mt7927_rx_csum(sc, m, csum_ok);
 			return 0;
 		}
 	}
@@ -10114,6 +10188,7 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		wh->i_fc[1] &= ~IEEE80211_FC1_PROTECTED;
 		sc->sc_7927_rx_hwdec_nopn++;
 	}
+	mt7927_rx_csum(sc, m, csum_ok);
 	return 0;
 }
 
@@ -10367,8 +10442,9 @@ mt7927_hal_poll(struct mwx_softc *sc)
 	if (sc->sc_7927_poll % 30 == 1) {
 		mt7927_engine_counters(sc->sc_7927, &intr, &isr, &frames, &other,
 		    &events, &timeouts);
-		MWX_DEV_LOG(sc, "MT7927 rx batches: %u, %u packets up the stack\n",
-		    sc->sc_7927_rx_batches, sc->sc_7927_rx_batched);
+		MWX_DEV_LOG(sc, "MT7927 rx batches: %u, %u packets up the stack, "
+		    "%u checksums checked by the chip\n", sc->sc_7927_rx_batches,
+		    sc->sc_7927_rx_batched, sc->sc_7927_rx_csum);
 		MWX_DEV_LOG(sc, "MT7927 poll: intr %u isr %u rx frames %u "
 		    "(net80211 %u, dropped ch %u short %u fcs %u icv %u trans %u) "
 		    "other %u events %u timeouts %u scans %u state %d\n", intr,

@@ -978,7 +978,7 @@ int main() {
     chip.roc_grant = true;
     assert(r->b.mcu_timeouts == 0 && svc_depth == 0 && op_depth == 0);
     mt7927_engine_stop(&r->b);
-    assert(!mt7927_engine_running(&r->b) && live_allocs == 0 && r->b.tok_mem.va == nullptr);
+    assert(!mt7927_engine_running(&r->b) && live_allocs == 0 && r->b.tok_chunk[0].va == nullptr);
     rm(r);
   }
 
@@ -993,7 +993,8 @@ int main() {
       assert(mt7927_engine_running(&r->b) && r->b.rx[MT7927_RX_MCU].count == 512 && r->b.rx[MT7927_RX_MCU].bufsz == 4096 &&
              r->b.rx[MT7927_RX_BAND0].count == 1536 && r->b.rx[MT7927_RX_BAND0].per_chunk == 16 &&
              mt7927_ring_buf_pa(&r->b.rx[MT7927_RX_BAND0], 17) == r->b.rx[MT7927_RX_BAND0].buf_chunk[1].pa + 4096);
-      assert(r->b.tx[MT7927_TX_BAND0].count == 256 && r->b.tok_mem.va != nullptr);
+      assert(r->b.tx[MT7927_TX_BAND0].count == MT7927_TX_TOKENS && r->b.tok_chunk[0].va != nullptr &&
+             r->b.tok_chunk[MT7927_TOK_CHUNKS - 1].va != nullptr);
       struct mt7927_vif v = {}; v.idx = 0; v.omac_idx = 0; v.band_idx = 1; v.wmm_idx = 0; v.wcid = MT7927_WTBL_RESERVED;
       memcpy(v.addr, mt7927_engine_mac(&r->b), 6);
       assert(mt7927_dev_add(&r->b, &v, true) == 0);
