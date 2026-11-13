@@ -539,6 +539,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     joinPending = true;
     assocNotified = firstBeaconNotified = portAuthorized = false;
     wclAssociatedBeacons = 0;
+    wclJoinBeacons = 0;
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
     disassocIsVoluntary = false;
     joinTimer->setTimeoutMS(30000);
@@ -612,6 +613,10 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
 IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
 {
     ieee80211com *ic = fHalService->get80211Controller();
+    XYLog("WCL leave: state %d joinPending %d assoc %d firstBeacon %d bssValid %d "
+        "join beacons %u assoc beacons %u port %d\n", ic->ic_state, joinPending,
+        assocNotified, firstBeaconNotified, wclBssValid, wclJoinBeacons,
+        wclAssociatedBeacons, portAuthorized);
     portAuthorized = false;
     updateWCLLinkQuality(true);
     joinPending = false;
@@ -643,6 +648,49 @@ IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
     return kIOReturnSuccess;
 }
 
+void AirportItlwmSkywalkInterface::notifyWCLFirstBeacon(const char *source)
+{
+    if (!joinPending || !assocNotified || firstBeaconNotified || !wclBssValid)
+        return;
+    AirportWCL::FirstBeaconEvent event = {};
+    memcpy(event.peer.bssid, joinBSSID, 6);
+    firstBeaconNotified = true;
+    AirportWCL::LinkStatusEvent link = {};
+    memcpy(link.bssid, joinBSSID, sizeof(link.bssid));
+    link.up = 1;
+    link.reason = 255;
+    wclLinkIndicated = true;
+    XYLog("WCL first beacon (%s), %u join beacons, port %s\n", source,
+        wclJoinBeacons, portAuthorized ? "authorized" : "not yet authorized");
+    instance->postMessage(this, AirportWCL::LinkStatus, &link, sizeof(link), true);
+    instance->postMessage(this, AirportWCL::FirstBeacon, &event, sizeof(event), true);
+    if (portAuthorized)
+        finishWCLJoin(0, 0, kIOReturnSuccess);
+}
+
+/*
+ * The port is authorized but no beacon from the BSS has arrived since the
+ * association. Publish the BSS from the beacon cached at scan time so the
+ * join can complete instead of hitting WCL's 10 s association timeout.
+ */
+void AirportItlwmSkywalkInterface::synthesizeWCLFirstBeacon()
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    ieee80211_node *ni = ic->ic_bss;
+
+    if (!joinPending || !assocNotified || firstBeaconNotified || !ni)
+        return;
+    if (!IEEE80211_ADDR_EQ(ni->ni_bssid, joinBSSID))
+        return;
+    if (!wclBssValid && ni->ni_rsnie_tlv && ni->ni_rsnie_tlv_len > 0)
+        publishWCLBeacon(ni, ni->ni_rsnie_tlv, ni->ni_rsnie_tlv_len);
+    if (!wclBssValid) {
+        XYLog("WCL first beacon: no cached BSS (ies %u)\n", ni->ni_rsnie_tlv_len);
+        return;
+    }
+    notifyWCLFirstBeacon("cached scan beacon");
+}
+
 void AirportItlwmSkywalkInterface::handleWCLLink(bool up)
 {
     if (wclStopping)
@@ -658,6 +706,8 @@ void AirportItlwmSkywalkInterface::handleWCLLink(bool up)
     }
     if (up && joinPending && firstBeaconNotified)
         finishWCLJoin(0, 0, kIOReturnSuccess);
+    else if (up && joinPending)
+        synthesizeWCLFirstBeacon();
     updateWCLLinkQuality(true);
 }
 
@@ -766,23 +816,11 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             if (scanPending || joinPending || ic->ic_state == IEEE80211_S_SCAN ||
                 (portAuthorized && IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID)))
                 publishWCLBeacon(beacon->node, beacon->ies, beacon->length);
+            if (joinPending && IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID))
+                ++wclJoinBeacons;
             if (joinPending && assocNotified && !firstBeaconNotified &&
-                IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID)) {
-                AirportWCL::FirstBeaconEvent event = {};
-                memcpy(event.peer.bssid, joinBSSID, 6);
-                if (!wclBssValid)
-                    break;
-                firstBeaconNotified = true;
-                AirportWCL::LinkStatusEvent link = {};
-                memcpy(link.bssid, joinBSSID, sizeof(link.bssid));
-                link.up = 1;
-                link.reason = 255;
-                wclLinkIndicated = true;
-                instance->postMessage(this, AirportWCL::LinkStatus, &link, sizeof(link), true);
-                instance->postMessage(this, AirportWCL::FirstBeacon, &event, sizeof(event), true);
-                if (portAuthorized)
-                    finishWCLJoin(0, 0, kIOReturnSuccess);
-            }
+                IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID))
+                notifyWCLFirstBeacon("beacon");
             break;
         }
         case IEEE80211_EVT_SCAN_DONE:

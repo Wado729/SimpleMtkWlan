@@ -22,6 +22,16 @@ struct mt7927_bss {
 	uint16_t	basic_rates;	/* mac80211 basic_rates bitmap */
 	uint16_t	ra_legacy;	/* STA_REC ra: RA_LEGACY_OFDM | CCK */
 	uint8_t		ht_mcs[10];
+	/* phase 4c: 11n/ac (zero when the peer has none) */
+	uint16_t	ht_cap;		/* HT capability info, ANDed with ours */
+	uint32_t	vht_cap;	/* VHT capability info, ANDed with ours */
+	uint16_t	vht_rx_mcs;	/* MCS map the peer receives (our TX) */
+	uint16_t	vht_tx_mcs;	/* MCS map the peer sends (our RX) */
+	uint8_t		ampdu;		/* A-MPDU factor | density << 2 */
+	uint8_t		max_ampdu_len;	/* A-MPDU length exponent */
+	uint8_t		vht_opmode;	/* bandwidth | rx_nss << 4 */
+	uint8_t		bw;		/* CMD_CBW_*: 0 20, 1 40, 2 80 MHz */
+	uint8_t		center_chan;	/* center of the operating channel */
 };
 
 /* MT7927 phase 4b: per-frame TXD inputs. */

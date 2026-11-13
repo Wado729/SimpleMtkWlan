@@ -444,6 +444,8 @@ private:
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
+    void notifyWCLFirstBeacon(const char *);
+    void synthesizeWCLFirstBeacon();
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];
     bool scanPending;
@@ -454,6 +456,7 @@ private:
     uint8_t wclBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];
     uint8_t wclBeaconInfo[0x808] = {};
     uint32_t wclAssociatedBeacons = 0;
+    uint32_t wclJoinBeacons = 0;
     uint32_t wclLqmBeacons = 0;
     uint32_t wclLqmReportedBeacons = 0;
     int wclReportedLinkQuality = -2;

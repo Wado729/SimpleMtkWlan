@@ -91,8 +91,11 @@ struct Chip {
   /* phase 4b */
   std::vector<uint16_t> bss_tags; uint16_t bss_ntlv = 0; uint8_t bss_bssid[6] = {0}; int bss_conn_state = -1;
   uint8_t bss_phymode = 0, bss_rate_idx = 0, bss_rlm_ch = 0, bss_rlm_band = 0, bss_band = 0xff; uint16_t bss_basic_rate = 0;
+  uint8_t bss_rlm_center = 0, bss_rlm_bw = 0xff, bss_rlm_sco = 0xff, bss_rlm_htop = 0xff;
   struct StaRec { uint16_t wcid; uint8_t muar; uint16_t ntlv; std::vector<uint16_t> tags; uint32_t conn_type; int conn_state;
-                  uint16_t aid; uint8_t peer[6]; uint16_t extra; int state; uint16_t ra_legacy, basic_rate; uint8_t phy_type; };
+                  uint16_t aid; uint8_t peer[6]; uint16_t extra; int state; uint16_t ra_legacy, basic_rate; uint8_t phy_type;
+                  uint8_t ampdu, max_ampdu_len, vht_opmode; uint16_t ht_cap; uint32_t vht_cap; uint16_t vht_rx, vht_tx; uint8_t ht_mcs0;
+                  int ba_tid = -1, ba_type = -1, ba_en = -1, ba_amsdu = -1; uint16_t ba_ssn = 0, ba_win = 0; };
   std::vector<StaRec> sta_recs;
   int roc_acquired = 0, roc_aborted = 0; uint8_t roc_ch = 0, roc_band = 0, roc_token = 0, roc_type = 0xff; uint32_t roc_maxint = 0;
   bool roc_grant = true;
@@ -202,7 +205,7 @@ static void post_txfree(uint16_t wcid, uint16_t msdu) {
   uint32_t n = chip.bar[base + 4], cpu = chip.bar[base + 8], dma = chip.bar[base + 12];
   assert(n && dma != cpu && "RX ring 6 has no free buffer");
   struct mwx_desc *d = (struct mwx_desc *)pa2va(chip.bar[base] + dma * 16, 16);
-  uint32_t w[5] = { (0u << 27) | (1u << 16) | 20u, 5u << 16, (1u << 31) | ((uint32_t)wcid << 12),
+  uint32_t w[5] = { (6u << 27) | (1u << 16) | 20u, 5u << 16, (1u << 31) | ((uint32_t)wcid << 12),
                     (1u << 30) | (1u << 24), (uint32_t)msdu | (0x7fffu << 15) };
   uint8_t *p = pa2va(d->buf0, 20); memcpy(p, w, 20);
   d->ctrl = MT_DMA_CTL_DMA_DONE | MT_DMA_CTL_LAST_SEC0 | (20u << 16);
@@ -284,7 +287,9 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
           assert(ln >= 4 && off + ln <= plen); chip.bss_tags.push_back(tg);
           if (tg == 11) { assert(ln == 16); memcpy(&chip.bss_basic_rate, pl + off + 6, 2); chip.bss_rate_idx = pl[off + 13];
                           assert(pl[off + 14] == chip.bss_rate_idx); }
-          if (tg == 2) { assert(ln == 16); chip.bss_rlm_ch = pl[off + 4]; chip.bss_rlm_band = pl[off + 12]; }
+          if (tg == 2) { assert(ln == 16); chip.bss_rlm_ch = pl[off + 4]; chip.bss_rlm_band = pl[off + 12];
+                         chip.bss_rlm_center = pl[off + 5]; chip.bss_rlm_bw = pl[off + 7]; chip.bss_rlm_htop = pl[off + 10];
+                         chip.bss_rlm_sco = pl[off + 11]; assert(pl[off + 8] == 2 && pl[off + 9] == 2); }
           if (tg == 16) assert(ln == 8);
           if (tg == 15) assert(ln == 8);
           if (tg == 26) assert(ln == 20 && pl[off + 13] == 0xff);
@@ -301,9 +306,15 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
         assert(ln >= 4 && off + ln <= plen); sr.tags.push_back(tg);
         if (tg == 0) { assert(ln == 20); memcpy(&sr.conn_type, pl + off + 4, 4); sr.conn_state = pl[off + 8];
                        memcpy(&sr.aid, pl + off + 10, 2); memcpy(sr.peer, pl + off + 12, 6); memcpy(&sr.extra, pl + off + 18, 2); }
-        if (tg == 0x15) { assert(ln == 12); memcpy(&sr.basic_rate, pl + off + 4, 2); sr.phy_type = pl[off + 6]; }
-        if (tg == 1) { assert(ln == 16); memcpy(&sr.ra_legacy, pl + off + 4, 2); }
-        if (tg == 7) { assert(ln == 16); sr.state = pl[off + 4]; }
+        if (tg == 0x15) { assert(ln == 12); memcpy(&sr.basic_rate, pl + off + 4, 2); sr.phy_type = pl[off + 6];
+                          sr.ampdu = pl[off + 7]; sr.max_ampdu_len = pl[off + 10]; }
+        if (tg == 1) { assert(ln == 16); memcpy(&sr.ra_legacy, pl + off + 4, 2); sr.ht_mcs0 = pl[off + 6]; }
+        if (tg == 7) { assert(ln == 16); sr.state = pl[off + 4]; sr.vht_opmode = pl[off + 12]; }
+        if (tg == 9) { assert(ln == 8); memcpy(&sr.ht_cap, pl + off + 4, 2); }
+        if (tg == 10) { assert(ln == 16); memcpy(&sr.vht_cap, pl + off + 4, 4); memcpy(&sr.vht_rx, pl + off + 8, 2);
+                        memcpy(&sr.vht_tx, pl + off + 10, 2); }
+        if (tg == 6) { assert(ln == 16); sr.ba_tid = pl[off + 4]; sr.ba_type = pl[off + 5]; sr.ba_amsdu = pl[off + 6];
+                       sr.ba_en = pl[off + 7]; memcpy(&sr.ba_ssn, pl + off + 8, 2); memcpy(&sr.ba_win, pl + off + 10, 2); }
         if (tg == 0x2b) { assert(ln == 8 && pl[off + 4] == 0 && pl[off + 5] == 1 && pl[off + 6] == 1); }
         if (tg == 0x25) assert(ln == 8);
         if (tg == 0x23) assert(ln == 4);
@@ -607,7 +618,7 @@ int main() {
     assert(ch(38, &fl) == 165); assert(ch(39, &fl) == 1 && fl == MT7927_CHAN_NO_IR); assert(ch(97, &fl) == 233);
   }
   /* mac init through the fixed map */
-  assert((chip.bar[0x00e804] & MT7927_MAX_RX_LEN_MASK) == MT7927_MAX_RX_LEN && (chip.bar[0x00e800] & MT7927_MDP_DCR0_DAMSDU_EN));
+  assert((chip.bar[0x00e804] & MT7927_MAX_RX_LEN_MASK) == MT7927_MAX_RX_LEN && !(chip.bar[0x00e800] & MT7927_MDP_DCR0_DAMSDU_EN));   /* 4c: whole A-MSDUs, sw keys */
   assert(chip.bar[0x021e00] == ((0x1234u & ~MT7927_MAX_RX_LEN_MASK) | MT7927_MAX_RX_LEN));   /* G5 cleared, len set */
   assert((chip.bar[0x0a1e00] & MT7927_MAX_RX_LEN_MASK) == MT7927_MAX_RX_LEN);
   assert(chip.bar[0x0210f4] == (0x3f | MT7927_CTCR0_DDLMT_EN | MT7927_CTCR0_VHT_SMPDU_EN) && chip.bar[0x0a10f4] == chip.bar[0x0210f4]);
@@ -851,6 +862,60 @@ int main() {
     rm(r);
   }
 
+  /* 17: phase 4c: 11n/ac STA_REC, 80 MHz RLM, block ack, RX batches beyond the stage, stop/start (sleep/wake) */
+  {
+    struct Got { std::vector<std::vector<uint8_t>> frames; } got;
+    r = mk(); svc_max = 0; op_taken = 0;
+    mt7927_engine_set_callbacks(&r->b, &got, [](void *a, const uint8_t *p, uint32_t l) { ((Got *)a)->frames.emplace_back(p, p + l); },
+      [](void *, uint8_t, const uint8_t *, uint32_t) {});
+    for (int round = 0; round < 3; round++) {               /* boot, then two wakes */
+      assert(mt7927_engine_start(&r->b, patch.data(), patch.size(), ram.data(), ram.size(), &abort_flag) == 0);
+      assert(mt7927_engine_running(&r->b) && r->b.rx[MT7927_RX_MCU].count == 256 && r->b.rx[MT7927_RX_MCU].bufsz == 4096);
+      assert(r->b.tx[MT7927_TX_BAND0].count == 256 && r->b.tok_mem.va != nullptr);
+      struct mt7927_vif v = {}; v.idx = 0; v.omac_idx = 0; v.band_idx = 1; v.wmm_idx = 0; v.wcid = MT7927_WTBL_RESERVED;
+      memcpy(v.addr, mt7927_engine_mac(&r->b), 6);
+      assert(mt7927_dev_add(&r->b, &v, true) == 0);
+      struct mt7927_bss bss = {};
+      const uint8_t ap[6] = {0x40, 0x00, 0x00, 0x00, 0x03, 0x4b};
+      memcpy(bss.bssid, ap, 6); bss.chan = 36; bss.band = 2; bss.bcn_int = 100; bss.dtim = 1; bss.qos = 1; bss.aid = 3;
+      bss.peer_wcid = 1; bss.phymode = 0x01 | 0x10 | 0x20; bss.phy_type = (1 << 3) | 0x10 | 0x20; bss.basic_rates = 0x15;
+      bss.ra_legacy = 0xff << 6; bss.ht_mcs[0] = 0xff; bss.ht_mcs[1] = 0xff;
+      bss.ht_cap = 0x09ef; bss.vht_cap = 0x0f8b79b2; bss.vht_rx_mcs = 0xfffa; bss.vht_tx_mcs = 0xfffa;
+      bss.ampdu = 0x17; bss.max_ampdu_len = 7; bss.vht_opmode = 2 | (2 << 4); bss.bw = 2; bss.center_chan = 42;
+      assert(mt7927_bss_info(&r->b, &v, &bss, true) == 0);
+      assert(chip.bss_rlm_ch == 36 && chip.bss_rlm_center == 42 && chip.bss_rlm_bw == 2 && chip.bss_rlm_sco == 1 && chip.bss_rlm_htop == 4);
+      assert(chip.bss_phymode == 0x31);
+      assert(mt7927_sta_rec(&r->b, &v, &bss, true, true, 2, false) == 0);
+      {
+        const Chip::StaRec &sr = chip.sta_recs.back();
+        const uint16_t want[] = {0, 0x15, 9, 10, 1, 7, 0x2b};
+        assert(sr.tags.size() == 7 && memcmp(sr.tags.data(), want, sizeof want) == 0);
+        assert(sr.ht_cap == 0x09ef && sr.vht_cap == 0x0f8b79b2 && sr.vht_rx == 0xfffa && sr.vht_tx == 0xfffa);
+        assert(sr.ampdu == 0x17 && sr.max_ampdu_len == 7 && sr.vht_opmode == 0x22 && sr.phy_type == 0x38 && sr.ht_mcs0 == 0xff);
+      }
+      /* Block Ack: RX recipient tid 0, TX originator tid 6, off again */
+      assert(mt7927_sta_ba(&r->b, &v, &bss, 0, false, true, 100, 64, false) == 0);
+      { const Chip::StaRec &sr = chip.sta_recs.back();
+        assert(sr.wcid == 1 && sr.muar == 0 && sr.tags.size() == 1 && sr.ba_tid == 0 && sr.ba_type == 2 && sr.ba_en == 1 &&
+               sr.ba_ssn == 100 && sr.ba_win == 64 && sr.ba_amsdu == 0); }
+      assert(mt7927_sta_ba(&r->b, &v, &bss, 6, true, true, 7, 64, false) == 0);
+      assert(chip.sta_recs.back().ba_type == 1 && chip.sta_recs.back().ba_en == (1 << 6) && chip.sta_recs.back().ba_tid == 6);
+      assert(mt7927_sta_ba(&r->b, &v, &bss, 6, true, false, 0, 0, false) == 0 && chip.sta_recs.back().ba_en == 0);
+      /* 150 frames land on the MCU ring before one interrupt: delivered in stage-sized batches, none dropped */
+      got.frames.clear(); chip.beacon_ring = 6; irq_registered = false;
+      for (int k = 0; k < 150; k++) post_beacon(36, k & 1);
+      irq_registered = true; deliver_irq();
+      assert(got.frames.size() == 150 && r->b.stage_drops == 0 && r->b.stage_head == r->b.stage_tail);
+      chip.beacon_ring = 4;
+      assert(r->b.mcu_timeouts == 0 && svc_depth == 0 && op_depth == 0);
+      /* sleep: everything stops and is freed; wake runs the whole bring-up again */
+      mt7927_engine_stop(&r->b);
+      assert(!mt7927_engine_running(&r->b) && !irq_registered && !r->dev->busmaster && live_allocs == 0);
+    }
+    assert(chip.wfsys_resets >= 6);
+    rm(r);
+  }
+
   /* 15: engine start failure (firmware never answers) tears down */
   r = mk(); chip.mute_uni = 0x15;
   assert(mt7927_engine_start(&r->b, patch.data(), patch.size(), ram.data(), ram.size(), &abort_flag) == EIO);
@@ -864,7 +929,7 @@ int main() {
        "order (eFuse, fw log, set_eeprom, mac init registers, DBDC, thermal, KeepFullPwr, channel domain, RTS, "
        "temperature), unsolicited firmware log events, DBDC/domain timeouts, country code, CLC scan; phase 4 "
        "connac3 RX parser, engine kept running, ISR delivery of frames/events/MCU replies, interface add/remove, "
-       "RX filter, TX power limits, scan request/cancel layout, ring/MIB diagnostics; phase 4b band reconfig, BSS_INFO/STA_REC TLVs, ROC grant/timeout/abort, connac3 TXD+TXP data TX, TX free tokens and reclaim. Simulated chip, not hardware.");
+       "RX filter, TX power limits, scan request/cancel layout, ring/MIB diagnostics; phase 4b band reconfig, BSS_INFO/STA_REC TLVs, ROC grant/timeout/abort, connac3 TXD+TXP data TX, TX free tokens and reclaim; phase 4c 4 KB RX buffers, 11n/ac STA_REC, 80 MHz RLM, block ack, RX batching, stop/start for sleep. Simulated chip, not hardware.");
   return 0;
 }
 '''
