@@ -4268,6 +4268,10 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 #define	MT7927_FILTER_ENABLE		(1U << 31)
 #define	MT7927_CONNECTION_INFRA_STA	0x00010001	/* STA_TYPE_STA | NETWORK_INFRA */
 #define	MT7927_WTBL_RESERVED		(MT7927_WTBL_SIZE - 1)
+#define	MT7927_UNI_SET_POWER_LIMIT	MT7927_UNI_CMD(0x2c)
+#define	MT7927_TXPWR_HDR		52	/* struct mt7925_tx_power_limit_tlv */
+#define	MT7927_SKU_LEN			450	/* channel + MT_CONNAC3_SKU_POWER_LIMIT */
+#define	MT7927_MIB(b, ofs)		(((b) ? 0x820fd000U : 0x820ed000U) + (ofs))
 
 /* cfg80211 channel flags carried in SET_DOMAIN_INFO (enum ieee80211_channel_flags). */
 #define	MT7927_CHAN_NO_IR		(1U << 1)
@@ -4435,6 +4439,11 @@ struct mt7927_bringup {
 	uint32_t		rx_other;	/* data-ring packets not delivered */
 	uint32_t		isr_runs;
 	uint8_t			scan_seq;
+	/* phase 4a diagnostics */
+	uint32_t		ring_pkts[MT7927_NRX];
+	uint32_t		ring_types[MT7927_NRX][16];
+	uint32_t		other_logged;
+	uint32_t		scan_done_logged;
 };
 
 static bool mt7927_bar_fault;
@@ -5165,6 +5174,7 @@ mt7927_tx_reap(struct mt7927_bringup *b, struct mt7927_ring *r)
 
 static void mt7927_service(struct mt7927_bringup *);
 static void mt7927_isr_running(struct mt7927_bringup *);
+static uint32_t mt7927_le32(const uint8_t *);
 
 static int
 mt7927_tx(struct mt7927_bringup *b, struct mt7927_ring *r, const void *data,
@@ -5281,6 +5291,17 @@ mt7927_unsolicited(struct mt7927_bringup *b, struct mt7927_ring *r,
 	if (b->unsolicited++ < 16)
 		MWX_DEV_LOG(b->sc, "MT7927 unsolicited event on %s: eid=0x%02x "
 		    "len=%u\n", r->name, eid, len);
+	if (eid == MT7927_UNI_EVENT_SCAN_DONE && b->scan_done_logged++ < 3) {
+		char hex[3 * 32 + 1];
+		uint32_t k, m = len > MT7927_MCU_RXD_LEN ? len - MT7927_MCU_RXD_LEN : 0;
+
+		if (m > 32)
+			m = 32;
+		for (k = 0; k < m; k++)
+			snprintf(hex + 3 * k, 4, "%02x ", p[MT7927_MCU_RXD_LEN + k]);
+		hex[3 * m] = '\0';
+		MWX_DEV_LOG(b->sc, "MT7927 scan-done event len %u: %s\n", len, hex);
+	}
 	if (b->running && b->cb_event != NULL)
 		b->cb_event(b->cb_arg, eid, p + MT7927_MCU_RXD_LEN,
 		    len > MT7927_MCU_RXD_LEN ? len - MT7927_MCU_RXD_LEN : 0);
@@ -5318,6 +5339,12 @@ mt7927_drain(struct mt7927_bringup *b, struct mt7927_ring *r, bool deliver)
 	for (n = 0; n < r->count && (p = mt7927_rx_peek(r, &len)) != NULL; n++) {
 		uint32_t rxd0 = len >= 4 ? le32toh(*(uint32_t *)p) : 0;
 		uint32_t type = mt7927_rx_type(rxd0);
+		int ri = (int)(r - b->rx);
+
+		if (ri >= 0 && ri < MT7927_NRX) {
+			b->ring_pkts[ri]++;
+			b->ring_types[ri][type & 0xf]++;
+		}
 
 		if (len >= MT7927_MCU_RXD_LEN - 4 &&
 		    type == MT7927_PKT_TYPE_RX_EVENT) {
@@ -5349,9 +5376,14 @@ mt7927_drain(struct mt7927_bringup *b, struct mt7927_ring *r, bool deliver)
 			b->cb_rx(b->cb_arg, p, len);
 		} else {
 			b->rx_other++;
-			if (b->unsolicited++ < 16)
+			if (b->other_logged++ < 12)
 				MWX_DEV_LOG(sc, "MT7927 rx on %s: type=%u len=%u "
-				    "rxd0=0x%08x\n", r->name, type, len, rxd0);
+				    "rxd0-3 %08x %08x %08x %08x (%s)\n", r->name,
+				    type, len, rxd0,
+				    len >= 8 ? mt7927_le32(p + 4) : 0,
+				    len >= 12 ? mt7927_le32(p + 8) : 0,
+				    len >= 16 ? mt7927_le32(p + 12) : 0,
+				    b->running ? "running" : "bring-up");
 		}
 		mt7927_rx_release(b, r);
 	}
@@ -6852,6 +6884,114 @@ mt7927_scan_cancel(struct mt7927_bringup *b, const struct mt7927_vif *v)
 	return rv;
 }
 
+/*
+ * mt7925_mcu_set_rate_txpower() as mac80211 triggers it when the first
+ * interface opens (IEEE80211_CONF_CHANGE_POWER): UNI SET_POWER_LIMIT, three
+ * channels per message, 2.4 then 5 GHz. With no device-tree limits Linux
+ * fills every rate with the channel's regulatory power (2 * max_reg_power,
+ * half-dB units) or 127 for channels outside the band's table; here the
+ * world-domain 20 dBm is used for the channels net80211 knows.
+ */
+static int
+mt7927_txpower_band(struct mt7927_bringup *b, int band)
+{
+	static const uint8_t ch2[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+	    14 };
+	static const uint8_t ch5[] = { 36, 38, 40, 42, 44, 46, 48, 50, 52, 54,
+	    56, 58, 60, 62, 64, 100, 102, 104, 106, 108, 110, 112, 114, 116, 118,
+	    120, 122, 124, 126, 128, 132, 134, 136, 138, 140, 142, 144, 149, 151,
+	    153, 155, 157, 159, 161, 165, 167 };
+	const uint8_t *list = band == 2 ? ch2 : ch5;
+	int n = band == 2 ? (int)nitems(ch2) : (int)nitems(ch5);
+	int i, j, idx = 0, batches = (n + 2) / 3, rv = 0;
+	uint8_t last = list[n - 1];
+	for (i = 0; i < batches && rv == 0; i++) {
+		/* Linux's batch count (n % 3 for the last one, 0 if n % 3 == 0) */
+		int nch = i == batches - 1 ? n % 3 : 3;
+		uint32_t mlen = MT7927_TXPWR_HDR + nch * MT7927_SKU_LEN;
+		uint8_t tmp[MT7927_TXPWR_HDR + 3 * MT7927_SKU_LEN];
+
+		memset(tmp, 0, MT7927_TXPWR_HDR);
+		tmp[4] = 1;			/* tag */
+		tmp[6] = (mlen - 4) & 0xff;
+		tmp[7] = (mlen - 4) >> 8;
+		tmp[12] = (uint8_t)nch;
+		tmp[13] = band == 2 ? 1 : 2;
+		tmp[16] = b->alpha2[0];
+		tmp[17] = b->alpha2[1];
+		for (j = 0; j < nch; j++, idx++) {
+			uint8_t *sku = tmp + MT7927_TXPWR_HDR + j * MT7927_SKU_LEN;
+			uint8_t c = list[idx];
+			bool known = band == 2 || (c % 4 == 0 && c <= 144) ||
+			    (c >= 149 && c % 4 == 1);
+			int8_t pw = known ? 40 : 127;
+
+			tmp[14] = c == last;	/* last_msg */
+			sku[0] = c;
+			memset(sku + 1, 127, MT7927_SKU_LEN - 1);
+			if (band == 2)
+				memset(sku + 1, pw, 4);		/* cck */
+			memset(sku + 1 + 4, pw, 8);		/* ofdm */
+			memset(sku + 1 + 44, pw, MT7927_SKU_LEN - 1 - 44);
+		}
+		rv = mt7927_mcu_send(b, MT7927_UNI_SET_POWER_LIMIT, tmp, mlen,
+		    true);
+	}
+	return rv;
+}
+
+int
+mt7927_set_rate_txpower(struct mt7927_bringup *b)
+{
+	int rv;
+
+	mt7927_op_lock(b);
+	rv = mt7927_txpower_band(b, 2);
+	if (rv == 0)
+		rv = mt7927_txpower_band(b, 5);
+	mt7927_op_unlock(b);
+	MWX_DEV_LOG(b->sc, "MT7927 rate TX power limits (2.4 + 5 GHz) -> %d\n", rv);
+	return rv;
+}
+
+/* Periodic snapshot for phase 4a debugging (command gate / poll context). */
+void
+mt7927_engine_log_diag(struct mt7927_bringup *b)
+{
+	struct mwx_softc *sc = b->sc;
+	char types[3][64];
+	int i, t;
+
+	for (i = 0; i < MT7927_NRX; i++) {
+		int o = 0;
+
+		types[i][0] = '\0';
+		for (t = 0; t < 16 && o < (int)sizeof(types[i]) - 8; t++)
+			if (b->ring_types[i][t])
+				o += snprintf(types[i] + o, sizeof(types[i]) - o,
+				    "%s%d:%u", o ? "," : "", t, b->ring_types[i][t]);
+	}
+	MWX_DEV_LOG(sc, "MT7927 rings: rx4 %u [%s] cpu %u dma %u | rx6 %u [%s] "
+	    "cpu %u dma %u | rx7 %u [%s] cpu %u dma %u | intr bits 0x%08x "
+	    "sw 0x%08x\n",
+	    b->ring_pkts[MT7927_RX_BAND0], types[MT7927_RX_BAND0],
+	    mt7927_raw_rd(sc, b->rx[MT7927_RX_BAND0].regbase + MT_DMA_CPU_IDX),
+	    mt7927_raw_rd(sc, b->rx[MT7927_RX_BAND0].regbase + MT_DMA_DMA_IDX),
+	    b->ring_pkts[MT7927_RX_MCU], types[MT7927_RX_MCU],
+	    mt7927_raw_rd(sc, b->rx[MT7927_RX_MCU].regbase + MT_DMA_CPU_IDX),
+	    mt7927_raw_rd(sc, b->rx[MT7927_RX_MCU].regbase + MT_DMA_DMA_IDX),
+	    b->ring_pkts[MT7927_RX_DATA2], types[MT7927_RX_DATA2],
+	    mt7927_raw_rd(sc, b->rx[MT7927_RX_DATA2].regbase + MT_DMA_CPU_IDX),
+	    mt7927_raw_rd(sc, b->rx[MT7927_RX_DATA2].regbase + MT_DMA_DMA_IDX),
+	    b->intr_seen, b->mcu_sw_seen);
+	for (i = 0; i < 2; i++)
+		MWX_DEV_LOG(sc, "MT7927 MIB band %d: rx mpdu %u fcs err %u rx time "
+		    "%u tx time %u\n", i, mt7927_rr(sc, MT7927_MIB(i, 0x780)),
+		    mt7927_rr(sc, MT7927_MIB(i, 0x698)) >> 16,
+		    mt7927_rr(sc, MT7927_MIB(i, 0x058)) & 0xffffff,
+		    mt7927_rr(sc, MT7927_MIB(i, 0x054)) & 0xffffff);
+}
+
 /* ---- Teardown ---- */
 
 static void mt7927_irq_teardown(struct mt7927_bringup *);
@@ -7540,6 +7680,8 @@ mt7927_hal_init_hw(struct mwx_softc *sc)
 	mt7927_vif_fill(sc, &v);
 	if ((rv = mt7927_dev_add(sc->sc_7927, &v, true)) != 0)
 		return rv;
+	/* mac80211 order after add_interface: hw_config (TX power), filter */
+	mt7927_set_rate_txpower(sc->sc_7927);
 	rv = mt7927_set_rxfilter(sc->sc_7927, v.band_idx, MT7927_FILTER_ENABLE);
 	MWX_DEV_LOG(sc, "MT7927 RX filter -> %d\n", rv);
 
@@ -7769,6 +7911,7 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		    timeouts, sc->sc_scan_done_count, sc->sc_ic.ic_state);
 		mt7927_publish(sc->sc_tag, "MT7927RxFrames", frames);
 		mt7927_publish(sc->sc_tag, "MT7927MCUTimeouts", timeouts);
+		mt7927_engine_log_diag(sc->sc_7927);
 	}
 }
 

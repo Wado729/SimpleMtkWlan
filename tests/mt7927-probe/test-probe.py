@@ -84,6 +84,7 @@ struct Chip {
   uint32_t bss_conn = 0; uint16_t bss_wcid = 0; uint8_t bss_idx = 0xff; uint32_t rxfilter = 0xdeadbeef; int rxfilter_mode = -1;
   std::vector<std::pair<uint8_t,uint8_t>> scan_ch; int scan_type = -1, scan_cancel = 0; uint8_t scan_seq = 0, scan_hdr_bss = 0xff;
   int scan_beacons = 0; bool scan_done_event = true;
+  std::vector<std::pair<uint8_t,uint8_t>> txpwr; int txpwr_last = 0;
   uint32_t fw_start_option = 0xffff, fw_start_addr = 0xffff;
   size_t accesses = 0; int wfsys_resets = 0; bool dma_ever_enabled = false;
 } chip;
@@ -262,6 +263,12 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
           for (int q = 0; q < pl[off + 5]; q++) chip.scan_ch.push_back({pl[off + 8 + 2 * q], pl[off + 9 + 2 * q]}); }
         off += ln; }
       assert(off == plen);
+      break; }
+    case 0x2c: {                                          /* SET_POWER_LIMIT */
+      assert(!query && tag == 1 && tl == plen - 4 && plen == 52u + pl[12] * 450u && pl[12] >= 1 && pl[12] <= 3);
+      for (int q = 0; q < pl[12]; q++) { const uint8_t *sku = pl + 52 + 450 * q; chip.txpwr.push_back({pl[13], sku[0]});
+        assert((int8_t)sku[1 + 4] == 40 || (int8_t)sku[1 + 4] == 127); assert((int8_t)sku[1 + 12] == 127 && (int8_t)sku[449] == (int8_t)sku[1 + 4]); }
+      if (pl[14]) chip.txpwr_last++;
       break; }
     case 0x35: assert(query && tag == 0 && tl == 8 && plen == 12);      /* THERMAL */
       r = {0,0,0,0, 0,0,12,0, 0,0,0,0, 45,0,0,0}; break;
@@ -616,6 +623,11 @@ int main() {
     assert(chip.uni_order.size() == 2 && chip.uni_order[0] == "dev" && chip.uni_order[1] == "bss");
     assert(chip.dev_active == 1 && chip.dev_band == 0 && memcmp(chip.dev_addr, v.addr, 6) == 0);
     assert(chip.bss_active == 1 && chip.bss_conn == 0x00010001 && chip.bss_wcid == 19 && chip.bss_idx == 0);
+    assert(mt7927_set_rate_txpower(&r->b) == 0 && chip.txpwr.size() == 14 + 46 && chip.txpwr_last == 2);
+    assert(chip.txpwr[0].first == 1 && chip.txpwr[0].second == 1 && chip.txpwr[13].second == 14 && chip.txpwr[14].first == 2 &&
+           chip.txpwr[14].second == 36 && chip.txpwr.back().second == 167);
+    mt7927_engine_log_diag(&r->b);
+    assert(logbuf.find("MT7927 MIB band 1") != std::string::npos && logbuf.find("rx4 0 []") != std::string::npos);
     assert(mt7927_set_rxfilter(&r->b, 0, MT7927_FILTER_ENABLE) == 0 && chip.rxfilter == 0x80000000u && chip.rxfilter_mode == 0);
 
     struct mt7927_scan_chan ch[3] = {{1, 1}, {1, 6}, {2, 36}};
@@ -638,7 +650,7 @@ int main() {
     assert(mt7927_scan_cancel(&r->b, &v) == 0 && chip.scan_cancel == 1 && chip.scan_seq == 1);
     assert(mt7927_dev_add(&r->b, &v, false) == 0);
     assert(chip.uni_order.size() == 4 && chip.uni_order[2] == "bss" && chip.uni_order[3] == "dev" && chip.dev_active == 0);
-    assert(r->b.mcu_timeouts == 0 && svc_max == 1 && svc_depth == 0 && op_depth == 0 && op_taken == 5);
+    assert(r->b.mcu_timeouts == 0 && svc_max == 1 && svc_depth == 0 && op_depth == 0 && op_taken == 6);
     /* a data packet that is not an 802.11 frame is counted, not delivered */
     mt7927_engine_stop(&r->b);
     assert(!mt7927_engine_running(&r->b) && !irq_registered && !r->dev->busmaster && live_allocs == 0 && chip.wfsys_resets == 2);
@@ -658,7 +670,7 @@ int main() {
        "order (eFuse, fw log, set_eeprom, mac init registers, DBDC, thermal, KeepFullPwr, channel domain, RTS, "
        "temperature), unsolicited firmware log events, DBDC/domain timeouts, country code, CLC scan; phase 4 "
        "connac3 RX parser, engine kept running, ISR delivery of frames/events/MCU replies, interface add/remove, "
-       "RX filter, scan request/cancel layout. Simulated chip, not hardware.");
+       "RX filter, TX power limits, scan request/cancel layout, ring/MIB diagnostics. Simulated chip, not hardware.");
   return 0;
 }
 '''
