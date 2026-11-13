@@ -627,6 +627,25 @@ struct mwx_softc {
 	uint32_t		sc_7927_rxml_frames;	/* 802.11 frames in it */
 	uint32_t		sc_7927_rx_batches, sc_7927_rx_batched;
 	uint32_t		sc_7927_rx_csum;	/* frames with chip-checked checksums */
+	/* phase 4c.10: RX header translation (decap offload) */
+	bool			sc_7927_rx_decap;	/* on unless -mtk7927nodecap */
+	struct mt7927_reorder	sc_7927_reorder[8];	/* per TID, BA sessions */
+	mbuf_t			sc_7927_amsdu_head;	/* A-MSDU being gathered */
+	mbuf_t			sc_7927_amsdu_tail;
+	struct mt7927_rxunit	sc_7927_amsdu_meta;
+	uint32_t		sc_7927_amsdu_when;	/* ms, first subframe */
+	uint8_t			sc_7927_pn_uc[17][6];	/* last CCMP PN per TID */
+	uint8_t			sc_7927_pn_mc[17][6];
+	volatile bool		sc_7927_pn_reset_uc;	/* new keys: start over */
+	volatile bool		sc_7927_pn_reset_mc;
+	CTimeout		*sc_7927_reorder_to;
+	bool			sc_7927_reorder_armed;
+	struct mt7927_rxu	sc_7927_rxu[8 * MT7927_REORDER_WIN];
+	struct mt7927_rxu	*sc_7927_rxu_free;
+	bool			sc_7927_rxu_init;
+	uint32_t		sc_7927_rx8023, sc_7927_rx8023_drop;
+	uint32_t		sc_7927_rx_replay, sc_7927_rx_late;
+	uint32_t		sc_7927_rx_nog4, sc_7927_rx_untrans_amsdu;
 	uint32_t		sc_7927_depth_tok;	/* max tokens out, last 5 s */
 	uint32_t		sc_7927_tf_ev, sc_7927_tf_ms, sc_7927_tf_re;
 	uint32_t		sc_7927_depth_ring;	/* max undone descriptors */
@@ -781,6 +800,7 @@ static void	mt7927_edca_fill(struct mwx_softc *, struct mt7927_edca *);
 struct mt7927_ba_op;
 static void	mt7927_key_install(struct mwx_softc *, struct mt7927_ba_op *);
 static void	mt7927_hal_txroom(void *);
+static void	mt7927_rx_bar(struct mwx_softc *, const uint8_t *, size_t);
 static int	mt7927_mac_fill_rx(struct mwx_softc *, struct mbuf *,
 		    struct ieee80211_rxinfo *);
 int	mwx_init_hw(struct ifnet *);
@@ -2135,8 +2155,12 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_CTL) {
 		mwx_rx_ctl_cnt++;
 		if ((wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK) ==
-		    IEEE80211_FC0_SUBTYPE_BAR)
+		    IEEE80211_FC0_SUBTYPE_BAR) {
 			mwx_rx_bar_cnt++;
+			if (sc->sc_hwtype == MWX_HW_MT7927)
+				mt7927_rx_bar(sc, mtod(m, const uint8_t *),
+				    mbuf_len(m));
+		}
 	}
 	if (rxi.rxi_flags & IEEE80211_RXI_HWDEC)
 		mwx_rx_hwdec_cnt++;
@@ -4550,7 +4574,18 @@ struct mt7927_rxi {
 	uint8_t		key_id;
 	bool		has_pn;		/* group 1 present: pn[] valid */
 	uint8_t		pn[6];		/* PN0 (least significant) first */
+	/* header translation (RX decap offload): payload is 802.3 */
+	bool		hdr_trans;
+	bool		hdr_trans_err;	/* 2-byte length after the type */
+	bool		frag;
+	uint8_t		amsdu;		/* RXD4: 0 none, 3 first, 2 middle, 1 last */
+	bool		has_g4;		/* group 4: fc, seq_ctrl, qos_ctl valid */
+	uint16_t	fc;
+	uint16_t	seq_ctrl;
+	uint16_t	qos_ctl;
 };
+
+
 
 struct mt7927_vif {
 	uint8_t		idx;		/* bss_idx */
@@ -4676,6 +4711,7 @@ struct mt7927_bringup {
 	void			(*cb_rx)(void *, const uint8_t *, uint32_t);
 	void			(*cb_rx_done)(void *);	/* end of an RX batch */
 	uint32_t		rx_cur_info;	/* DMA descriptor info of the frame in cb_rx */
+	bool			rx_decap;	/* header translation + de-A-MSDU */
 	void			(*cb_event)(void *, uint8_t, const uint8_t *,
 				    uint32_t);
 	void			(*cb_txroom)(void *);
@@ -6792,8 +6828,17 @@ mt7927_mac_init(struct mt7927_bringup *b)
 	struct mwx_softc *sc = b->sc;
 	uint32_t i, band;
 
-	mt7927_rmw(sc, MT7927_MDP_DCR1, MT7927_MAX_RX_LEN_MASK, MT7927_MAX_RX_LEN);
-	mt7927_clear(sc, MT7927_MDP_DCR0, MT7927_MDP_DCR0_DAMSDU_EN);
+	/*
+	 * With header translation (rx_decap) the chip splits A-MSDUs and
+	 * translates each subframe, as mt7925_mac_init() sets it up: 1536 and
+	 * de-A-MSDU on. Otherwise whole A-MSDUs for net80211.
+	 */
+	mt7927_rmw(sc, MT7927_MDP_DCR1, MT7927_MAX_RX_LEN_MASK,
+	    b->rx_decap ? 1536U << 3 : MT7927_MAX_RX_LEN);
+	if (b->rx_decap)
+		mt7927_set(sc, MT7927_MDP_DCR0, MT7927_MDP_DCR0_DAMSDU_EN);
+	else
+		mt7927_clear(sc, MT7927_MDP_DCR0, MT7927_MDP_DCR0_DAMSDU_EN);
 
 	b->wtbl_busy = 0;
 	for (i = 0; i < MT7927_WTBL_SIZE; i++)
@@ -6812,7 +6857,7 @@ mt7927_mac_init(struct mt7927_bringup *b)
 		mt7927_set(sc, MT7927_MIB_SCR1(band), MT7927_MIB_TXDUR_EN);
 		mt7927_set(sc, MT7927_MIB_SCR1(band), MT7927_MIB_RXDUR_EN);
 		mt7927_rmw(sc, MT7927_DMA_DCR0(band), MT7927_MAX_RX_LEN_MASK,
-		    MT7927_MAX_RX_LEN);
+		    b->rx_decap ? 1536U << 3 : MT7927_MAX_RX_LEN);
 		mt7927_clear(sc, MT7927_DMA_DCR0(band), MT7927_DMA_DCR0_RXD_G5_EN);
 		mt7927_rmw(sc, MT7927_WTBLOFF_RSCR(band), MT7927_RSCR_RCPI_MASK,
 		    MT7927_RSCR_RCPI_SET);
@@ -7030,8 +7075,9 @@ mt7927_connac3_init(struct mt7927_bringup *b, const uint8_t *ram, size_t ram_len
 /*
  * connac3 RX descriptor of an 802.11 frame (mt7925_mac_fill_rx subset):
  * 8-dword RXD, optional groups 4/1/2/3 (4 dwords each) and 5 (24 dwords),
- * then 2 * HDR_OFFSET pad bytes. Header-translated (802.3) frames are not
- * supported yet.
+ * then 2 * HDR_OFFSET pad bytes. With header translation the payload at
+ * hdr_off is an 802.3 frame (DA, SA, type) and group 4 has the original
+ * frame control, sequence and QoS control.
  */
 int
 mt7927_rx_parse(const uint8_t *p, uint32_t len, uint8_t antenna_mask,
@@ -7057,7 +7103,11 @@ mt7927_rx_parse(const uint8_t *p, uint32_t len, uint8_t antenna_mask,
 		return MT7927_RX_FCS_ERR;
 	if (rxd1 & (1U << 25))			/* ICV_ERR */
 		return MT7927_RX_ICV_ERR;
-	if (rxd2 & (1U << 7))			/* HDR_TRANS */
+	ri->hdr_trans = (rxd2 & (1U << 7)) != 0;
+	ri->hdr_trans_err = (rxd2 & (1U << 25)) != 0;
+	ri->frag = (rxd2 & (1U << 27)) != 0;
+	ri->amsdu = mt7927_le32(p + 16) & 0x3;	/* RXD4 PAYLOAD_FORMAT */
+	if (ri->hdr_trans && (rxd1 & (1U << 23)))	/* CM: not decrypted */
 		return MT7927_RX_HDR_TRANS;
 
 	chfreq = (rxd3 >> 8) & 0xff;
@@ -7080,8 +7130,15 @@ mt7927_rx_parse(const uint8_t *p, uint32_t len, uint8_t antenna_mask,
 	ri->sec_mode = (uint8_t)sec;
 	ri->key_id = (rxd1 >> 21) & 0x3;
 
-	if (rxd1 & (1U << 19))			/* group 4 */
+	if (rxd1 & (1U << 19)) {		/* group 4 */
+		if (off + 16 > len)
+			return MT7927_RX_SHORT;
+		ri->has_g4 = true;
+		ri->fc = (uint16_t)(mt7927_le32(p + off) & 0xffff);
+		ri->seq_ctrl = (uint16_t)(mt7927_le32(p + off + 8) & 0xffff);
+		ri->qos_ctl = (uint16_t)(mt7927_le32(p + off + 8) >> 16);
 		off += 16;
+	}
 	if (rxd1 & (1U << 16)) {		/* group 1: IV/PN */
 		if (off + 16 > len)
 			return MT7927_RX_SHORT;
@@ -7111,11 +7168,160 @@ mt7927_rx_parse(const uint8_t *p, uint32_t len, uint8_t antenna_mask,
 	}
 	pad = (rxd2 >> 13) & 0x7;
 	off += 2 * pad;
-	if (off + 16 > len)			/* ieee80211_frame_min */
+	if (off + (ri->hdr_trans ? 14 : 16) > len)	/* 802.3 / 802.11 min */
 		return MT7927_RX_SHORT;
 	ri->hdr_off = off;
 	ri->frame_len = len - off;
 	return 0;
+}
+
+/* ---- Block Ack reorder (mt76 agg-rx.c) ---- */
+
+static inline bool
+mt7927_sn_less(uint16_t a, uint16_t b)
+{
+	return ((a - b) & 0xfff) > 0x800;
+}
+
+void
+mt7927_reorder_start(struct mt7927_reorder *r, uint16_t ssn, uint16_t size)
+{
+	memset(r, 0, sizeof(*r));
+	r->active = true;
+	r->head = ssn & 0xfff;
+	r->size = size == 0 || size > MT7927_REORDER_WIN ? MT7927_REORDER_WIN :
+	    size;
+}
+
+static void
+mt7927_reorder_release(struct mt7927_reorder *r, mt7927_release_fn fn,
+    void *arg)
+{
+	uint16_t idx = r->head % r->size;
+	void *u = r->buf[idx];
+
+	r->head = (r->head + 1) & 0xfff;
+	if (u == NULL)
+		return;
+	r->buf[idx] = NULL;
+	r->n--;
+	fn(arg, u, true);
+}
+
+/* everything before sequence number head (mt76_rx_aggr_release_frames) */
+static void
+mt7927_reorder_release_to(struct mt7927_reorder *r, uint16_t head,
+    mt7927_release_fn fn, void *arg)
+{
+	while (mt7927_sn_less(r->head, head))
+		mt7927_reorder_release(r, fn, arg);
+}
+
+/* the in-order run at the head (mt76_rx_aggr_release_head) */
+static void
+mt7927_reorder_release_head(struct mt7927_reorder *r, mt7927_release_fn fn,
+    void *arg)
+{
+	while (r->buf[r->head % r->size] != NULL)
+		mt7927_reorder_release(r, fn, arg);
+}
+
+/* Window stops (DELBA, leaving): what is buffered goes up in order. */
+void
+mt7927_reorder_stop(struct mt7927_reorder *r, mt7927_release_fn fn, void *arg)
+{
+	uint32_t i;
+
+	if (!r->active)
+		return;
+	for (i = 0; i < r->size && r->n != 0; i++)
+		mt7927_reorder_release(r, fn, arg);
+	r->active = false;
+}
+
+/* A Block Ack Request moves the window to ssn. */
+void
+mt7927_reorder_bar(struct mt7927_reorder *r, uint16_t ssn,
+    mt7927_release_fn fn, void *arg)
+{
+	if (!r->active)
+		return;
+	r->started = true;
+	mt7927_reorder_release_to(r, ssn & 0xfff, fn, arg);
+	mt7927_reorder_release_head(r, fn, arg);
+}
+
+/* mt76_rx_aggr_reorder() for one unit with sequence number seq. */
+void
+mt7927_reorder_add(struct mt7927_reorder *r, uint16_t seq, void *unit,
+    uint32_t now, mt7927_release_fn fn, void *arg)
+{
+	uint16_t idx;
+
+	seq &= 0xfff;
+	if (!r->active) {
+		fn(arg, unit, true);
+		return;
+	}
+	if (!r->started) {
+		if (mt7927_sn_less(seq, r->head)) {
+			fn(arg, unit, true);	/* before the window began */
+			return;
+		}
+		r->started = true;
+	}
+	if (mt7927_sn_less(seq, r->head)) {
+		fn(arg, unit, false);		/* late or duplicate */
+		return;
+	}
+	if (seq == r->head) {
+		r->head = (r->head + 1) & 0xfff;
+		fn(arg, unit, true);
+		if (r->n != 0)
+			mt7927_reorder_release_head(r, fn, arg);
+		return;
+	}
+	/* beyond the window: release older frames to make room */
+	if (!mt7927_sn_less(seq, (r->head + r->size) & 0xfff))
+		mt7927_reorder_release_to(r,
+		    (uint16_t)((seq - r->size + 1) & 0xfff), fn, arg);
+	idx = seq % r->size;
+	if (r->buf[idx] != NULL) {
+		fn(arg, unit, false);		/* duplicate */
+		return;
+	}
+	r->buf[idx] = unit;
+	r->when[idx] = now;
+	r->n++;
+	mt7927_reorder_release_head(r, fn, arg);
+}
+
+/*
+ * Frames held longer than timeo_ms go up with the gap before them given up
+ * (mt76_rx_aggr_check_release). Returns whether frames are still held.
+ */
+bool
+mt7927_reorder_check(struct mt7927_reorder *r, uint32_t now,
+    uint32_t timeo_ms, mt7927_release_fn fn, void *arg)
+{
+	uint32_t i;
+
+	if (!r->active || r->n == 0)
+		return false;
+	mt7927_reorder_release_head(r, fn, arg);
+	for (i = 1; i < r->size && r->n != 0; i++) {
+		uint16_t seq = (uint16_t)((r->head + i) & 0xfff);
+		uint16_t idx = seq % r->size;
+
+		if (r->buf[idx] == NULL)
+			continue;
+		if (now - r->when[idx] < timeo_ms)
+			break;
+		mt7927_reorder_release_to(r, seq, fn, arg);
+		mt7927_reorder_release_head(r, fn, arg);
+		i = 0;
+	}
+	return r->n != 0;
 }
 
 /* Scan-done event payload (after the MCU RXD): rsv[4], then TLVs. */
@@ -7618,7 +7824,9 @@ mt7927_sta_rec(struct mt7927_bringup *b, const struct mt7927_vif *v,
 		t = mt7927_msg_tlv(&m, MT7927_STA_TAG_HDR_TRANS, 8);
 		t[4] = 0;					/* from_ds */
 		t[5] = 1;					/* to_ds (station) */
-		t[6] = 1;					/* dis_rx_hdr_tran */
+		/* dis_rx_hdr_tran (mt7925_mcu_sta_hdr_trans_tlv): on only for
+		 * the peer with decap offload, never the broadcast entry */
+		t[6] = peer && bss->rx_hdr_trans ? 0 : 1;
 	} else {
 		t = mt7927_msg_tlv(&m, MT7927_STA_TAG_REMOVE, 8);
 		t = mt7927_msg_tlv(&m, MT7927_STA_TAG_MLD_OFF, 4);
@@ -8712,6 +8920,13 @@ mt7927_engine_set_txroom(struct mt7927_bringup *b, void (*fn)(void *))
 	b->cb_txroom = fn;
 }
 
+/* RX header translation and hardware de-A-MSDU (set before bring-up). */
+void
+mt7927_engine_set_rx_decap(struct mt7927_bringup *b, bool on)
+{
+	b->rx_decap = on;
+}
+
 /* DMA descriptor info word of the frame being handed to cb_rx (else 0). */
 uint32_t
 mt7927_engine_rx_info(struct mt7927_bringup *b)
@@ -8869,6 +9084,10 @@ void mtk_dbg_publish();
 
 static void mt7927_hal_rx(void *, const uint8_t *, uint32_t);
 static void mt7927_hal_rx_done(void *);
+static void mt7927_reorder_timeo(void *);
+static void mt7927_rx_amsdu_flush(struct mwx_softc *);
+static void mt7927_rx_decap_reset(struct mwx_softc *);
+static IOReturn mt7927_rx_ba_action(OSObject *, void *, void *, void *, void *);
 static void mt7927_hal_event(void *, uint8_t, const uint8_t *, uint32_t);
 
 static void
@@ -8902,6 +9121,17 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 	    mt7927_hal_event);
 	mt7927_engine_set_txroom(sc->sc_7927, mt7927_hal_txroom);
 	mt7927_engine_set_rxdone(sc->sc_7927, mt7927_hal_rx_done);
+	/* RX header translation + hardware de-A-MSDU like Linux (decap offload) */
+	{
+		int off = 0;
+
+		sc->sc_7927_rx_decap = !PE_parse_boot_argn("-mtk7927nodecap",
+		    &off, sizeof(off));
+	}
+	mt7927_engine_set_rx_decap(sc->sc_7927, sc->sc_7927_rx_decap);
+	timeout_set(&sc->sc_7927_reorder_to, mt7927_reorder_timeo, sc);
+	MWX_DEV_LOG(sc, "MT7927 RX header translation %s\n",
+	    sc->sc_7927_rx_decap ? "on" : "off (-mtk7927nodecap)");
 	mt7927_bringup_set_country(sc->sc_7927, NULL);	/* "00" */
 	if (PE_parse_boot_argn("mtk7927cc", cc, sizeof(cc) - 1)) {
 		MWX_DEV_LOG(sc, "MT7927 country %s (mtk7927cc)\n", cc);
@@ -9270,6 +9500,7 @@ mt7927_bss_fill(struct mwx_softc *sc, struct ieee80211_node *ni,
 		if (bss->amsdu > 1 + IEEE80211_VHTCAP_MAX_MPDU_LENGTH_11454)
 			bss->amsdu = 1 + IEEE80211_VHTCAP_MAX_MPDU_LENGTH_3895;
 	}
+	bss->rx_hdr_trans = sc->sc_7927_rx_decap;
 }
 
 /* Per stream: 3 = not supported, else the lower of the two MCS limits. */
@@ -9315,6 +9546,7 @@ mt7927_join_teardown(struct mwx_softc *sc, const char *why)
 	sc->sc_7927_assoc = false;
 	sc->sc_7927_hwkeys = 0;
 	sc->sc_7927_ptk_pending = false;
+	mt7927_rx_decap_reset(sc);
 	MWX_DEV_LOG(sc, "MT7927 left %s (%s)\n",
 	    ether_sprintf(sc->sc_7927_bss.bssid), why);
 }
@@ -9582,10 +9814,13 @@ mt7927_ba_answer_action(OSObject *, void *arg0, void *arg1, void *arg2,
 	if (ni != ic->ic_bss || !sc->sc_7927_assoc)
 		return kIOReturnSuccess;
 	if ((code & 0xff) == MT7927_BA_RX_START) {
-		if (ok)
+		if (ok) {
 			ieee80211_addba_req_accept(ic, ni, tid);
-		else
+			mt7927_rx_ba_action(NULL, sc, (void *)(uintptr_t)tid,
+			    (void *)1, NULL);
+		} else {
 			ieee80211_addba_req_refuse(ic, ni, tid);
+		}
 	} else if ((code & 0xff) == MT7927_BA_TX_START) {
 		if (ok)
 			ieee80211_addba_resp_accept(ic, ni, tid);
@@ -9660,6 +9895,9 @@ mt7927_ba_task(void *arg)
 		case MT7927_BA_TX_STOP:
 			mt7927_sta_ba(sc->sc_7927, &v, &sc->sc_7927_bss, op.tid,
 			    op.kind == MT7927_BA_TX_STOP, false, 0, 0, false);
+			if (op.kind == MT7927_BA_RX_STOP && gate != NULL)
+				gate->runAction(mt7927_rx_ba_action, sc,
+				    (void *)(uintptr_t)op.tid, NULL);
 			continue;
 		}
 		if (gate != NULL)
@@ -9772,6 +10010,11 @@ mt7927_key_install(struct mwx_softc *sc, struct mt7927_ba_op *op)
 	if (rv == 0) {
 		sc->sc_7927_hwkeys |= op->key_pairwise ?
 		    MT7927_HWKEY_PAIRWISE : MT7927_HWKEY_GROUP;
+		/* new key, new PN space for the 802.3 path's replay check */
+		if (op->key_pairwise)
+			sc->sc_7927_pn_reset_uc = true;
+		else
+			sc->sc_7927_pn_reset_mc = true;
 	} else {
 		/* software keys stay set up: TX and RX fall back to them */
 		sc->sc_7927_hwkey_fail++;
@@ -10035,6 +10278,443 @@ mt7927_hal_event(void *arg, uint8_t eid, const uint8_t *p, uint32_t len)
 }
 
 /* Data-ring packet (interrupt work, main work loop): RXD + 802.11 frame. */
+
+/* ---- Phase 4c.10: header-translated (802.3) receive path ---- */
+
+#define	MT7927_RXD3_CSUM	((1U << 26) | (1U << 27))	/* IP, UDP/TCP sum */
+
+extern void ieee80211_enqueue_data(struct ieee80211com *, mbuf_t,
+    struct ieee80211_node *, int, struct mbuf_list *);
+
+#define	MT7927_REORDER_TIMEO_MS	100	/* mt76_aggr_tid_to_timeo(): HZ / 10 */
+
+static uint32_t
+mt7927_now_ms(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return (uint32_t)(ns / 1000000ULL);
+}
+
+/* Frames of one unit up the stack (as net80211's decap ends) or freed. */
+static void
+mt7927_rx_chain(struct mwx_softc *sc, mbuf_t m, bool deliver)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	mbuf_t next;
+
+	for (; m != NULL; m = next) {
+		next = mbuf_nextpkt(m);
+		mbuf_setnextpkt(m, NULL);
+		if (!deliver || ic->ic_bss == NULL ||
+		    ic->ic_state != IEEE80211_S_RUN) {
+			mbuf_freem(m);
+			continue;
+		}
+		/* port check, EAPOL to the key handshake, rest to the batch */
+		ieee80211_enqueue_data(ic, m, ic->ic_bss,
+		    (mbuf_flags(m) & MBUF_MCAST) != 0, &sc->sc_7927_rxml);
+		sc->sc_7927_rxml_frames++;
+	}
+}
+
+/*
+ * CCMP replay check per TID (mt76_check_ccmp_pn), once per MPDU (the
+ * subframes of an A-MSDU share its PN) and after reordering, as
+ * mt76_rx_complete() runs it: retransmitted MPDUs arrive late with lower
+ * PNs. Group-addressed frames use the group key's counters.
+ */
+static bool
+mt7927_rx_pn_ok(struct mwx_softc *sc, const struct mt7927_rxunit *u)
+{
+	uint8_t *last;
+	int i;
+
+	if (!u->check_pn)
+		return true;
+	if (sc->sc_7927_pn_reset_uc) {
+		sc->sc_7927_pn_reset_uc = false;
+		memset(sc->sc_7927_pn_uc, 0, sizeof(sc->sc_7927_pn_uc));
+	}
+	if (sc->sc_7927_pn_reset_mc) {
+		sc->sc_7927_pn_reset_mc = false;
+		memset(sc->sc_7927_pn_mc, 0, sizeof(sc->sc_7927_pn_mc));
+	}
+	last = u->mcast ? sc->sc_7927_pn_mc[u->tid] : sc->sc_7927_pn_uc[u->tid];
+	for (i = 5; i >= 0; i--) {		/* PN5 is the most significant */
+		if (u->pn[i] != last[i])
+			break;
+	}
+	if (i < 0 || u->pn[i] < last[i]) {
+		sc->sc_7927_rx_replay++;
+		return false;
+	}
+	memcpy(last, u->pn, 6);
+	return true;
+}
+
+/* A unit leaves (in order, or given up): replay check, then up or freed. */
+static void
+mt7927_rx_unit_out(struct mwx_softc *sc, mbuf_t head,
+    const struct mt7927_rxunit *u, bool deliver)
+{
+	if (!deliver)
+		sc->sc_7927_rx_late++;
+	else if (!mt7927_rx_pn_ok(sc, u))
+		deliver = false;
+	mt7927_rx_chain(sc, head, deliver);
+}
+
+static struct mt7927_rxu *
+mt7927_rxu_get(struct mwx_softc *sc)
+{
+	struct mt7927_rxu *x;
+
+	if (!sc->sc_7927_rxu_init) {
+		sc->sc_7927_rxu_free = NULL;
+		for (int i = (int)nitems(sc->sc_7927_rxu) - 1; i >= 0; i--) {
+			sc->sc_7927_rxu[i].next = sc->sc_7927_rxu_free;
+			sc->sc_7927_rxu_free = &sc->sc_7927_rxu[i];
+		}
+		sc->sc_7927_rxu_init = true;
+	}
+	if ((x = sc->sc_7927_rxu_free) != NULL)
+		sc->sc_7927_rxu_free = x->next;
+	return x;
+}
+
+static void
+mt7927_rxu_put(struct mwx_softc *sc, struct mt7927_rxu *x)
+{
+	x->head = NULL;
+	x->next = sc->sc_7927_rxu_free;
+	sc->sc_7927_rxu_free = x;
+}
+
+/* mt7927_release_fn for the reorder buffers */
+static void
+mt7927_rxu_release(void *arg, void *unit, bool deliver)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct mt7927_rxu *x = (struct mt7927_rxu *)unit;
+
+	mt7927_rx_unit_out(sc, (mbuf_t)x->head, &x->u, deliver);
+	mt7927_rxu_put(sc, x);
+}
+
+static IOReturn
+mt7927_reorder_timeo_action(OSObject *, void *arg0, void *, void *, void *)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg0;
+	uint32_t now = mt7927_now_ms();
+	bool more = false;
+
+	sc->sc_7927_reorder_armed = false;
+	if (sc->sc_7927_amsdu_head != NULL) {
+		if (now - sc->sc_7927_amsdu_when >= 20)
+			mt7927_rx_amsdu_flush(sc);
+		else
+			more = true;
+	}
+	for (int tid = 0; tid < 8; tid++)
+		more |= mt7927_reorder_check(&sc->sc_7927_reorder[tid], now,
+		    MT7927_REORDER_TIMEO_MS, mt7927_rxu_release, sc);
+	mt7927_hal_rx_done(sc);
+	if (more) {
+		sc->sc_7927_reorder_armed = true;
+		timeout_add_msec(&sc->sc_7927_reorder_to,
+		    MT7927_REORDER_TIMEO_MS / 2);
+	}
+	return kIOReturnSuccess;
+}
+
+/* Reorder timeout (mt76_rx_aggr_reorder_work): on the work loop's gate. */
+static void
+mt7927_reorder_timeo(void *arg)
+{
+	IOCommandGate *gate = gMwxHal != NULL ? gMwxHal->mwxGate() : NULL;
+	int s = splnet();
+
+	if (gate != NULL)
+		gate->runAction(mt7927_reorder_timeo_action, arg);
+	splx(s);
+}
+
+/* One complete MPDU: into its TID's reorder buffer, or straight on. */
+static void
+mt7927_rx_unit_finish(struct mwx_softc *sc, mbuf_t head,
+    const struct mt7927_rxunit *u)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct mt7927_reorder *r;
+	struct mt7927_rxu *x;
+
+	if (!u->reorder || u->mcast || u->tid >= 8 ||
+	    !sc->sc_7927_reorder[u->tid].active ||
+	    (x = mt7927_rxu_get(sc)) == NULL) {
+		mt7927_rx_unit_out(sc, head, u, true);
+		return;
+	}
+	x->head = head;
+	x->u = *u;
+	r = &sc->sc_7927_reorder[u->tid];
+	mt7927_reorder_add(r, u->seq, x, mt7927_now_ms(), mt7927_rxu_release,
+	    sc);
+	/* the frames bypass ieee80211_input_ba(): keep net80211's session */
+	if (ic->ic_bss != NULL) {
+		struct ieee80211_rx_ba *ba = &ic->ic_bss->ni_rx_ba[u->tid];
+
+		if (ba->ba_timeout_val != 0)
+			timeout_add_usec(&ba->ba_to, ba->ba_timeout_val);
+	}
+	if (r->n != 0 && !sc->sc_7927_reorder_armed) {
+		sc->sc_7927_reorder_armed = true;
+		timeout_add_msec(&sc->sc_7927_reorder_to,
+		    MT7927_REORDER_TIMEO_MS / 2);
+	}
+}
+
+static void
+mt7927_rx_unit_free(mbuf_t m)
+{
+	mbuf_t next;
+
+	for (; m != NULL; m = next) {
+		next = mbuf_nextpkt(m);
+		mbuf_setnextpkt(m, NULL);
+		mbuf_freem(m);
+	}
+}
+
+/* An A-MSDU still being gathered goes on as it is. */
+static void
+mt7927_rx_amsdu_flush(struct mwx_softc *sc)
+{
+	mbuf_t head = sc->sc_7927_amsdu_head;
+
+	if (head == NULL)
+		return;
+	sc->sc_7927_amsdu_head = sc->sc_7927_amsdu_tail = NULL;
+	mt7927_rx_unit_finish(sc, head, &sc->sc_7927_amsdu_meta);
+}
+
+/*
+ * A frame the chip translated to 802.3 (mt7925_mac_fill_rx with
+ * RX_FLAG_8023): no net80211 decap. The chip split A-MSDUs into subframes
+ * (RXD4 first/middle/last), which are gathered into one unit like
+ * mt76_rx_release_amsdu() before reordering.
+ */
+static void
+mt7927_rx_8023(struct mwx_softc *sc, const uint8_t *p, uint32_t len)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	struct mt7927_rxunit u;
+	struct mt7927_rxi ri;
+	const uint8_t *d;
+	uint32_t dlen, rxd3;
+	unsigned int chunks = 1;
+	uint16_t type;
+	mbuf_t m = NULL;
+	int rv;
+
+	rv = mt7927_rx_parse(p, len, sc->sc_capa.antenna_mask ?
+	    sc->sc_capa.antenna_mask : 0x3, &ri);
+	if (rv != 0) {
+		sc->sc_7927_rx_drop[rv & 7]++;
+		return;
+	}
+	if (ic->ic_state != IEEE80211_S_RUN || ni == NULL || ri.frag ||
+	    (ri.wlan_idx != sc->sc_7927_bss.peer_wcid &&
+	    ri.wlan_idx != sc->sc_vif.vif_mn.wcid)) {
+		sc->sc_7927_rx8023_drop++;
+		return;
+	}
+	d = p + ri.hdr_off;
+	dlen = ri.frame_len;
+	type = (uint16_t)(d[12] << 8 | d[13]);
+	/* RSN: only EAPOL may come in the clear, and only before the keys */
+	if ((ic->ic_flags & IEEE80211_F_RSNON) && !ri.decrypted &&
+	    (type != ETHERTYPE_PAE || ni->ni_port_valid)) {
+		sc->sc_7927_rx8023_drop++;
+		return;
+	}
+	if (mbuf_allocpacket(MBUF_DONTWAIT, dlen + ETHER_ALIGN, &chunks,
+	    &m) != 0 || mbuf_maxlen(m) < dlen + ETHER_ALIGN) {
+		if (m != NULL)
+			mbuf_freem(m);
+		sc->sc_ic.ic_if.if_ierrors++;
+		return;
+	}
+	/* IP header aligned like net80211's decap leaves it */
+	mbuf_setdata(m, (uint8_t *)mbuf_datastart(m) + ETHER_ALIGN, 0);
+	if (ri.hdr_trans_err && type == ETHERTYPE_VLAN && dlen >= 18) {
+		/* the chip put a 2-byte length after the VLAN tag */
+		memcpy(mtod(m, uint8_t *), d, 16);
+		memcpy(mtod(m, uint8_t *) + 16, d + 18, dlen - 18);
+		dlen -= 2;
+	} else {
+		memcpy(mtod(m, uint8_t *), d, dlen);
+	}
+	mbuf_setlen(m, dlen);
+	mbuf_pkthdr_setlen(m, dlen);
+	rxd3 = mt7927_le32(p + 12);
+	if (!(mt7927_engine_rx_info(sc->sc_7927) & 0xd) &&
+	    (rxd3 & MT7927_RXD3_CSUM) == MT7927_RXD3_CSUM) {
+		mbuf_set_csum_performed(m, MBUF_CSUM_DID_IP |
+		    MBUF_CSUM_IP_GOOD | MBUF_CSUM_DID_DATA |
+		    MBUF_CSUM_PSEUDO_HDR, 0xffff);
+		sc->sc_7927_rx_csum++;
+	}
+	memset(&u, 0, sizeof(u));
+	u.mcast = !ri.unicast || (d[0] & 0x01);
+	if (u.mcast) {
+		mbuf_setflags_mask(m, MBUF_MCAST, MBUF_MCAST);
+		sc->sc_7927_rx_mcast++;
+	} else {
+		sc->sc_7927_rx_ucast++;
+	}
+	sc->sc_7927_rx8023++;
+	/* what ieee80211_input() keeps up to date for the AP */
+	ni->ni_inact = 0;
+	if (ri.rssi < 0 && ri.rssi > -127)
+		ni->ni_rssi = (uint8_t)mwx_dbm_to_rssi(ri.rssi);
+
+	u.tid = 16;
+	if (ri.has_g4) {
+		u.seq = ri.seq_ctrl >> 4;
+		if ((ri.fc & 0x00fc) == 0x0088) {		/* QoS data */
+			u.tid = ri.qos_ctl & 0xf;
+			/* normal ack (not no-ack or no explicit ack): in a BA */
+			u.reorder = ((ri.qos_ctl >> 5) & 0x3) == 0;
+		}
+	} else {
+		sc->sc_7927_rx_nog4++;
+	}
+	/* without group 4 the order is unknown: the chip's replay check only */
+	u.check_pn = ri.decrypted && ri.has_pn && ri.has_g4 &&
+	    ri.sec_mode == MT7927_CIPHER_AES_CCMP;
+	memcpy(u.pn, ri.pn, 6);
+
+	switch (ri.amsdu) {
+	case 0:						/* a single MSDU */
+		mt7927_rx_amsdu_flush(sc);
+		mt7927_rx_unit_finish(sc, m, &u);
+		break;
+	case 3:						/* first subframe */
+		mt7927_rx_amsdu_flush(sc);
+		sc->sc_7927_amsdu_head = sc->sc_7927_amsdu_tail = m;
+		sc->sc_7927_amsdu_meta = u;
+		sc->sc_7927_amsdu_when = mt7927_now_ms();
+		/* a last subframe that never comes: the timer sends it on */
+		if (!sc->sc_7927_reorder_armed) {
+			sc->sc_7927_reorder_armed = true;
+			timeout_add_msec(&sc->sc_7927_reorder_to,
+			    MT7927_REORDER_TIMEO_MS / 2);
+		}
+		break;
+	default:					/* middle, last */
+		if (sc->sc_7927_amsdu_head != NULL &&
+		    sc->sc_7927_amsdu_meta.seq == u.seq &&
+		    sc->sc_7927_amsdu_meta.tid == u.tid) {
+			mbuf_setnextpkt(sc->sc_7927_amsdu_tail, m);
+			sc->sc_7927_amsdu_tail = m;
+		} else {
+			mt7927_rx_amsdu_flush(sc);
+			sc->sc_7927_amsdu_head = sc->sc_7927_amsdu_tail = m;
+			sc->sc_7927_amsdu_meta = u;
+		}
+		if (ri.amsdu == 1)
+			mt7927_rx_amsdu_flush(sc);
+		break;
+	}
+}
+
+/* A Block Ack Request from the AP moves our reorder window (mt76 check_ctl). */
+static void
+mt7927_rx_bar(struct mwx_softc *sc, const uint8_t *f, size_t len)
+{
+	uint16_t ctl, ssn;
+	uint8_t tid;
+
+	if (len < 20 || !sc->sc_7927_rx_decap)
+		return;
+	ctl = (uint16_t)(f[16] | f[17] << 8);
+	ssn = (uint16_t)(f[18] | f[19] << 8) >> 4;
+	tid = (uint8_t)(ctl >> 12);
+	if (tid >= 8)
+		return;
+	mt7927_reorder_bar(&sc->sc_7927_reorder[tid], ssn,
+	    mt7927_rxu_release, sc);
+}
+
+/* Leaving or stopping (work loop): drop held frames, start over on keys. */
+static IOReturn
+mt7927_rx_decap_reset_action(OSObject *, void *arg0, void *, void *, void *)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg0;
+
+	for (int tid = 0; tid < 8; tid++) {
+		struct mt7927_reorder *r = &sc->sc_7927_reorder[tid];
+
+		for (int i = 0; i < MT7927_REORDER_WIN; i++) {
+			struct mt7927_rxu *x = (struct mt7927_rxu *)r->buf[i];
+
+			if (x == NULL)
+				continue;
+			mt7927_rx_unit_free((mbuf_t)x->head);
+			mt7927_rxu_put(sc, x);
+		}
+		memset(r, 0, sizeof(*r));
+	}
+	mt7927_rx_unit_free(sc->sc_7927_amsdu_head);
+	sc->sc_7927_amsdu_head = sc->sc_7927_amsdu_tail = NULL;
+	memset(sc->sc_7927_pn_uc, 0, sizeof(sc->sc_7927_pn_uc));
+	memset(sc->sc_7927_pn_mc, 0, sizeof(sc->sc_7927_pn_mc));
+	return kIOReturnSuccess;
+}
+
+static void
+mt7927_rx_decap_reset(struct mwx_softc *sc)
+{
+	IOCommandGate *gate = gMwxHal != NULL ? gMwxHal->mwxGate() : NULL;
+
+	if (sc->sc_7927_reorder_to != NULL)
+		timeout_del(&sc->sc_7927_reorder_to);
+	sc->sc_7927_reorder_armed = false;
+	if (gate != NULL)
+		gate->runAction(mt7927_rx_decap_reset_action, sc);
+	else
+		mt7927_rx_decap_reset_action(NULL, sc, NULL, NULL, NULL);
+}
+
+/* BA session start/stop for our reorder buffers (work loop). */
+static IOReturn
+mt7927_rx_ba_action(OSObject *, void *arg0, void *arg1, void *arg2, void *)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg0;
+	struct ieee80211com *ic = &sc->sc_ic;
+	uint8_t tid = (uint8_t)(uintptr_t)arg1;
+	bool start = arg2 != NULL;
+
+	if (tid >= 8)
+		return kIOReturnSuccess;
+	if (start && ic->ic_bss != NULL) {
+		const struct ieee80211_rx_ba *ba = &ic->ic_bss->ni_rx_ba[tid];
+
+		mt7927_reorder_stop(&sc->sc_7927_reorder[tid],
+		    mt7927_rxu_release, sc);
+		mt7927_reorder_start(&sc->sc_7927_reorder[tid], ba->ba_winstart,
+		    ba->ba_winsize);
+	} else {
+		mt7927_reorder_stop(&sc->sc_7927_reorder[tid],
+		    mt7927_rxu_release, sc);
+	}
+	mt7927_hal_rx_done(sc);
+	return kIOReturnSuccess;
+}
+
 static void
 mt7927_hal_rx(void *arg, const uint8_t *p, uint32_t len)
 {
@@ -10046,6 +10726,14 @@ mt7927_hal_rx(void *arg, const uint8_t *p, uint32_t len)
 
 	if (!(ifp->if_flags & IFF_RUNNING) || sc->sc_suspended)
 		return;
+	if (len >= 32 && (mt7927_le32(p + 8) & (1U << 7))) {	/* HDR_TRANS */
+		mt7927_rx_8023(sc, p, len);
+		if (sc->sc_7927_rxml_frames >= MT7927_RX_BATCH)
+			mt7927_hal_rx_done(sc);
+		return;
+	}
+	if (sc->sc_7927_amsdu_head != NULL)		/* order with the old path */
+		mt7927_rx_amsdu_flush(sc);
 	if (mbuf_allocpacket(MBUF_DONTWAIT, len, &chunks, &m) != 0) {
 		ifp->if_ierrors++;
 		return;
@@ -10094,8 +10782,6 @@ mt7927_hal_rx_done(void *arg)
  * descriptor reports no checksum error. Not for an A-MSDU (one result for
  * several packets). The flags ride on the mbuf through net80211's decap.
  */
-#define	MT7927_RXD3_CSUM	((1U << 26) | (1U << 27))
-
 static void
 mt7927_rx_csum(struct mwx_softc *sc, struct mbuf *m, bool ok)
 {
@@ -10138,6 +10824,24 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	csum_ok = !(mt7927_engine_rx_info(sc->sc_7927) & 0xd) &&
 	    (mt7927_le32(mtod(m, const uint8_t *) + 12) & MT7927_RXD3_CSUM) ==
 	    MT7927_RXD3_CSUM;
+	if (ri.amsdu != 0 && !ri.hdr_trans &&
+	    ri.frame_len >= sizeof(struct ieee80211_frame) + 2) {
+		/*
+		 * An A-MSDU subframe the chip split but did not translate:
+		 * 2 pad bytes follow the 802.11 header (mt7925_mac_fill_rx
+		 * pad_start). Move the header over them.
+		 */
+		uint8_t *wh0 = mtod(m, uint8_t *) + ri.hdr_off;
+		uint32_t hl = (uint32_t)ieee80211_get_hdrlen(
+		    (struct ieee80211_frame *)wh0);
+
+		if (hl + 2 <= ri.frame_len) {
+			memmove(wh0 + 2, wh0, hl);
+			ri.hdr_off += 2;
+			ri.frame_len -= 2;
+		}
+		sc->sc_7927_rx_untrans_amsdu++;
+	}
 	if (ri.band == 6 || ri.chan == 0 || ri.chan > IEEE80211_CHAN_MAX ||
 	    ic->ic_channels[ri.chan].ic_flags == 0) {
 		sc->sc_7927_rx_drop[0]++;
@@ -10445,6 +11149,12 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		MWX_DEV_LOG(sc, "MT7927 rx batches: %u, %u packets up the stack, "
 		    "%u checksums checked by the chip\n", sc->sc_7927_rx_batches,
 		    sc->sc_7927_rx_batched, sc->sc_7927_rx_csum);
+		MWX_DEV_LOG(sc, "MT7927 rx 802.3 (chip-translated): %u frames, "
+		    "%u dropped, %u replays, %u late/duplicate, %u without "
+		    "group 4, %u untranslated A-MSDU subframes\n",
+		    sc->sc_7927_rx8023, sc->sc_7927_rx8023_drop,
+		    sc->sc_7927_rx_replay, sc->sc_7927_rx_late,
+		    sc->sc_7927_rx_nog4, sc->sc_7927_rx_untrans_amsdu);
 		MWX_DEV_LOG(sc, "MT7927 poll: intr %u isr %u rx frames %u "
 		    "(net80211 %u, dropped ch %u short %u fcs %u icv %u trans %u) "
 		    "other %u events %u timeouts %u scans %u state %d\n", intr,
@@ -13606,11 +14316,15 @@ MtkMwx::detach(IOPCIDevice *device)
     if (com->sc_hwtype == MWX_HW_MT7927)
         mt7927_hal_detach(com);		/* stops the init thread, keeps the engine */
     timeout_del(&com->sc_reset_to);
+    if (com->sc_hwtype == MWX_HW_MT7927 && com->sc_7927_reorder_to != NULL)
+        timeout_del(&com->sc_7927_reorder_to);
     /* Keep interrupts alive while in-flight MCU requests finish. */
     taskq_quiesce(com->sc_nswq);
     if (taskQueueOwned) taskq_quiesce(systq);
     if (ifp->if_flags & IFF_RUNNING) mwx_stop(ifp);
     timeout_free(&com->sc_reset_to);
+    if (com->sc_hwtype == MWX_HW_MT7927 && com->sc_7927_reorder_to != NULL)
+        timeout_free(&com->sc_7927_reorder_to);
     /* No interrupt callback may access buffers during their destruction. */
     if (com->sc_ih) {
         pci_intr_disestablish(pci->pa_pc, com->sc_ih);

@@ -3,7 +3,7 @@ import subprocess,sys,tempfile
 b=Path(__file__).resolve().parent
 src=Path(sys.argv[1]) if len(sys.argv)>1 else b.parents[1]/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp'
 s=src.read_text()
-i=s.index('#define\tMT7927_RXD3_CSUM');j=s.index('static int\nmt7927_mac_fill_rx(');f=s[i:s.index('\n}\n',j)+3]
+i=s.index('static void\nmt7927_rx_csum(');j=s.index('static int\nmt7927_mac_fill_rx(');f=s[i:s.index('\n}\n',j)+3]
 pre=r'''
 #include <cassert>
 #include <cstdio>
@@ -19,8 +19,9 @@ struct ieee80211_frame{uint8_t i_fc[2];uint8_t rest[22];};
 struct chan{int ic_flags;};
 struct ieee80211com{chan ic_channels[256];};
 struct capa{uint8_t antenna_mask=3;};
+#define MT7927_RXD3_CSUM ((1U << 26) | (1U << 27))
 struct mt7927_bringup{uint32_t info;};
-struct mwx_softc{ieee80211com sc_ic;capa sc_capa;unsigned sc_7927_rx_drop[8]={0};unsigned sc_7927_rx_hwdec=0,sc_7927_rx_hwdec_nopn=0,sc_7927_rx_csum=0;mt7927_bringup*sc_7927;};
+struct mwx_softc{ieee80211com sc_ic;capa sc_capa;unsigned sc_7927_rx_drop[8]={0};unsigned sc_7927_rx_hwdec=0,sc_7927_rx_hwdec_nopn=0,sc_7927_rx_csum=0,sc_7927_rx_untrans_amsdu=0;mt7927_bringup*sc_7927;};
 struct ieee80211_qosframe{uint8_t b[26];};
 #define IEEE80211_FC0_TYPE_MASK 0x0c
 #define IEEE80211_FC0_TYPE_DATA 0x08
@@ -33,7 +34,7 @@ uint32_t mt7927_engine_rx_info(mt7927_bringup*b){return b->info;}
 static uint32_t mt7927_le32(const uint8_t*p){uint32_t v;memcpy(&v,p,4);return v;}
 struct ieee80211_rxinfo{int rxi_flags;int rxi_chan;int rxi_rssi;};
 struct mt7927_rxi{uint32_t hdr_off,frame_len;uint8_t chan,band,band_idx;int8_t rssi;bool decrypted,unicast;uint16_t wlan_idx;
- uint8_t sec_mode,key_id;bool has_pn;uint8_t pn[6];};
+ uint8_t sec_mode,key_id;bool has_pn;uint8_t pn[6];bool hdr_trans,hdr_trans_err,frag;uint8_t amsdu;bool has_g4;uint16_t fc,seq_ctrl,qos_ctl;};
 struct mbuf{uint8_t*data;size_t len;int csum=0;};
 void mbuf_set_csum_performed(mbuf*m,int f,int){m->csum=f;}
 #define mtod(m,t) ((t)((m)->data))
@@ -90,6 +91,13 @@ int main(){
   std::vector<uint8_t> buf; frame(buf,32,true); mbuf m{buf.data(),buf.size()}; ieee80211_rxinfo rxi{}; eng.info=0;
   next={}; next.hdr_off=32; next.frame_len=(uint32_t)buf.size()-32; next.chan=36;
   assert(mt7927_mac_fill_rx(&sc,&m,&rxi)==0 && m.csum==0);                  /* SUM bits not set */
+ }
+ { /* phase 4c.10: an untranslated A-MSDU subframe loses the 2 pad bytes after its header */
+  std::vector<uint8_t> buf; frame(buf,32,true); buf.insert(buf.begin()+32+26,{0xee,0xee}); std::vector<uint8_t> orig(buf);
+  mbuf m{buf.data(),buf.size()}; ieee80211_rxinfo rxi{}; eng.info=0;
+  next={}; next.hdr_off=32; next.frame_len=(uint32_t)buf.size()-32; next.chan=36; next.amsdu=3;
+  assert(mt7927_mac_fill_rx(&sc,&m,&rxi)==0 && m.data==buf.data()+34 && sc.sc_7927_rx_untrans_amsdu==1);
+  assert(memcmp(m.data,orig.data()+32,26)==0 && memcmp(m.data+26,orig.data()+32+28,10)==0);
  }
  { /* parse error and 6 GHz: dropped */
   std::vector<uint8_t> buf(64); mbuf m{buf.data(),buf.size()}; ieee80211_rxinfo rxi{};

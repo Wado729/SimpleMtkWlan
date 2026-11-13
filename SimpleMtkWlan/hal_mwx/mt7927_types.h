@@ -34,6 +34,7 @@ struct mt7927_bss {
 	uint8_t		center_chan;	/* center of the operating channel */
 	uint8_t		cipher;		/* CONNAC3_CIPHER_* in hardware, 0 none */
 	uint8_t		amsdu;		/* HW A-MSDU: max_mpdu_size + 1, 0 off */
+	uint8_t		rx_hdr_trans;	/* peer: RX header translation on */
 };
 
 /* MT7927 phase 4b: per-frame TXD inputs. */
@@ -58,6 +59,41 @@ struct mt7927_edca {
 	uint8_t		ecw_min;	/* CWmin = 2^ecw_min - 1 */
 	uint8_t		ecw_max;
 	uint16_t	txop;		/* 32 us units */
+};
+
+/* one received MPDU of header-translated frames (an A-MSDU: its subframes) */
+struct mt7927_rxunit {
+	uint16_t	seq;		/* sequence number */
+	uint8_t		tid;		/* 16: not QoS */
+	bool		reorder;	/* QoS, normal ack policy: BA reordering */
+	bool		mcast;
+	bool		check_pn;	/* decrypted CCMP with a PN */
+	uint8_t		pn[6];		/* PN0 first */
+};
+
+/*
+ * Block Ack reorder buffer of one TID for header-translated frames, which
+ * bypass net80211's (mt76_rx_aggr_reorder() in mt76 agg-rx.c). A unit is
+ * one MPDU: an mbuf, or the chain of an A-MSDU's subframes.
+ */
+#define	MT7927_REORDER_WIN	64
+struct mt7927_reorder {
+	bool		active;
+	bool		started;
+	uint16_t	head;		/* next sequence number to release */
+	uint16_t	size;		/* window, <= MT7927_REORDER_WIN */
+	uint16_t	n;		/* units buffered */
+	void		*buf[MT7927_REORDER_WIN];
+	uint32_t	when[MT7927_REORDER_WIN];	/* ms */
+};
+/* deliver: in order up the stack; else free (late or duplicate) */
+typedef void (*mt7927_release_fn)(void *arg, void *unit, bool deliver);
+
+/* a unit held in a reorder buffer: its frames and what the release needs */
+struct mt7927_rxu {
+	struct mt7927_rxu	*next;		/* free list */
+	void			*head;		/* mbuf chain (nextpkt) */
+	struct mt7927_rxunit	u;
 };
 
 #endif /* MT7927_TYPES_H */

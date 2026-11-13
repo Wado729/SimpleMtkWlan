@@ -98,7 +98,7 @@ struct Chip {
   struct StaRec { uint16_t wcid; uint8_t muar; uint16_t ntlv; std::vector<uint16_t> tags; uint32_t conn_type; int conn_state;
                   uint16_t aid; uint8_t peer[6]; uint16_t extra; int state; uint16_t ra_legacy, basic_rate; uint8_t phy_type;
                   uint8_t ampdu, max_ampdu_len, vht_opmode; uint16_t ht_cap; uint32_t vht_cap; uint16_t vht_rx, vht_tx; uint8_t ht_mcs0;
-                  int ba_tid = -1, ba_type = -1, ba_en = -1, ba_amsdu = -1; uint16_t ba_ssn = 0, ba_win = 0;
+                  int ba_tid = -1, ba_type = -1, ba_en = -1, ba_amsdu = -1; uint16_t ba_ssn = 0, ba_win = 0; int dis_hdr_trans = -1;
                   int key_add = -1, key_tx = -1, key_type = -1; uint8_t key_peer[6] = {0}, key_bss = 0, key_cipher = 0,
                   key_id = 0, key_len = 0, key_wlan = 0, key_mgmt = 0, key[32] = {0};
                   int amsdu_num = -1, amsdu_size = -1, amsdu_en = -1; };
@@ -338,7 +338,7 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
                         memcpy(&sr.vht_tx, pl + off + 10, 2); }
         if (tg == 6) { assert(ln == 16); sr.ba_tid = pl[off + 4]; sr.ba_type = pl[off + 5]; sr.ba_amsdu = pl[off + 6];
                        sr.ba_en = pl[off + 7]; memcpy(&sr.ba_ssn, pl + off + 8, 2); memcpy(&sr.ba_win, pl + off + 10, 2); }
-        if (tg == 0x2b) { assert(ln == 8 && pl[off + 4] == 0 && pl[off + 5] == 1 && pl[off + 6] == 1); }
+        if (tg == 0x2b) { assert(ln == 8 && pl[off + 4] == 0 && pl[off + 5] == 1 && pl[off + 6] <= 1); sr.dis_hdr_trans = pl[off + 6]; }
         if (tg == 0x27) { assert(ln == 68); sr.key_add = pl[off + 4]; sr.key_tx = pl[off + 5]; sr.key_type = pl[off + 6];
                           assert(pl[off + 7] == 0); memcpy(sr.key_peer, pl + off + 8, 6); sr.key_bss = pl[off + 14];
                           sr.key_cipher = pl[off + 15]; sr.key_id = pl[off + 16]; sr.key_len = pl[off + 17];
@@ -723,7 +723,14 @@ int main() {
     assert(mt7927_rx_parse(f.data(), f.size(), 0x2, &ri) == 0 && ri.rssi == -30);           /* antenna mask */
     w32(12, (36u << 8) | (1u << 24)); assert(mt7927_rx_parse(f.data(), f.size(), 3, &ri) == MT7927_RX_FCS_ERR);
     w32(12, 36u << 8); w32(4, 1u << 25); assert(mt7927_rx_parse(f.data(), f.size(), 3, &ri) == MT7927_RX_ICV_ERR);
-    w32(4, 0); w32(8, 1u << 7); assert(mt7927_rx_parse(f.data(), f.size(), 3, &ri) == MT7927_RX_HDR_TRANS);
+    /* phase 4c.10: header-translated frames parse; group 4 gives fc/seq/qos; RXD4 the A-MSDU position */
+    w32(4, 1u << 19); w32(8, (1u << 7) | (1u << 25)); w32(16, 3); w32(32, 0x0188); w32(40, (0x0005u << 16) | (0x123u << 4));
+    assert(mt7927_rx_parse(f.data(), f.size(), 3, &ri) == 0 && ri.hdr_trans && ri.hdr_trans_err && ri.amsdu == 3 &&
+           ri.has_g4 && ri.fc == 0x0188 && (ri.seq_ctrl >> 4) == 0x123 && ri.qos_ctl == 5 && ri.hdr_off == 48);
+    w32(4, (1u << 19) | (1u << 23)); assert(mt7927_rx_parse(f.data(), f.size(), 3, &ri) == MT7927_RX_HDR_TRANS);  /* CM */
+    w32(4, 0); w32(8, 1u << 7); w32(16, 0); w32(32, 0); w32(40, 0);
+    assert(mt7927_rx_parse(f.data(), 46, 3, &ri) == 0 && ri.hdr_trans && !ri.has_g4);      /* 14-byte 802.3 header fits */
+    assert(mt7927_rx_parse(f.data(), 45, 3, &ri) == MT7927_RX_SHORT);
     w32(8, 0); assert(mt7927_rx_parse(f.data(), 40, 3, &ri) == MT7927_RX_SHORT);            /* no room for a header */
     assert(mt7927_rx_parse(f.data(), 31, 3, &ri) == MT7927_RX_SHORT);
     assert(mt7927_rx_parse(f.data(), f.size(), 3, &ri) == 0 && ri.band == 5 && ri.chan == 36 && ri.hdr_off == 32 && ri.rssi == -127);
@@ -739,6 +746,42 @@ int main() {
     assert(mt7927_scan_event_done(ev.data(), ev.size()));
     ev[12] = 3; assert(!mt7927_scan_event_done(ev.data(), ev.size()));
     assert(!mt7927_scan_event_done(ev.data(), 3));
+  }
+
+  /* 13b: phase 4c.10 Block Ack reorder for header-translated frames (mt76 agg-rx.c) */
+  {
+    struct Rel { std::vector<std::pair<int, bool>> out; } rel;
+    auto fn = [](void *arg, void *u, bool deliver) { ((Rel *)arg)->out.push_back({(int)(intptr_t)u, deliver}); };
+    struct mt7927_reorder ro; memset(&ro, 0, sizeof ro);
+    mt7927_reorder_add(&ro, 5, (void *)1, 0, fn, &rel);                 /* no session: straight through */
+    assert(rel.out.size() == 1 && rel.out[0] == std::make_pair(1, true));
+    rel.out.clear(); mt7927_reorder_start(&ro, 100, 64);
+    mt7927_reorder_add(&ro, 100, (void *)100, 0, fn, &rel);             /* in order */
+    mt7927_reorder_add(&ro, 102, (void *)102, 10, fn, &rel);            /* hole at 101: held */
+    mt7927_reorder_add(&ro, 103, (void *)103, 10, fn, &rel);
+    assert(rel.out.size() == 1 && ro.n == 2 && ro.head == 101);
+    mt7927_reorder_add(&ro, 101, (void *)101, 20, fn, &rel);            /* fills the hole: 101 102 103 */
+    assert(rel.out.size() == 4 && rel.out[1].first == 101 && rel.out[2].first == 102 && rel.out[3].first == 103 &&
+           ro.n == 0 && ro.head == 104);
+    mt7927_reorder_add(&ro, 102, (void *)9, 20, fn, &rel);              /* late duplicate: freed */
+    assert(rel.out.back() == std::make_pair(9, false));
+    rel.out.clear();
+    mt7927_reorder_add(&ro, 106, (void *)106, 100, fn, &rel);           /* 104 105 missing */
+    assert(!mt7927_reorder_check(&ro, 150, 100, fn, &rel) == false && rel.out.empty());   /* not yet timed out */
+    assert(!mt7927_reorder_check(&ro, 200, 100, fn, &rel) && rel.out.size() == 1 && rel.out[0].first == 106 &&
+           ro.head == 107);
+    rel.out.clear();
+    mt7927_reorder_add(&ro, 107 + 70, (void *)177, 300, fn, &rel);       /* beyond the window: head jumps */
+    assert(ro.head == ((177 - 64 + 1) & 0xfff) && ro.n == 1 && rel.out.empty());
+    mt7927_reorder_bar(&ro, 178, fn, &rel);                              /* BAR: everything before 178 goes */
+    assert(rel.out.size() == 1 && rel.out[0].first == 177 && ro.head == 178);
+    rel.out.clear();
+    mt7927_reorder_start(&ro, 4090, 64);                                 /* sequence numbers wrap at 4096 */
+    mt7927_reorder_add(&ro, 2, (void *)2, 0, fn, &rel);
+    mt7927_reorder_add(&ro, 4090, (void *)4090, 0, fn, &rel);
+    assert(rel.out.size() == 1 && rel.out[0].first == 4090 && ro.n == 1);
+    mt7927_reorder_stop(&ro, fn, &rel);                                  /* DELBA: held frames go up in order */
+    assert(rel.out.size() == 2 && rel.out[1].first == 2 && !ro.active && ro.n == 0);
   }
 
   /* 14: phase 4 engine: start keeps the hardware, ISR delivers frames and events, scan */
@@ -905,6 +948,12 @@ int main() {
     bss.aid = 5;
     assert(mt7927_sta_rec(&r->b, &v, &bss, true, true, 2, false) == 0 && chip.sta_recs.back().state == 2 &&
            chip.sta_recs.back().extra == 1 && chip.sta_recs.back().aid == 5);
+    assert(chip.sta_recs.back().dis_hdr_trans == 1);                       /* decap offload off: not translated */
+    /* phase 4c.10: with decap offload the AP's entry has RX header translation on, never the broadcast entry */
+    bss.rx_hdr_trans = 1;
+    assert(mt7927_sta_rec(&r->b, &v, &bss, true, true, 2, false) == 0 && chip.sta_recs.back().dis_hdr_trans == 0);
+    assert(mt7927_sta_rec(&r->b, &v, &bss, false, true, 2, false) == 0 && chip.sta_recs.back().dis_hdr_trans == 1);
+    bss.rx_hdr_trans = 0;
     assert(mt7927_sta_rec(&r->b, &v, &bss, false, true, 2, false) == 0);
     {
       const Chip::StaRec &bc = chip.sta_recs.back();
