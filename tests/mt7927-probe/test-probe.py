@@ -93,6 +93,7 @@ struct Chip {
   uint8_t bss_phymode = 0, bss_rate_idx = 0, bss_rlm_ch = 0, bss_rlm_band = 0, bss_band = 0xff; uint16_t bss_basic_rate = 0;
   uint8_t bss_rlm_center = 0, bss_rlm_bw = 0xff, bss_rlm_sco = 0xff, bss_rlm_htop = 0xff;
   uint8_t bss_sec_mode = 0xff, bss_sec_status = 0xff, bss_sec_cipher = 0xff;
+  uint8_t ps_bss = 0xff, ps_state = 0xff; int ps_n = 0;
   uint8_t edca_bss = 0xff, edca[4][3] = {{0}}; uint16_t edca_txop[4] = {0}; int edca_n = 0;
   struct StaRec { uint16_t wcid; uint8_t muar; uint16_t ntlv; std::vector<uint16_t> tags; uint32_t conn_type; int conn_state;
                   uint16_t aid; uint8_t peer[6]; uint16_t extra; int state; uint16_t ra_legacy, basic_rate; uint8_t phy_type;
@@ -292,6 +293,9 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
       assert(!query && plen == 16 && tag == 0 && tl == 12); chip.uni_order.push_back("dev");
       chip.dev_active = pl[8]; chip.dev_band = pl[1]; memcpy(chip.dev_addr, pl + 10, 6); break;
     case 0x02:                                            /* BSS_INFO_UPDATE */
+      if (tag == 21) {                                    /* PS only (mt7925_mcu_uni_bss_ps) */
+        assert(!query && tl == 8 && plen == 12 && pl[1] == 0 && pl[2] == 0 && pl[3] == 0);
+        chip.ps_bss = pl[0]; chip.ps_state = pl[8]; chip.ps_n++; break; }
       assert(!query && tag == 0 && tl == 32); chip.uni_order.push_back("bss");
       chip.bss_idx = pl[0]; chip.bss_active = pl[8]; memcpy(&chip.bss_conn, pl + 12, 4);
       memcpy(&chip.bss_wcid, pl + 30, 2);                 /* sta_idx */
@@ -902,6 +906,8 @@ int main() {
       assert(chip.edca[0][0] == 2 && chip.edca[0][1] == 2 && chip.edca[0][2] == 3 && chip.edca_txop[0] == 47);
       assert(chip.edca[1][1] == 3 && chip.edca_txop[1] == 94 && chip.edca[2][0] == 3 && chip.edca[2][2] == 6 &&
              chip.edca[3][0] == 7 && chip.edca[3][2] == 10 && chip.edca_txop[3] == 0); }
+    /* phase 4c.6: power save off, BSS_INFO with only the PS TLV */
+    assert(mt7927_bss_ps(&r->b, &v, 0) == 0 && chip.ps_n == 1 && chip.ps_bss == v.idx && chip.ps_state == 0);
     /* phase 4c.2: CCMP keys in the chip */
     assert(chip.bss_sec_mode == 0 && chip.bss_sec_status == 1 && chip.bss_sec_cipher == 0);     /* open until a key */
     bss.cipher = 4;

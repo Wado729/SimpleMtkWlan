@@ -4408,6 +4408,7 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 #define	MT7927_BSS_TAG_QBSS		15
 #define	MT7927_BSS_TAG_SEC		16
 #define	MT7927_BSS_TAG_IFS_TIME		23
+#define	MT7927_BSS_TAG_PS		21	/* UNI_BSS_INFO_PS */
 #define	MT7927_BSS_TAG_MLD		26
 #define	MT7927_STA_TAG_BASIC		0
 #define	MT7927_STA_TAG_RA		1
@@ -7609,6 +7610,31 @@ mt7927_sta_ba(struct mt7927_bringup *b, const struct mt7927_vif *v,
 }
 
 /*
+ * mt7925_mcu_uni_bss_ps(): the BSS's power save state, 0 = stay awake (what
+ * Linux sends with power save off). Without it the firmware picks its own,
+ * and the AP then holds our frames until a beacon.
+ */
+int
+mt7927_bss_ps(struct mt7927_bringup *b, const struct mt7927_vif *v,
+    uint8_t ps_state)
+{
+	struct mt7927_msg m;
+	uint8_t hdr[4] = { v->idx, 0, 0, 0 };
+	uint32_t status;
+	uint8_t *t;
+	int rv;
+
+	mt7927_msg_init(&m, hdr, sizeof(hdr));
+	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_PS, 8);
+	t[4] = ps_state;
+	m.buf[2] = m.buf[3] = 0;			/* pad in mt7925's header */
+	rv = mt7927_uni_send_status(b, MCU_UNI_CMD_BSS_INFO_UPDATE, &m, &status);
+	MWX_DEV_LOG(b->sc, "MT7927 power save state %u (0 = awake) -> %d "
+	    "(fw status 0x%x)\n", ps_state, rv, status);
+	return rv;
+}
+
+/*
  * mt7925_mcu_set_tx(): WMM/EDCA parameters of the BSS, one TLV per access
  * category in mac80211 order (VO, VI, BE, BK; queue = that index). Without
  * them the firmware's TX queues run on whatever it defaults to.
@@ -9255,6 +9281,8 @@ mt7927_join_assoc(struct mwx_softc *sc)
 		mt7927_edca_fill(sc, e);
 		sc->sc_7927_edca_dirty = false;
 		mt7927_set_edca(sc->sc_7927, &v, e);
+		/* BSS_CHANGED_PS with power save off (mt7925_mcu_uni_bss_ps) */
+		mt7927_bss_ps(sc->sc_7927, &v, 0);
 	}
 	return rv;
 }
@@ -10059,9 +10087,18 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 		return;
 	}
 	if (loss != sc->sc_7927_bcn_loss_seen) {
+		/*
+		 * Only noted: the firmware tracks beacons only with beacon
+		 * filtering set up (BCNFT, power save), so mt7925 ignores this
+		 * event without it. It came ~30 s after every join here while
+		 * traffic flowed; leaving on it cost a needless rejoin.
+		 */
 		sc->sc_7927_bcn_loss_seen = loss;
-		why = "firmware beacon loss";
-	} else if (windows != sc->sc_7927_mib_seen) {
+		MWX_DEV_LOG(sc, "MT7927 link watchdog: firmware beacon loss "
+		    "event (%u so far), not acted on; rx airtime %u us\n", loss,
+		    rxt);
+	}
+	if (windows != sc->sc_7927_mib_seen) {
 		sc->sc_7927_mib_seen = windows;
 		/* a whole 30 s window inside this association, no RX airtime */
 		if (sc->sc_7927_run_polls > 35 && rxt == 0)
