@@ -83,7 +83,7 @@ struct Chip {
   std::vector<std::string> uni_order; int dev_active = -1, bss_active = -1; uint8_t dev_addr[6] = {0}, dev_band = 0xff;
   uint32_t bss_conn = 0; uint16_t bss_wcid = 0; uint8_t bss_idx = 0xff; uint32_t rxfilter = 0xdeadbeef; int rxfilter_mode = -1;
   std::vector<std::pair<uint8_t,uint8_t>> scan_ch; int scan_type = -1, scan_cancel = 0; uint8_t scan_seq = 0, scan_hdr_bss = 0xff;
-  int scan_beacons = 0; bool scan_done_event = true;
+  int scan_beacons = 0; bool scan_done_event = true; int beacon_ring = 4;
   std::vector<std::pair<uint8_t,uint8_t>> txpwr; int txpwr_last = 0;
   uint32_t fw_start_option = 0xffff, fw_start_addr = 0xffff;
   size_t accesses = 0; int wfsys_resets = 0; bool dma_ever_enabled = false;
@@ -181,7 +181,8 @@ static void post_event(uint8_t seq, uint8_t eid, uint8_t ext_eid, const std::vec
 }
 /* a beacon on RX ring 4: connac3 RXD (group 3 with RCPI) + 802.11 frame */
 static void post_beacon(uint8_t chan, int k) {
-  uint32_t base = MT7927_RING_REG(MT7927_RX_RING_BASE, 4);
+  int ring = chip.beacon_ring;  /* hardware: frames come on the MCU ring 6 tagged type 7 / flag 1 */
+  uint32_t base = MT7927_RING_REG(MT7927_RX_RING_BASE, ring);
   uint32_t n = chip.bar[base + 4], cpu = chip.bar[base + 8], dma = chip.bar[base + 12];
   assert(n && dma != cpu && "RX ring 4 has no free buffer");
   struct mwx_desc *d = (struct mwx_desc *)pa2va(chip.bar[base] + dma * 16, 16);
@@ -194,12 +195,12 @@ static void post_beacon(uint8_t chan, int k) {
   f.insert(f.end(), hdr, hdr + 24);
   uint8_t fixed[12] = {0}; fixed[8] = 100; fixed[10] = 0x11; f.insert(f.end(), fixed, fixed + 12);
   const char *ssid = k ? "Neighbour" : "HomeNet"; f.push_back(0); f.push_back(strlen(ssid)); f.insert(f.end(), ssid, ssid + strlen(ssid));
-  uint32_t len = f.size(), rxd0 = (2u << 27) | len; memcpy(&f[0], &rxd0, 4);
+  uint32_t len = f.size(), rxd0 = (ring == 6 ? (7u << 27) | (1u << 16) : (2u << 27)) | len; memcpy(&f[0], &rxd0, 4);
   uint32_t cap = (d->ctrl >> 16) & 0x3fff; assert(len <= cap && !(d->ctrl & MT_DMA_CTL_DMA_DONE));
   memcpy(pa2va(d->buf0, len), f.data(), len);
   d->ctrl = MT_DMA_CTL_DMA_DONE | MT_DMA_CTL_LAST_SEC0 | (len << 16);
   chip.bar[base + 12] = (dma + 1) % n;
-  raise(MT7927_INT_RX_DONE_DATA);
+  raise(ring == 6 ? MT7927_INT_RX_DONE_WM : MT7927_INT_RX_DONE_DATA);
 }
 static void handle_cmd(const uint8_t *buf, uint32_t len) {
   uint32_t txd0, txd1; memcpy(&txd0, buf, 4); memcpy(&txd1, buf + 4, 4);
@@ -560,8 +561,8 @@ int main() {
   r = mk(); mt7927_bringup_set_country(&r->b, "DE");
   assert(mt7927_bringup_run(&r->b, 5, patch.data(), patch.size(), ram.data(), ram.size(), &abort_flag) == 5);
   assert(chip.domain[0] == 'D' && chip.domain[1] == 'E' && chip.domain[2] == 0); rm(r);
-  r = mk(); mt7927_bringup_set_country(&r->b, "de"); assert(r->b.alpha2[0] == 0);
-  mt7927_bringup_set_country(&r->b, "DEU"); assert(r->b.alpha2[0] == 0); rm(r);
+  r = mk(); mt7927_bringup_set_country(&r->b, "de"); assert(r->b.alpha2[0] == '0' && r->b.alpha2[1] == '0');
+  mt7927_bringup_set_country(&r->b, "DEU"); assert(r->b.alpha2[0] == '0'); rm(r);
 
   /* 12: a RAM image with a CLC region: records are found and counted */
   {
@@ -648,9 +649,22 @@ int main() {
     for (auto &e : got.events) if (e.first == MT7927_UNI_EVENT_SCAN_DONE) done = mt7927_scan_event_done(e.second.data(), e.second.size());
     assert(done);
     assert(mt7927_scan_cancel(&r->b, &v) == 0 && chip.scan_cancel == 1 && chip.scan_seq == 1);
+    /* 4a.3: as on hardware, beacons on the MCU ring (type 7, flag 1) are staged and delivered */
+    chip.beacon_ring = 6; chip.scan_cancel = 0; chip.scan_beacons = 0; chip.scan_ch.clear();
+    assert(mt7927_scan_start(&r->b, &v, ch, 3, nullptr, 0) == 0);
+    post_event(0, 0x29, 0, {0,0,0,0}, MT7927_RXD_OPT_UNSOLICITED);   /* any later interrupt flushes the stage */
+    assert(got.frames.size() == 4 && r->b.stage_frames == 2 && r->b.stage_drops == 0 && r->b.rx_frames == 4);
+    assert(r->b.stage_head == r->b.stage_tail && r->b.ring_types[MT7927_RX_MCU][PKT_TYPE_NORMAL] == 2);
+    {
+      struct mt7927_rxi ri;
+      assert(mt7927_rx_parse(got.frames[2].data(), got.frames[2].size(), 0x3, &ri) == 0 && ri.chan == 1 && ri.rssi == -40);
+      assert(memcmp(&got.frames[2][ri.hdr_off + 24 + 12 + 2], "HomeNet", 7) == 0);
+    }
+    assert(mt7927_scan_cancel(&r->b, &v) == 0);
+    chip.beacon_ring = 4;
     assert(mt7927_dev_add(&r->b, &v, false) == 0);
     assert(chip.uni_order.size() == 4 && chip.uni_order[2] == "bss" && chip.uni_order[3] == "dev" && chip.dev_active == 0);
-    assert(r->b.mcu_timeouts == 0 && svc_max == 1 && svc_depth == 0 && op_depth == 0 && op_taken == 6);
+    assert(r->b.mcu_timeouts == 0 && svc_max == 1 && svc_depth == 0 && op_depth == 0 && op_taken == 8);
     /* a data packet that is not an 802.11 frame is counted, not delivered */
     mt7927_engine_stop(&r->b);
     assert(!mt7927_engine_running(&r->b) && !irq_registered && !r->dev->busmaster && live_allocs == 0 && chip.wfsys_resets == 2);

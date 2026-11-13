@@ -4371,6 +4371,8 @@ struct mt7927_ring {
 
 enum { MT7927_TX_BAND0, MT7927_TX_MCU, MT7927_TX_FWDL, MT7927_NTX };
 enum { MT7927_RX_BAND0, MT7927_RX_MCU, MT7927_RX_DATA2, MT7927_NRX };
+#define MT7927_STAGE_N		32	/* rx6 frame staging slots */
+#define MT7927_STAGE_SZ		2048
 
 struct mt7927_bringup {
 	struct mwx_softc	*sc;
@@ -4444,6 +4446,23 @@ struct mt7927_bringup {
 	uint32_t		ring_types[MT7927_NRX][16];
 	uint32_t		other_logged;
 	uint32_t		scan_done_logged;
+	/*
+	 * phase 4a.3: the firmware routes 802.11 frames to the MCU event
+	 * ring (rx6) too. That ring is drained under the svc lock, from the
+	 * interrupt handler or from a thread waiting on a command, where
+	 * calling into net80211 could deadlock. Frames are copied here
+	 * under the lock and handed to cb_rx from the interrupt handler
+	 * once it is released. Producers hold the svc lock; the work loop
+	 * is the only consumer, and stage_tail moves only after a slot
+	 * has been delivered, so a slot is never rewritten while read.
+	 */
+	uint32_t		stage_head;	/* written under svc lock */
+	uint32_t		stage_tail;	/* advanced under svc lock */
+	uint32_t		stage_drops;
+	uint32_t		stage_frames;	/* rx6 frames delivered */
+	uint16_t		stage_len[MT7927_STAGE_N];
+	uint8_t			stage[MT7927_STAGE_N][MT7927_STAGE_SZ]
+				    __attribute__((aligned(8)));
 };
 
 static bool mt7927_bar_fault;
@@ -5374,6 +5393,21 @@ mt7927_drain(struct mt7927_bringup *b, struct mt7927_ring *r, bool deliver)
 		    type == MT7927_PKT_TYPE_NORMAL_MCU)) {
 			b->rx_frames++;
 			b->cb_rx(b->cb_arg, p, len);
+		} else if (!deliver && b->running && b->cb_rx != NULL &&
+		    (type == PKT_TYPE_NORMAL ||
+		    type == MT7927_PKT_TYPE_NORMAL_MCU)) {
+			/* caller holds the svc lock (running mode) */
+			if (b->stage_head - b->stage_tail < MT7927_STAGE_N &&
+			    len <= MT7927_STAGE_SZ) {
+				uint32_t slot = b->stage_head % MT7927_STAGE_N;
+
+				memcpy(b->stage[slot], p, len);
+				b->stage_len[slot] = (uint16_t)len;
+				OSSynchronizeIO();
+				b->stage_head++;
+			} else {
+				b->stage_drops++;
+			}
 		} else {
 			b->rx_other++;
 			if (b->other_logged++ < 12)
@@ -5414,6 +5448,34 @@ mt7927_service(struct mt7927_bringup *b)
 }
 
 /*
+ * Hand frames staged from rx6 to cb_rx (work loop thread, svc lock not
+ * held). The tail moves only after the slot has been delivered.
+ */
+static void
+mt7927_deliver_staged(struct mt7927_bringup *b)
+{
+	uint32_t head, tail;
+
+	mt7927_svc_lock(b);
+	head = b->stage_head;
+	tail = b->stage_tail;
+	mt7927_svc_unlock(b);
+	while (tail != head) {
+		uint32_t slot = tail % MT7927_STAGE_N;
+
+		if (b->cb_rx != NULL && b->running) {
+			b->rx_frames++;
+			b->stage_frames++;
+			b->cb_rx(b->cb_arg, b->stage[slot], b->stage_len[slot]);
+		}
+		tail++;
+		mt7927_svc_lock(b);
+		b->stage_tail = tail;
+		mt7927_svc_unlock(b);
+	}
+}
+
+/*
  * Interrupt work once running (work loop thread): the MCU ring under the
  * lock, then the data rings with frames handed to cb_rx. MSI is edge
  * triggered, so status that arrived meanwhile is drained before the mask
@@ -5431,6 +5493,7 @@ mt7927_isr_running(struct mt7927_bringup *b)
 		mt7927_svc_lock(b);
 		mt7927_drain(b, &b->rx[MT7927_RX_MCU], false);
 		mt7927_svc_unlock(b);
+		mt7927_deliver_staged(b);
 		mt7927_drain(b, &b->rx[MT7927_RX_BAND0], true);
 		mt7927_drain(b, &b->rx[MT7927_RX_DATA2], true);
 		sta = mt7927_raw_rd(sc, MT_WFDMA0_HOST_INT_STA) & b->irq_mask;
@@ -6699,6 +6762,7 @@ mt7927_dev_add(struct mt7927_bringup *b, const struct mt7927_vif *v, bool enable
 		uint8_t		phymode_ext, link_idx;
 	} __packed bss;
 	int rv;
+	uint32_t st_dev = 0xffffffff, st_bss = 0xffffffff;
 
 	memset(&dev, 0, sizeof(dev));
 	dev.omac_idx = v->omac_idx;
@@ -6724,11 +6788,16 @@ mt7927_dev_add(struct mt7927_bringup *b, const struct mt7927_vif *v, bool enable
 
 	mt7927_op_lock(b);
 	if (enable) {
+		/* mt7925_mcu_parse_response(): { u8 cid; pad[3]; le32 status } */
 		rv = mt7927_mcu_send(b, MCU_UNI_CMD_DEV_INFO_UPDATE, &dev,
 		    sizeof(dev), true);
+		if (rv == 0 && b->resp_len >= 8)
+			st_dev = mt7927_le32(b->resp + 4);
 		if (rv == 0)
 			rv = mt7927_mcu_send(b, MCU_UNI_CMD_BSS_INFO_UPDATE, &bss,
 			    sizeof(bss), true);
+		if (rv == 0 && b->resp_len >= 8)
+			st_bss = mt7927_le32(b->resp + 4);
 	} else {
 		rv = mt7927_mcu_send(b, MCU_UNI_CMD_BSS_INFO_UPDATE, &bss,
 		    sizeof(bss), true);
@@ -6738,8 +6807,8 @@ mt7927_dev_add(struct mt7927_bringup *b, const struct mt7927_vif *v, bool enable
 	}
 	mt7927_op_unlock(b);
 	MWX_DEV_LOG(b->sc, "MT7927 %s interface bss %u omac %u band %u wcid %u "
-	    "-> %d\n", enable ? "add" : "remove", v->idx, v->omac_idx,
-	    v->band_idx, v->wcid, rv);
+	    "-> %d (fw status dev 0x%x bss 0x%x)\n", enable ? "add" : "remove",
+	    v->idx, v->omac_idx, v->band_idx, v->wcid, rv, st_dev, st_bss);
 	return rv;
 }
 
@@ -6973,7 +7042,7 @@ mt7927_engine_log_diag(struct mt7927_bringup *b)
 	}
 	MWX_DEV_LOG(sc, "MT7927 rings: rx4 %u [%s] cpu %u dma %u | rx6 %u [%s] "
 	    "cpu %u dma %u | rx7 %u [%s] cpu %u dma %u | intr bits 0x%08x "
-	    "sw 0x%08x\n",
+	    "sw 0x%08x | rx6 frames staged %u dropped %u\n",
 	    b->ring_pkts[MT7927_RX_BAND0], types[MT7927_RX_BAND0],
 	    mt7927_raw_rd(sc, b->rx[MT7927_RX_BAND0].regbase + MT_DMA_CPU_IDX),
 	    mt7927_raw_rd(sc, b->rx[MT7927_RX_BAND0].regbase + MT_DMA_DMA_IDX),
@@ -6983,7 +7052,7 @@ mt7927_engine_log_diag(struct mt7927_bringup *b)
 	    b->ring_pkts[MT7927_RX_DATA2], types[MT7927_RX_DATA2],
 	    mt7927_raw_rd(sc, b->rx[MT7927_RX_DATA2].regbase + MT_DMA_CPU_IDX),
 	    mt7927_raw_rd(sc, b->rx[MT7927_RX_DATA2].regbase + MT_DMA_DMA_IDX),
-	    b->intr_seen, b->mcu_sw_seen);
+	    b->intr_seen, b->mcu_sw_seen, b->stage_frames, b->stage_drops);
 	for (i = 0; i < 2; i++)
 		MWX_DEV_LOG(sc, "MT7927 MIB band %d: rx mpdu %u fcs err %u rx time "
 		    "%u tx time %u\n", i, mt7927_rr(sc, MT7927_MIB(i, 0x780)),
@@ -7212,7 +7281,8 @@ mt7927_bringup_destroy(struct mt7927_bringup *b)
 void
 mt7927_bringup_set_country(struct mt7927_bringup *b, const char *cc)
 {
-	b->alpha2[0] = b->alpha2[1] = 0;
+	/* Linux world domain, as mt7925_regd_notifier() leaves it at boot */
+	b->alpha2[0] = b->alpha2[1] = '0';
 	if (cc != NULL && cc[0] >= 'A' && cc[0] <= 'Z' && cc[1] >= 'A' &&
 	    cc[1] <= 'Z' && cc[2] == '\0') {
 		b->alpha2[0] = cc[0];
@@ -7503,6 +7573,7 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 		return ENOMEM;
 	mt7927_engine_set_callbacks(sc->sc_7927, sc, mt7927_hal_rx,
 	    mt7927_hal_event);
+	mt7927_bringup_set_country(sc->sc_7927, NULL);	/* "00" */
 	if (PE_parse_boot_argn("mtk7927cc", cc, sizeof(cc) - 1)) {
 		MWX_DEV_LOG(sc, "MT7927 country %s (mtk7927cc)\n", cc);
 		mt7927_bringup_set_country(sc->sc_7927, cc);
