@@ -52,4 +52,12 @@ struct mt7927_txinfo {
 	bool		txs;		/* ask for a TX status (rate sample) */
 };
 
+/* one access category for EDCA_UPDATE (mt7925_mcu_set_tx) */
+struct mt7927_edca {
+	uint8_t		aifs;
+	uint8_t		ecw_min;	/* CWmin = 2^ecw_min - 1 */
+	uint8_t		ecw_max;
+	uint16_t	txop;		/* 32 us units */
+};
+
 #endif /* MT7927_TYPES_H */

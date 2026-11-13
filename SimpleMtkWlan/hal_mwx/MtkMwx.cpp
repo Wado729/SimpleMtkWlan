@@ -622,6 +622,7 @@ struct mwx_softc {
 	uint32_t		sc_7927_recoveries;
 	uint32_t		sc_7927_last_recovery;	/* poll tick */
 	uint32_t		sc_7927_tx_held;	/* frames held back: no token */
+	volatile bool		sc_7927_edca_dirty;	/* AP changed WMM parameters */
 	uint32_t		sc_7927_depth_tok;	/* max tokens out, last 5 s */
 	uint32_t		sc_7927_depth_ring;	/* max undone descriptors */
 	uint32_t		sc_7927_tx_encfail;
@@ -769,6 +770,9 @@ static int	mt7927_ampdu_tx_start(struct ieee80211com *,
 static void	mt7927_ampdu_tx_stop(struct ieee80211com *,
 		    struct ieee80211_node *, uint8_t);
 static void	mt7927_ba_task(void *);
+struct mt7927_edca;
+static void	mt7927_updateedca(struct ieee80211com *);
+static void	mt7927_edca_fill(struct mwx_softc *, struct mt7927_edca *);
 struct mt7927_ba_op;
 static void	mt7927_key_install(struct mwx_softc *, struct mt7927_ba_op *);
 static void	mt7927_hal_txroom(void *);
@@ -2672,6 +2676,7 @@ common:
 
 		ic->ic_set_key = mt7927_set_key;
 		ic->ic_delete_key = mt7927_delete_key;
+		ic->ic_updateedca = mt7927_updateedca;
 		ic->ic_caps &= ~IEEE80211_C_TX_AMSDU_IN_AMPDU;
 		sc->sc_7927_hwcrypto = !PE_parse_boot_argn("-mtk7927swcrypto",
 		    &sw, sizeof(sw));
@@ -4345,6 +4350,7 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 #define	MT7927_UNI_SET_DOMAIN_INFO	MT7927_UNI_CMD(0x15)
 #define	MT7927_UNI_SET_DBDC_PARMS	MT7927_UNI_CMD(0x28)
 #define	MT7927_UNI_THERMAL		MT7927_UNI_CMD(0x35)
+#define	MT7927_UNI_EDCA_UPDATE		MT7927_UNI_CMD(0x04)
 #define	MT7927_WM_UNI_QUERY(c)		((c) | MCU_CMD_FIELD_QUERY | MCU_CMD_FIELD_WM)
 #define	MT7927_UNI_CHIP_CONFIG_CHIP_CFG	0x2
 #define	MT7927_UNI_BAND_CONFIG_RTS	0x08
@@ -7603,6 +7609,42 @@ mt7927_sta_ba(struct mt7927_bringup *b, const struct mt7927_vif *v,
 }
 
 /*
+ * mt7925_mcu_set_tx(): WMM/EDCA parameters of the BSS, one TLV per access
+ * category in mac80211 order (VO, VI, BE, BK; queue = that index). Without
+ * them the firmware's TX queues run on whatever it defaults to.
+ */
+int
+mt7927_set_edca(struct mt7927_bringup *b, const struct mt7927_vif *v,
+    const struct mt7927_edca *e)
+{
+	struct mt7927_msg m;
+	uint8_t hdr[4] = { v->idx, 0, 0, 0 };
+	uint32_t status;
+	uint8_t *t;
+	int ac, rv;
+
+	mt7927_msg_init(&m, hdr, sizeof(hdr));
+	for (ac = 0; ac < 4; ac++) {
+		t = mt7927_msg_tlv(&m, 0, 12);		/* MCU_EDCA_AC_PARAM */
+		t[4] = (uint8_t)ac;			/* queue */
+		t[5] = 0x0f;				/* WMM_PARAM_SET */
+		t[6] = e[ac].ecw_min;
+		t[7] = e[ac].ecw_max;
+		mt7927_put16(t + 8, e[ac].txop);
+		t[10] = e[ac].aifs;
+	}
+	m.buf[2] = m.buf[3] = 0;			/* reserved, not a TLV count */
+	rv = mt7927_uni_send_status(b, MT7927_UNI_EDCA_UPDATE, &m, &status);
+	MWX_DEV_LOG(b->sc, "MT7927 EDCA (aifs/cwmin/cwmax/txop) VO %u/%u/%u/%u "
+	    "VI %u/%u/%u/%u BE %u/%u/%u/%u BK %u/%u/%u/%u -> %d (fw status 0x%x)\n",
+	    e[0].aifs, e[0].ecw_min, e[0].ecw_max, e[0].txop,
+	    e[1].aifs, e[1].ecw_min, e[1].ecw_max, e[1].txop,
+	    e[2].aifs, e[2].ecw_min, e[2].ecw_max, e[2].txop,
+	    e[3].aifs, e[3].ecw_min, e[3].ecw_max, e[3].txop, rv, status);
+	return rv;
+}
+
+/*
  * mt7925_mcu_sta_key_tlv(): install (or remove) a key in the firmware. The
  * pairwise key goes on the AP's WCID, a group key on the BSS's broadcast
  * entry, as mac80211 passes sta == NULL for it.
@@ -9206,6 +9248,14 @@ mt7927_join_assoc(struct mwx_softc *sc)
 	sc->sc_7927_assoc_polls = 0;
 	MWX_DEV_LOG(sc, "MT7927 associated with %s aid %u -> %d\n",
 	    ether_sprintf(sc->sc_7927_bss.bssid), sc->sc_7927_bss.aid, rv);
+	if (rv == 0) {
+		/* mac80211 calls conf_tx (mt7925_mcu_set_tx) at association */
+		struct mt7927_edca e[4];
+
+		mt7927_edca_fill(sc, e);
+		sc->sc_7927_edca_dirty = false;
+		mt7927_set_edca(sc->sc_7927, &v, e);
+	}
 	return rv;
 }
 
@@ -9458,6 +9508,45 @@ mt7927_hal_txroom(void *arg)
 	if (ifp->iface != NULL)
 		ifp->iface->signalOutputThread();
 #endif
+}
+
+/*
+ * net80211's EDCA parameters (from the AP's WMM element, EDCA_AC_* order)
+ * in the firmware's mac80211 order. An AP without WMM leaves them zero:
+ * use the 802.11 defaults then.
+ */
+static void
+mt7927_edca_fill(struct mwx_softc *sc, struct mt7927_edca *e)
+{
+	static const uint8_t map[4] = { EDCA_AC_VO, EDCA_AC_VI, EDCA_AC_BE,
+	    EDCA_AC_BK };
+	static const struct mt7927_edca def[4] = {
+		{ 2, 2, 3, 47 }, { 2, 3, 4, 94 }, { 3, 4, 10, 0 }, { 7, 4, 10, 0 }
+	};
+	struct ieee80211com *ic = &sc->sc_ic;
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		const struct ieee80211_edca_ac_params *p = &ic->ic_edca_ac[map[i]];
+
+		if (p->ac_aifsn == 0 || p->ac_ecwmax == 0) {
+			e[i] = def[i];
+			continue;
+		}
+		e[i].aifs = p->ac_aifsn;
+		e[i].ecw_min = p->ac_ecwmin;
+		e[i].ecw_max = p->ac_ecwmax;
+		e[i].txop = p->ac_txoplimit;
+	}
+}
+
+/* ic_updateedca (RX context): send them from the next watchdog tick. */
+static void
+mt7927_updateedca(struct ieee80211com *ic)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+
+	sc->sc_7927_edca_dirty = true;
 }
 
 /* Data TX again after the pairwise key went to the chip (work loop). */
@@ -10093,6 +10182,15 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		mt7927_engine_log_diag(sc->sc_7927);
 	}
 	mt7927_link_watchdog(sc);
+	if (sc->sc_7927_edca_dirty && sc->sc_7927_assoc) {
+		struct mt7927_edca e[4];
+		struct mt7927_vif v;
+
+		sc->sc_7927_edca_dirty = false;
+		mt7927_vif_fill(sc, &v);
+		mt7927_edca_fill(sc, e);
+		mt7927_set_edca(sc->sc_7927, &v, e);
+	}
 }
 
 int

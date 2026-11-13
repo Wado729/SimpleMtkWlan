@@ -93,6 +93,7 @@ struct Chip {
   uint8_t bss_phymode = 0, bss_rate_idx = 0, bss_rlm_ch = 0, bss_rlm_band = 0, bss_band = 0xff; uint16_t bss_basic_rate = 0;
   uint8_t bss_rlm_center = 0, bss_rlm_bw = 0xff, bss_rlm_sco = 0xff, bss_rlm_htop = 0xff;
   uint8_t bss_sec_mode = 0xff, bss_sec_status = 0xff, bss_sec_cipher = 0xff;
+  uint8_t edca_bss = 0xff, edca[4][3] = {{0}}; uint16_t edca_txop[4] = {0}; int edca_n = 0;
   struct StaRec { uint16_t wcid; uint8_t muar; uint16_t ntlv; std::vector<uint16_t> tags; uint32_t conn_type; int conn_state;
                   uint16_t aid; uint8_t peer[6]; uint16_t extra; int state; uint16_t ra_legacy, basic_rate; uint8_t phy_type;
                   uint8_t ampdu, max_ampdu_len, vht_opmode; uint16_t ht_cap; uint32_t vht_cap; uint16_t vht_rx, vht_tx; uint8_t ht_mcs0;
@@ -345,6 +346,13 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
       assert(off == plen && sr.ntlv == sr.tags.size());
       chip.sta_recs.push_back(sr);
       r = {0,0,0,0, 0,0,0,0};                             /* cid, pad, status 0 */
+      break; }
+    case 0x04: {                                          /* EDCA_UPDATE (mt7925_mcu_set_tx) */
+      assert(!query && plen == 4 + 4 * 12 && pl[1] == 0 && pl[2] == 0 && pl[3] == 0);
+      chip.edca_bss = pl[0]; chip.edca_n++;
+      for (int k = 0; k < 4; k++) { const uint8_t *t = pl + 4 + 12 * k; uint16_t tg, ln; memcpy(&tg, t, 2); memcpy(&ln, t + 2, 2);
+        assert(tg == 0 && ln == 12 && t[4] == k && t[5] == 0x0f && t[11] == 0);
+        chip.edca[k][0] = t[10]; chip.edca[k][1] = t[6]; chip.edca[k][2] = t[7]; memcpy(&chip.edca_txop[k], t + 8, 2); }
       break; }
     case 0x27: {                                          /* ROC */
       assert(!query);
@@ -888,6 +896,12 @@ int main() {
       assert(bc.wcid == MT7927_WTBL_RESERVED && bc.muar == 0xe && bc.conn_type == 0x10020 && bc.tags.size() == 2 &&
              bc.tags[0] == 0 && bc.tags[1] == 0x2b && bc.aid == 5);
     }
+    /* phase 4c.4: EDCA_UPDATE, mac80211 AC order (VO VI BE BK), queue = index */
+    { const struct mt7927_edca e[4] = { {2, 2, 3, 47}, {2, 3, 4, 94}, {3, 4, 6, 0}, {7, 4, 10, 0} };
+      assert(mt7927_set_edca(&r->b, &v, e) == 0 && chip.edca_n == 1 && chip.edca_bss == v.idx);
+      assert(chip.edca[0][0] == 2 && chip.edca[0][1] == 2 && chip.edca[0][2] == 3 && chip.edca_txop[0] == 47);
+      assert(chip.edca[1][1] == 3 && chip.edca_txop[1] == 94 && chip.edca[2][0] == 3 && chip.edca[2][2] == 6 &&
+             chip.edca[3][0] == 7 && chip.edca[3][2] == 10 && chip.edca_txop[3] == 0); }
     /* phase 4c.2: CCMP keys in the chip */
     assert(chip.bss_sec_mode == 0 && chip.bss_sec_status == 1 && chip.bss_sec_cipher == 0);     /* open until a key */
     bss.cipher = 4;
