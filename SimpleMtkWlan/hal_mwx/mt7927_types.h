@@ -33,6 +33,7 @@ struct mt7927_bss {
 	uint8_t		bw;		/* CMD_CBW_*: 0 20, 1 40, 2 80 MHz */
 	uint8_t		center_chan;	/* center of the operating channel */
 	uint8_t		cipher;		/* CONNAC3_CIPHER_* in hardware, 0 none */
+	uint8_t		amsdu;		/* HW A-MSDU: max_mpdu_size + 1, 0 off */
 };
 
 /* MT7927 phase 4b: per-frame TXD inputs. */
@@ -47,6 +48,8 @@ struct mt7927_txinfo {
 	bool		fixed_rate;
 	bool		multicast;
 	bool		protect;	/* hardware encrypts (key in WTBL) */
+	bool		amsdu;		/* the MAC may pack it into an A-MSDU */
+	bool		txs;		/* ask for a TX status (rate sample) */
 };
 
 #endif /* MT7927_TYPES_H */

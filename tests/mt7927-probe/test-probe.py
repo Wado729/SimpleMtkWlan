@@ -98,7 +98,8 @@ struct Chip {
                   uint8_t ampdu, max_ampdu_len, vht_opmode; uint16_t ht_cap; uint32_t vht_cap; uint16_t vht_rx, vht_tx; uint8_t ht_mcs0;
                   int ba_tid = -1, ba_type = -1, ba_en = -1, ba_amsdu = -1; uint16_t ba_ssn = 0, ba_win = 0;
                   int key_add = -1, key_tx = -1, key_type = -1; uint8_t key_peer[6] = {0}, key_bss = 0, key_cipher = 0,
-                  key_id = 0, key_len = 0, key_wlan = 0, key_mgmt = 0, key[32] = {0}; };
+                  key_id = 0, key_len = 0, key_wlan = 0, key_mgmt = 0, key[32] = {0};
+                  int amsdu_num = -1, amsdu_size = -1, amsdu_en = -1; };
   std::vector<StaRec> sta_recs;
   int roc_acquired = 0, roc_aborted = 0; uint8_t roc_ch = 0, roc_band = 0, roc_token = 0, roc_type = 0xff; uint32_t roc_maxint = 0;
   bool roc_grant = true;
@@ -215,6 +216,18 @@ static void post_txfree(uint16_t wcid, uint16_t msdu) {
   chip.bar[base + 12] = (dma + 1) % n;
   raise(MT7927_INT_RX_DONE_WM);
 }
+/* TXS (packet type 0) on RX ring 6: RXD dwords 0-1, then one 8-dword status entry */
+static void post_txs(uint32_t txs0, uint32_t pid) {
+  uint32_t base = MT7927_RING_REG(MT7927_RX_RING_BASE, 6);
+  uint32_t n = chip.bar[base + 4], cpu = chip.bar[base + 8], dma = chip.bar[base + 12];
+  assert(n && dma != cpu && "RX ring 6 has no free buffer");
+  struct mwx_desc *d = (struct mwx_desc *)pa2va(chip.bar[base] + dma * 16, 16);
+  uint32_t w[10] = { (0u << 27) | 40u, 0, txs0, 0x000000f6u /* -10 dBm */, 1u << 16, pid << 24, 0, 0, 0, 0 };
+  uint8_t *p = pa2va(d->buf0, 40); memcpy(p, w, 40);
+  d->ctrl = MT_DMA_CTL_DMA_DONE | MT_DMA_CTL_LAST_SEC0 | (40u << 16);
+  chip.bar[base + 12] = (dma + 1) % n;
+  raise(MT7927_INT_RX_DONE_WM);
+}
 /* a beacon on RX ring 4: connac3 RXD (group 3 with RCPI) + 802.11 frame */
 static void post_beacon(uint8_t chan, int k) {
   int ring = chip.beacon_ring;  /* hardware: frames come on the MCU ring 6 tagged type 7 / flag 1 */
@@ -325,6 +338,7 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
                           sr.key_cipher = pl[off + 15]; sr.key_id = pl[off + 16]; sr.key_len = pl[off + 17];
                           sr.key_wlan = pl[off + 18]; sr.key_mgmt = pl[off + 19]; memcpy(sr.key, pl + off + 20, 32);
                           for (int k = 52; k < 68; k++) assert(pl[off + k] == 0); }
+        if (tg == 0x0f) { assert(ln == 8); sr.amsdu_num = pl[off + 4]; sr.amsdu_size = pl[off + 5]; sr.amsdu_en = pl[off + 6]; }
         if (tg == 0x25) assert(ln == 8);
         if (tg == 0x23) assert(ln == 4);
         off += ln; }
@@ -846,6 +860,15 @@ int main() {
     chip.tx_free_auto = false;
     for (int k = 0; k < MT7927_TX_TOKENS + 6; k++) assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0);
     assert(r->b.tx_reclaimed == 6 && r->b.tx_queued == 2 + MT7927_TX_TOKENS + 6);
+    /* phase 4c.3: once a free event comes back, a full set of tokens waits instead of being reclaimed */
+    post_txfree(1, chip.txf.back().msdu & 0x7fff); deliver_irq();
+    assert(r->b.tok_free_seq == r->b.tok_seq);
+    assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0);                 /* the freed token */
+    { uint32_t nt = r->b.tx_no_token;
+      assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == ENOBUFS && r->b.tx_no_token == nt + 1 &&
+             r->b.tx_reclaimed == 6 && r->b.tx_blocked); }
+    for (uint32_t k = 0; k < MT7927_TX_TOKENS; k++) r->b.tok_busy[k] = 0;      /* the chip catches up */
+    r->b.tx_blocked = false;
     chip.tx_free_auto = true;
     assert(mt7927_tx_frame(&r->b, &ti, auth, 4) == EINVAL);
     assert(svc_depth == 0 && op_depth == 0);
@@ -891,6 +914,21 @@ int main() {
            chip.txf.back().frame[1] == data[1]);
     ti.protect = false; data[1] &= ~0x40;
     assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0 && !(chip.txf.back().txd[3] & 2));
+    /* phase 4c.3: TXD3 HW_AMSDU; a TX status request (PID 0x80, host) drops HW_AMSDU and sets BA_DISABLE */
+    ti.amsdu = true;
+    assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0 && (chip.txf.back().txd[3] & (1u << 5)) &&
+           !(chip.txf.back().txd[3] & (1u << 28)) && chip.txf.back().txd[5] == 0);
+    ti.txs = true;
+    assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0 && !(chip.txf.back().txd[3] & (1u << 5)) &&
+           (chip.txf.back().txd[3] & (1u << 28)) && chip.txf.back().txd[5] == ((1u << 10) | 0x80));
+    ti.amsdu = ti.txs = false;
+    /* TX status: VHT (mode 4) MCS 9 NSS 2, 80 MHz; another PID is not ours */
+    post_txs((2u << 29) | (4u << 6) | (1u << 10) | 9u, 0x80);
+    post_txs((1u << 16) | 1u, 0x20); deliver_irq();
+    { uint32_t n, e, t0, t1; mt7927_engine_txs(&r->b, &n, &e, &t0, &t1);
+      assert(n == 1 && e == 0 && (t0 & 0x3fff) == ((4u << 6) | (1u << 10) | 9u) && (t0 >> 29) == 2 && (int8_t)(t1 & 0xff) == -10); }
+    post_txs((1u << 16) | (1u << 6) | 4u, 0x80); deliver_irq();                   /* OFDM, ACK timeout */
+    { uint32_t n, e, t0, t1; mt7927_engine_txs(&r->b, &n, &e, &t0, &t1); assert(n == 2 && e == 1); }
     bss.cipher = 0;
     /* leave: ROC abort, STA_REC remove, BSS_INFO without RLM */
     assert(mt7927_roc_abort(&r->b, &v) == 0 && chip.roc_aborted == 1 && !r->b.roc_active);
@@ -947,6 +985,26 @@ int main() {
       assert(mt7927_sta_ba(&r->b, &v, &bss, 6, true, true, 7, 64, false) == 0);
       assert(chip.sta_recs.back().ba_type == 1 && chip.sta_recs.back().ba_en == (1 << 6) && chip.sta_recs.back().ba_tid == 6);
       assert(mt7927_sta_ba(&r->b, &v, &bss, 6, true, false, 0, 0, false) == 0 && chip.sta_recs.back().ba_en == 0);
+      /* phase 4c.3: firmware beacon loss / coredump events are counted; MIB windows recorded */
+      if (round == 0) {
+        post_event(0, 0x0c, 0, {0,0,0,0, 1,0,8,0, 0x40,0xed,0,0}, MT7927_RXD_OPT_UNSOLICITED); deliver_irq();
+        post_event(0, 0x0a, 0, {0,0,0,0}, MT7927_RXD_OPT_UNSOLICITED); deliver_irq();
+        uint32_t loss, dumps, rxt, txt, win;
+        mt7927_engine_link(&r->b, 1, &loss, &dumps, &rxt, &txt, &win);
+        assert(loss == 1 && dumps == 1 && r->b.eid_count[0x0c] == 1 && r->b.eid_count[0x0a] == 1);
+        mt7927_engine_log_diag(&r->b);
+        mt7927_engine_link(&r->b, 1, &loss, &dumps, &rxt, &txt, &win);
+        assert(win == 1);
+      }
+      /* phase 4c.3: hardware A-MSDU TLV after VHT (max MPDU 11454 -> 2) */
+      bss.amsdu = 3;
+      assert(mt7927_sta_rec(&r->b, &v, &bss, true, true, 2, false) == 0);
+      { const Chip::StaRec &sr = chip.sta_recs.back();
+        const uint16_t want[] = {0, 0x15, 9, 10, 0x0f, 1, 7, 0x2b};
+        assert(sr.tags.size() == 8 && memcmp(sr.tags.data(), want, sizeof want) == 0);
+        assert(sr.amsdu_num == 8 && sr.amsdu_size == 2 && sr.amsdu_en == 1); }
+      assert(mt7927_sta_rec(&r->b, &v, &bss, false, true, 2, false) == 0 && chip.sta_recs.back().amsdu_en == -1);
+      bss.amsdu = 0;
       /* 150 frames land on the MCU ring before one interrupt: delivered in stage-sized batches, none dropped */
       got.frames.clear(); chip.beacon_ring = 6; irq_registered = false;
       for (int k = 0; k < 150; k++) post_beacon(36, k & 1);
