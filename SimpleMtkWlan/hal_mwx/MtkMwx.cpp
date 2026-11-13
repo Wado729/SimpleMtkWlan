@@ -2647,6 +2647,24 @@ common:
 	ic->ic_vht_tx_mcs_map = 0xfffa;
 	ic->ic_vht_rx_highest = 0;
 	ic->ic_vht_tx_highest = 0;
+	if (sc->sc_hwtype == MWX_HW_MT7927) {
+		int off = 0;
+
+		/* mt7925_init_hardware(): VHT 160 MHz with short GI */
+		ic->ic_vhtcaps |= IEEE80211_VHTCAP_SUPP_CHAN_WIDTH_160MHZ |
+		    IEEE80211_VHTCAP_SHORT_GI_160;
+		/*
+		 * With the chip splitting A-MSDUs (RX decap, phase 4c.10) the
+		 * MPDU size is not bound by our buffers: 11454-byte MPDUs and
+		 * 1 MB A-MPDUs (exponent 7), as mt7925 advertises.
+		 */
+		if (!PE_parse_boot_argn("-mtk7927nodecap", &off, sizeof(off))) {
+			ic->ic_vhtcaps &= ~(IEEE80211_VHTCAP_MAX_MPDU_MASK |
+			    IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK);
+			ic->ic_vhtcaps |= IEEE80211_VHTCAP_MAX_MPDU_LENGTH_11454 |
+			    IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK;
+		}
+	}
 
 #if NOTYET
 	ic->ic_vhtcaps = IEEE80211_VHTCAP_MAX_MPDU_LENGTH_11454 |
@@ -9480,8 +9498,9 @@ mt7927_bss_fill(struct mwx_softc *sc, struct ieee80211_node *ni,
 		bss->vht_tx_mcs = tx;
 		if (vaf > bss->max_ampdu_len)
 			bss->max_ampdu_len = vaf;
-		/* IEEE80211_STA_RX_BW_20/40/80 | rx_nss << 4, as Linux sends it */
-		bwc = ni->ni_chw >= IEEE80211_CHAN_WIDTH_80 ? 2 :
+		/* IEEE80211_STA_RX_BW_20/40/80/160 | rx_nss << 4, as Linux sends it */
+		bwc = ni->ni_chw == IEEE80211_CHAN_WIDTH_160 ? 3 :
+		    ni->ni_chw >= IEEE80211_CHAN_WIDTH_80 ? 2 :
 		    ni->ni_chw >= IEEE80211_CHAN_WIDTH_40 ? 1 : 0;
 		bss->vht_opmode = bwc | (uint8_t)((nss ? nss : 1) << 4);
 	}
@@ -9644,6 +9663,11 @@ mt7927_join_assoc(struct mwx_softc *sc)
 		    (ic->ic_bss->ni_flags & IEEE80211_NODE_VHT) ? "VHT " : "",
 		    nb.phymode, nb.phy_type, nb.bw, nb.center_chan, nb.ampdu,
 		    nb.max_ampdu_len, nb.vht_opmode, nb.ht_mcs[1], nb.ht_mcs[0]);
+		MWX_DEV_LOG(sc, "MT7927 AP VHT operation: width %u center %u/%u, "
+		    "negotiated VHT caps 0x%08x, chw %d\n",
+		    ic->ic_bss->ni_vht_chanwidth, ic->ic_bss->ni_vht_chan1,
+		    ic->ic_bss->ni_vht_chan2, ic->ic_bss->ni_vhtcaps,
+		    (int)ic->ic_bss->ni_chw);
 	}
 	sc->sc_7927_bss.aid = IEEE80211_AID(ic->ic_bss->ni_associd);
 	if ((rv = mt7927_bss_info(sc->sc_7927, &v, &sc->sc_7927_bss, true)) == 0 &&
@@ -12295,8 +12319,8 @@ mt7921_mcu_chan_bw(struct ieee80211_channel *channel)
 }
 
 /*
- * Operating bandwidth and center channel negotiated with the AP: VHT80,
- * HT40 or 20 MHz.
+ * Operating bandwidth and center channel negotiated with the AP: VHT160
+ * (MT7927 only advertises it), VHT80, HT40 or 20 MHz. 80+80 is used as 80.
  */
 static void
 mwx_node_chan_width(struct ieee80211_node *ni, uint8_t *bw, uint8_t *center)
@@ -12306,7 +12330,13 @@ mwx_node_chan_width(struct ieee80211_node *ni, uint8_t *bw, uint8_t *center)
 	if (ni->ni_chan->ic_center_freq1 == 0)
 		return;
 	if ((ni->ni_flags & IEEE80211_NODE_VHT) &&
-	    ni->ni_chw == IEEE80211_CHAN_WIDTH_80) {
+	    ni->ni_chw == IEEE80211_CHAN_WIDTH_160) {
+		*bw = CMD_CBW_160MHZ;
+		*center = ieee80211_mhz2ieee(ni->ni_chan->ic_center_freq1,
+		    ni->ni_chan->ic_flags);
+	} else if ((ni->ni_flags & IEEE80211_NODE_VHT) &&
+	    (ni->ni_chw == IEEE80211_CHAN_WIDTH_80 ||
+	    ni->ni_chw == IEEE80211_CHAN_WIDTH_80P80)) {
 		*bw = CMD_CBW_80MHZ;
 		*center = ieee80211_mhz2ieee(ni->ni_chan->ic_center_freq1,
 		    ni->ni_chan->ic_flags);
