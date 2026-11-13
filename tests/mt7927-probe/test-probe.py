@@ -224,9 +224,10 @@ static void post_txs(uint32_t txs0, uint32_t pid) {
   uint32_t n = chip.bar[base + 4], cpu = chip.bar[base + 8], dma = chip.bar[base + 12];
   assert(n && dma != cpu && "RX ring 6 has no free buffer");
   struct mwx_desc *d = (struct mwx_desc *)pa2va(chip.bar[base] + dma * 16, 16);
-  uint32_t w[10] = { (0u << 27) | 40u, 0, txs0, 0x000000f6u /* -10 dBm */, 1u << 16, pid << 24, 0, 0, 0, 0 };
-  uint8_t *p = pa2va(d->buf0, 40); memcpy(p, w, 40);
-  d->ctrl = MT_DMA_CTL_DMA_DONE | MT_DMA_CTL_LAST_SEC0 | (40u << 16);
+  /* PCI layout (mt7925_rx_check): 4 dword header, then 12 dword records */
+  uint32_t w[16] = { (0u << 27) | 64u, 0, 0, 0, txs0, 0x000000f6u /* -10 dBm */, 1u << 16, pid << 24, 0, 0, 0, 0, 0, 0, 0, 0 };
+  uint8_t *p = pa2va(d->buf0, 64); memcpy(p, w, 64);
+  d->ctrl = MT_DMA_CTL_DMA_DONE | MT_DMA_CTL_LAST_SEC0 | (64u << 16);
   chip.bar[base + 12] = (dma + 1) % n;
   raise(MT7927_INT_RX_DONE_WM);
 }
@@ -870,11 +871,21 @@ int main() {
     assert(((chip.txf.back().txd[2] >> 4) & 3) == 2 && (chip.txf.back().txd[2] & 0xf) == 8);
     /* no TX free events: the oldest token is reused once enough newer frames went out */
     chip.tx_free_auto = false;
-    for (int k = 0; k < MT7927_TX_TOKENS + 6; k++) assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0);
+    for (int k = 0; k < MT7927_TX_TOKENS; k++) assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0);
+    /* phase 4c.7: only once free events have stopped for MT7927_RECLAIM_TICKS watchdog seconds */
+    assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == ENOBUFS && r->b.tx_reclaimed == 0);
+    assert(!mt7927_engine_tx_room(&r->b));
+    for (int k = 0; k < MT7927_RECLAIM_TICKS; k++) mt7927_engine_tick(&r->b);
+    assert(mt7927_engine_tx_room(&r->b));
+    r->b.tx_blocked = false;
+    for (int k = 0; k < 6; k++) assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0);
     assert(r->b.tx_reclaimed == 6 && r->b.tx_queued == 2 + MT7927_TX_TOKENS + 6);
     /* phase 4c.3: once a free event comes back, a full set of tokens waits instead of being reclaimed */
     post_txfree(1, chip.txf.back().msdu & 0x7fff); deliver_irq();
-    assert(r->b.tok_free_seq == r->b.tok_seq);
+    assert(r->b.tok_free_seq == r->b.tok_seq && r->b.tok_free_tick == r->b.wd_ticks);
+    { uint32_t ev, ms, mx, re, fa; mt7927_engine_txfree_stats(&r->b, &ev, &ms, &mx, &re, &fa);
+      assert(ev == r->b.tx_free_events && ms >= 2 && mx >= 1 && re == 0);
+      mt7927_engine_txfree_stats(&r->b, &ev, &ms, &mx, &re, &fa); assert(mx == 0); }
     assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0);                 /* the freed token */
     { uint32_t nt = r->b.tx_no_token;
       assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == ENOBUFS && r->b.tx_no_token == nt + 1 &&

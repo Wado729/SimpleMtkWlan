@@ -624,6 +624,7 @@ struct mwx_softc {
 	uint32_t		sc_7927_tx_held;	/* frames held back: no token */
 	volatile bool		sc_7927_edca_dirty;	/* AP changed WMM parameters */
 	uint32_t		sc_7927_depth_tok;	/* max tokens out, last 5 s */
+	uint32_t		sc_7927_tf_ev, sc_7927_tf_ms, sc_7927_tf_re;
 	uint32_t		sc_7927_depth_ring;	/* max undone descriptors */
 	uint32_t		sc_7927_tx_encfail;
 	uint32_t		sc_7927_rx_bcn;		/* beacons from our BSS */
@@ -4587,6 +4588,8 @@ enum { MT7927_RX_BAND0, MT7927_RX_MCU, MT7927_RX_DATA2, MT7927_NRX };
 #define MT7927_STAGE_N		64	/* rx6 frame staging slots */
 #define MT7927_TX_TOKENS	256	/* data TX payload buffers (msdu ids) */
 #define MT7927_TX_TOKEN_SZ	2304
+/* no TX free event for this many watchdog seconds: tokens may be reclaimed */
+#define MT7927_RECLAIM_TICKS	3
 #define MT7927_STAGE_SZ		4096
 
 struct mt7927_bringup {
@@ -4704,6 +4707,11 @@ struct mt7927_bringup {
 	uint32_t		tx_ring_full;
 	uint32_t		tx_logged;
 	uint32_t		tok_free_seq;	/* tok_seq at the last TX free event */
+	uint32_t		wd_ticks;	/* watchdog seconds (engine_tick) */
+	uint32_t		tok_free_tick;	/* ticks at the last TX free event */
+	uint32_t		tx_retries;	/* free event headers: tx count - 1 */
+	uint32_t		tx_free_msdus;	/* MSDUs in TX free events */
+	uint32_t		tx_free_max;	/* most MSDUs in one free event */
 	/* phase 4c.3: sampled TX status (rate the firmware picked) */
 	uint32_t		txs_count;
 	uint32_t		txs_ack_err;
@@ -7871,6 +7879,7 @@ mt7927_tx_free_event(struct mt7927_bringup *b, const uint8_t *p, uint32_t len)
 
 	b->tx_free_events++;
 	b->tok_free_seq = b->tok_seq;
+	b->tok_free_tick = b->wd_ticks;
 	if (len < 8)
 		return;
 	total = (mt7927_le32(p) >> 16) & 0x3ff;			/* MSDU_CNT */
@@ -7882,9 +7891,15 @@ mt7927_tx_free_event(struct mt7927_bringup *b, const uint8_t *p, uint32_t len)
 		int i;
 
 		if (info & (MT7927_TXFREE_INFO_PAIR | MT7927_TXFREE_INFO_HEADER)) {
-			if ((info & MT7927_TXFREE_INFO_HEADER) &&
-			    ((info >> 28) & 3) != 0)
-				b->tx_failed++;
+			if (info & MT7927_TXFREE_INFO_HEADER) {
+				/* MT_TXFREE_INFO_COUNT / _STAT (mt7925_mac_tx_free) */
+				uint32_t cnt = (info >> 24) & 0xf;
+
+				if (cnt > 1)
+					b->tx_retries += cnt - 1;
+				if (((info >> 28) & 3) != 0)
+					b->tx_failed++;
+			}
 			continue;
 		}
 		for (i = 0; i < 2; i++) {
@@ -7900,6 +7915,31 @@ mt7927_tx_free_event(struct mt7927_bringup *b, const uint8_t *p, uint32_t len)
 			}
 		}
 	}
+	b->tx_free_msdus += count;
+	if (count > b->tx_free_max)
+		b->tx_free_max = count;
+}
+
+/* Watchdog second (1 s): the clock for reclaiming tokens. */
+void
+mt7927_engine_tick(struct mt7927_bringup *b)
+{
+	b->wd_ticks++;
+}
+
+/* Retries and aggregation as TX free events report them, since the last call. */
+void
+mt7927_engine_txfree_stats(struct mt7927_bringup *b, uint32_t *events,
+    uint32_t *msdus, uint32_t *max, uint32_t *retries, uint32_t *failed)
+{
+	mt7927_svc_lock(b);
+	*events = b->tx_free_events;
+	*msdus = b->tx_free_msdus;
+	*max = b->tx_free_max;
+	*retries = b->tx_retries;
+	*failed = b->tx_failed;
+	b->tx_free_max = 0;
+	mt7927_svc_unlock(b);
 }
 
 /*
@@ -7912,7 +7952,8 @@ mt7927_txs_event(struct mt7927_bringup *b, const uint8_t *p, uint32_t len)
 {
 	uint32_t off;
 
-	for (off = 8; off + 32 <= len; off += 32) {
+	/* the PCI path, mt7925_rx_check(): 4 dword header, 12 dword records */
+	for (off = 16; off + 48 <= len; off += 48) {
 		uint32_t t0 = mt7927_le32(p + off);
 		uint32_t t3 = mt7927_le32(p + off + 12);
 
@@ -7959,7 +8000,8 @@ mt7927_engine_tx_room(struct mt7927_bringup *b)
 		}
 	}
 	/* while free events have stopped, mt7927_tx_frame() may reclaim */
-	if (!room && b->tok_seq - b->tok_free_seq >= MT7927_TX_TOKENS)
+	if (!room && b->tok_seq - b->tok_free_seq >= MT7927_TX_TOKENS &&
+	    b->wd_ticks - b->tok_free_tick >= MT7927_RECLAIM_TICKS)
 		room = true;
 	if (!room)
 		b->tx_blocked = true;
@@ -8048,6 +8090,7 @@ mt7927_tx_frame(struct mt7927_bringup *b, const struct mt7927_txinfo *ti,
 		 */
 		if (best == MT7927_TX_TOKENS ||
 		    b->tok_seq - b->tok_free_seq < MT7927_TX_TOKENS ||
+		    b->wd_ticks - b->tok_free_tick < MT7927_RECLAIM_TICKS ||
 		    b->tok_seq - b->tok_when[best] < MT7927_TX_TOKENS / 2) {
 			mt7927_svc_unlock(b);
 			b->tx_no_token++;
@@ -9264,6 +9307,28 @@ mt7927_join_assoc(struct mwx_softc *sc)
 	if (!sc->sc_7927_joined)
 		return EINVAL;
 	mt7927_vif_fill(sc, &v);
+	{
+		/*
+		 * The record was filled at AUTH from the scan node, before
+		 * net80211 negotiated HT/VHT/QoS from the association response
+		 * (ieee80211_ht/vht_negotiate): the firmware had a legacy
+		 * 20 MHz peer. mt7925_mac_link_sta_assoc() builds these from
+		 * the negotiated link_sta: do the same.
+		 */
+		struct mt7927_bss nb;
+
+		mt7927_bss_fill(sc, ic->ic_bss, &nb);
+		nb.cipher = sc->sc_7927_bss.cipher;
+		sc->sc_7927_bss = nb;
+		MWX_DEV_LOG(sc, "MT7927 peer at association: %s%s%sphymode 0x%02x "
+		    "phy_type 0x%02x bw %u center %u ampdu 0x%02x max %u "
+		    "vht_opmode 0x%02x ht mcs 0x%02x%02x\n",
+		    (ic->ic_bss->ni_flags & IEEE80211_NODE_QOS) ? "QoS " : "",
+		    (ic->ic_bss->ni_flags & IEEE80211_NODE_HT) ? "HT " : "",
+		    (ic->ic_bss->ni_flags & IEEE80211_NODE_VHT) ? "VHT " : "",
+		    nb.phymode, nb.phy_type, nb.bw, nb.center_chan, nb.ampdu,
+		    nb.max_ampdu_len, nb.vht_opmode, nb.ht_mcs[1], nb.ht_mcs[0]);
+	}
 	sc->sc_7927_bss.aid = IEEE80211_AID(ic->ic_bss->ni_associd);
 	if ((rv = mt7927_bss_info(sc->sc_7927, &v, &sc->sc_7927_bss, true)) == 0 &&
 	    (rv = mt7927_sta_rec(sc->sc_7927, &v, &sc->sc_7927_bss, true, true,
@@ -9833,6 +9898,12 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 		} else {
 			ti.q_idx = MT7927_LMAC_ALTX0;
 			ti.tid = 0;				/* MT_TX_NORMAL */
+			/* an ADDBA request is MT_TX_ADDBA (mt7925_mac_write_txwi_80211) */
+			if ((wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK) ==
+			    IEEE80211_FC0_SUBTYPE_ACTION && len >= 26 &&
+			    sc->sc_7927_txbuf[24] == IEEE80211_CATEG_BA &&
+			    sc->sc_7927_txbuf[25] == IEEE80211_ACTION_ADDBA_REQ)
+				ti.tid = 2;
 			ti.fixed_rate = true;
 		}
 		rv = mt7927_tx_frame(sc->sc_7927, &ti, sc->sc_7927_txbuf, len);
@@ -10159,6 +10230,7 @@ mt7927_hal_poll(struct mwx_softc *sc)
 	{
 		uint32_t tok, ring;
 
+		mt7927_engine_tick(sc->sc_7927);
 		mt7927_engine_tx_depth(sc->sc_7927, &tok, &ring);
 		if (tok > sc->sc_7927_depth_tok)
 			sc->sc_7927_depth_tok = tok;
@@ -10201,6 +10273,23 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		    sc->sc_7927_depth_ring, sc->sc_7927_tx_held,
 		    sc->sc_7927_recoveries);
 		sc->sc_7927_depth_tok = sc->sc_7927_depth_ring = 0;
+		{
+			uint32_t ev, ms, mx, re, fa, dev_, dms, dre;
+
+			mt7927_engine_txfree_stats(sc->sc_7927, &ev, &ms, &mx,
+			    &re, &fa);
+			dev_ = ev - sc->sc_7927_tf_ev;
+			dms = ms - sc->sc_7927_tf_ms;
+			dre = re - sc->sc_7927_tf_re;
+			MWX_DEV_LOG(sc, "MT7927 tx done: last 5 s %u frames in %u "
+			    "free events (most in one %u), %u retries (%u.%02u "
+			    "per frame); total failed %u\n", dms, dev_, mx, dre,
+			    dms ? dre / dms : 0, dms ? (dre * 100 / dms) % 100 : 0,
+			    fa);
+			sc->sc_7927_tf_ev = ev;
+			sc->sc_7927_tf_ms = ms;
+			sc->sc_7927_tf_re = re;
+		}
 	}
 	if (sc->sc_7927_poll % 30 == 1) {
 		mt7927_engine_counters(sc->sc_7927, &intr, &isr, &frames, &other,
