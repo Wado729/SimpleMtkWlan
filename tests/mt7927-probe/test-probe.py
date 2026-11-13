@@ -159,7 +159,7 @@ static void IOSleep(unsigned ms) { now_us += ms * 1000ull; }
 '''
 
 post = r'''
-static int mt7927_dmamem_alloc(struct mt7927_dmamem *m, size_t size) {
+static int mt7927_dmamem_alloc(struct mt7927_dmamem *m, size_t size, bool) {
   memset(m, 0, sizeof(*m)); m->va = calloc(1, size); m->pa = next_pa; next_pa += (size + 0xfff) & ~0xfffu;
   m->size = size; m->handle = m->va; mems.push_back({m->pa, (uint8_t *)m->va, size}); live_allocs++; return 0; }
 static void mt7927_dmamem_free(struct mt7927_dmamem *m) {
@@ -990,7 +990,9 @@ int main() {
       [](void *, uint8_t, const uint8_t *, uint32_t) {});
     for (int round = 0; round < 3; round++) {               /* boot, then two wakes */
       assert(mt7927_engine_start(&r->b, patch.data(), patch.size(), ram.data(), ram.size(), &abort_flag) == 0);
-      assert(mt7927_engine_running(&r->b) && r->b.rx[MT7927_RX_MCU].count == 256 && r->b.rx[MT7927_RX_MCU].bufsz == 4096);
+      assert(mt7927_engine_running(&r->b) && r->b.rx[MT7927_RX_MCU].count == 512 && r->b.rx[MT7927_RX_MCU].bufsz == 4096 &&
+             r->b.rx[MT7927_RX_BAND0].count == 1536 && r->b.rx[MT7927_RX_BAND0].per_chunk == 16 &&
+             mt7927_ring_buf_pa(&r->b.rx[MT7927_RX_BAND0], 17) == r->b.rx[MT7927_RX_BAND0].buf_chunk[1].pa + 4096);
       assert(r->b.tx[MT7927_TX_BAND0].count == 256 && r->b.tok_mem.va != nullptr);
       struct mt7927_vif v = {}; v.idx = 0; v.omac_idx = 0; v.band_idx = 1; v.wmm_idx = 0; v.wcid = MT7927_WTBL_RESERVED;
       memcpy(v.addr, mt7927_engine_mac(&r->b), 6);

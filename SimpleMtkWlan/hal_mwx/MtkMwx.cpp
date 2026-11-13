@@ -623,6 +623,9 @@ struct mwx_softc {
 	uint32_t		sc_7927_last_recovery;	/* poll tick */
 	uint32_t		sc_7927_tx_held;	/* frames held back: no token */
 	volatile bool		sc_7927_edca_dirty;	/* AP changed WMM parameters */
+	struct mbuf_list	sc_7927_rxml;		/* RX batch for if_input */
+	uint32_t		sc_7927_rxml_frames;	/* 802.11 frames in it */
+	uint32_t		sc_7927_rx_batches, sc_7927_rx_batched;
 	uint32_t		sc_7927_depth_tok;	/* max tokens out, last 5 s */
 	uint32_t		sc_7927_tf_ev, sc_7927_tf_ms, sc_7927_tf_re;
 	uint32_t		sc_7927_depth_ring;	/* max undone descriptors */
@@ -4569,9 +4572,17 @@ struct mt7927_dmamem {
 	void		*handle;
 };
 
+/*
+ * Ring buffers come in 64 KB physically contiguous chunks, so rings as large
+ * as Linux's (1536 RX buffers) need no multi-megabyte contiguous block.
+ */
+#define	MT7927_CHUNK_SZ		65536
+#define	MT7927_RING_CHUNKS	96
+
 struct mt7927_ring {
 	struct mt7927_dmamem	desc_mem;
-	struct mt7927_dmamem	buf_mem;
+	struct mt7927_dmamem	buf_chunk[MT7927_RING_CHUNKS];
+	uint16_t		per_chunk;	/* buffers per chunk */
 	struct mwx_desc		*desc;
 	uint32_t		regbase;
 	uint32_t		bufsz;
@@ -4586,6 +4597,7 @@ struct mt7927_ring {
 enum { MT7927_TX_BAND0, MT7927_TX_MCU, MT7927_TX_FWDL, MT7927_NTX };
 enum { MT7927_RX_BAND0, MT7927_RX_MCU, MT7927_RX_DATA2, MT7927_NRX };
 #define MT7927_STAGE_N		64	/* rx6 frame staging slots */
+#define MT7927_RX_BATCH		64	/* 802.11 frames per if_input() */
 #define MT7927_TX_TOKENS	256	/* data TX payload buffers (msdu ids) */
 #define MT7927_TX_TOKEN_SZ	2304
 /* no TX free event for this many watchdog seconds: tokens may be reclaimed */
@@ -4653,6 +4665,7 @@ struct mt7927_bringup {
 	volatile bool		wait_done;
 	void			*cb_arg;
 	void			(*cb_rx)(void *, const uint8_t *, uint32_t);
+	void			(*cb_rx_done)(void *);	/* end of an RX batch */
 	void			(*cb_event)(void *, uint8_t, const uint8_t *,
 				    uint32_t);
 	void			(*cb_txroom)(void *);
@@ -5212,7 +5225,7 @@ mt7927_phase1(struct mt7927_bringup *b)
 
 #ifdef MT7927_HOST_TEST
 /* tests/mt7927-probe supplies these after the block. */
-static int mt7927_dmamem_alloc(struct mt7927_dmamem *, size_t);
+static int mt7927_dmamem_alloc(struct mt7927_dmamem *, size_t, bool);
 static void mt7927_dmamem_free(struct mt7927_dmamem *);
 static void mt7927_signal(struct mt7927_bringup *);
 static void mt7927_wait(struct mt7927_bringup *, int);
@@ -5231,16 +5244,22 @@ struct mt7927_os {
 };
 
 static int
-mt7927_dmamem_alloc(struct mt7927_dmamem *m, size_t size)
+mt7927_dmamem_alloc(struct mt7927_dmamem *m, size_t size, bool cached)
 {
 	IOBufferMemoryDescriptor *md;
 	IOPhysicalAddress pa;
 
 	memset(m, 0, sizeof(*m));
-	/* Page aligned, physically contiguous, below 4 GB (32-bit DMA mask). */
+	/*
+	 * Page aligned, physically contiguous, below 4 GB (32-bit DMA mask).
+	 * Frame buffers are cached, like Linux's page_pool / coherent memory
+	 * on x86, where PCIe DMA snoops the CPU caches: copying a frame out
+	 * of uncached memory costs a bus read per word. Descriptors stay
+	 * uncached.
+	 */
 	md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-	    kIOMemoryPhysicallyContiguous | kIODirectionInOut | kIOMapInhibitCache,
-	    size, 0x00000000fffff000ULL);
+	    kIOMemoryPhysicallyContiguous | kIODirectionInOut |
+	    (cached ? 0 : kIOMapInhibitCache), size, 0x00000000fffff000ULL);
 	if (md == NULL)
 		return ENOMEM;
 	if (md->prepare() != kIOReturnSuccess) {
@@ -5344,10 +5363,21 @@ mt7927_ring_alloc(struct mt7927_bringup *b, struct mt7927_ring *r,
 	r->regbase = MT7927_RING_REG(rx ? MT7927_RX_RING_BASE :
 	    MT7927_TX_RING_BASE, hwidx);
 	if ((rv = mt7927_dmamem_alloc(&r->desc_mem,
-	    count * sizeof(struct mwx_desc))) != 0)
+	    count * sizeof(struct mwx_desc), false)) != 0)
 		return rv;
-	if ((rv = mt7927_dmamem_alloc(&r->buf_mem, (size_t)count * bufsz)) != 0)
-		return rv;
+	r->per_chunk = bufsz >= MT7927_CHUNK_SZ ? 1 :
+	    (uint16_t)(MT7927_CHUNK_SZ / bufsz);
+	for (uint32_t i = 0, done = 0; done < count; i++) {
+		uint32_t n = count - done < r->per_chunk ? count - done :
+		    r->per_chunk;
+
+		if (i >= MT7927_RING_CHUNKS)
+			return EINVAL;
+		if ((rv = mt7927_dmamem_alloc(&r->buf_chunk[i], (size_t)n * bufsz,
+		    true)) != 0)
+			return rv;
+		done += n;
+	}
 	r->desc = (struct mwx_desc *)r->desc_mem.va;
 	return 0;
 }
@@ -5356,20 +5386,24 @@ static void
 mt7927_ring_free(struct mt7927_ring *r)
 {
 	mt7927_dmamem_free(&r->desc_mem);
-	mt7927_dmamem_free(&r->buf_mem);
+	for (int i = 0; i < MT7927_RING_CHUNKS; i++)
+		if (r->buf_chunk[i].va != NULL)
+			mt7927_dmamem_free(&r->buf_chunk[i]);
 	r->desc = NULL;
 }
 
 static inline uint32_t
 mt7927_ring_buf_pa(struct mt7927_ring *r, uint16_t idx)
 {
-	return r->buf_mem.pa + (uint32_t)idx * r->bufsz;
+	return r->buf_chunk[idx / r->per_chunk].pa +
+	    (uint32_t)(idx % r->per_chunk) * r->bufsz;
 }
 
 static inline uint8_t *
 mt7927_ring_buf(struct mt7927_ring *r, uint16_t idx)
 {
-	return (uint8_t *)r->buf_mem.va + (size_t)idx * r->bufsz;
+	return (uint8_t *)r->buf_chunk[idx / r->per_chunk].va +
+	    (size_t)(idx % r->per_chunk) * r->bufsz;
 }
 
 /* mt76_dma_queue_reset + sync_idx: descriptors done, registers programmed. */
@@ -5835,6 +5869,8 @@ mt7927_isr_running(struct mt7927_bringup *b)
 		} while (full && ++batch < 64);
 		mt7927_drain(b, &b->rx[MT7927_RX_BAND0], true, false);
 		mt7927_drain(b, &b->rx[MT7927_RX_DATA2], true, false);
+		if (b->cb_rx_done != NULL)
+			b->cb_rx_done(b->cb_arg);
 		mt7927_tx_room_check(b);
 		sta = mt7927_raw_rd(sc, MT_WFDMA0_HOST_INT_STA) & b->irq_mask;
 		if (sta == 0 || sta == (0xffffffff & b->irq_mask))
@@ -6068,11 +6104,11 @@ mt7927_dma_init(struct mt7927_bringup *b)
 	    (rv = mt7927_ring_alloc(b, &b->tx[MT7927_TX_FWDL], "tx16-fwdl", false,
 	    MT7927_TXQ_FWDL, 32, MT7927_FW_CHUNK)) != 0 ||
 	    (rv = mt7927_ring_alloc(b, &b->rx[MT7927_RX_MCU], "rx6-mcu", true,
-	    MT7927_RXQ_MCU_WM, 256, MT7927_RX_BUF_SIZE)) != 0 ||
+	    MT7927_RXQ_MCU_WM, 512, MT7927_RX_BUF_SIZE)) != 0 ||
 	    (rv = mt7927_ring_alloc(b, &b->rx[MT7927_RX_BAND0], "rx4-data", true,
-	    MT7927_RXQ_BAND0, 128, MT7927_RX_BUF_SIZE)) != 0 ||
+	    MT7927_RXQ_BAND0, 1536, MT7927_RX_BUF_SIZE)) != 0 ||
 	    (rv = mt7927_ring_alloc(b, &b->rx[MT7927_RX_DATA2], "rx7-data2", true,
-	    MT7927_RXQ_DATA2, 32, MT7927_RX_BUF_SIZE)) != 0) {
+	    MT7927_RXQ_DATA2, 512, MT7927_RX_BUF_SIZE)) != 0) {
 		MWX_DEV_LOG(sc, "MT7927 ring allocation failed (%d)\n", rv);
 		return rv;
 	}
@@ -7855,7 +7891,7 @@ mt7927_tx_alloc(struct mt7927_bringup *b)
 	if (b->tok_mem.va != NULL)
 		return 0;
 	rv = mt7927_dmamem_alloc(&b->tok_mem,
-	    (size_t)MT7927_TX_TOKENS * MT7927_TX_TOKEN_SZ);
+	    (size_t)MT7927_TX_TOKENS * MT7927_TX_TOKEN_SZ, true);
 	if (rv == 0) {
 		memset((void *)b->tok_busy, 0, sizeof(b->tok_busy));
 		b->tok_seq = 0;
@@ -8646,6 +8682,13 @@ mt7927_engine_set_txroom(struct mt7927_bringup *b, void (*fn)(void *))
 	b->cb_txroom = fn;
 }
 
+/* Called after each pass over the RX rings, so frames can go up in batches. */
+void
+mt7927_engine_set_rxdone(struct mt7927_bringup *b, void (*fn)(void *))
+{
+	b->cb_rx_done = fn;
+}
+
 void
 mt7927_engine_set_callbacks(struct mt7927_bringup *b, void *arg,
     void (*rx)(void *, const uint8_t *, uint32_t),
@@ -8788,6 +8831,7 @@ void mtk_dbg_publish();
 #define	MT7927_SCAN_TIMEOUT_SEC	30
 
 static void mt7927_hal_rx(void *, const uint8_t *, uint32_t);
+static void mt7927_hal_rx_done(void *);
 static void mt7927_hal_event(void *, uint8_t, const uint8_t *, uint32_t);
 
 static void
@@ -8820,6 +8864,7 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 	mt7927_engine_set_callbacks(sc->sc_7927, sc, mt7927_hal_rx,
 	    mt7927_hal_event);
 	mt7927_engine_set_txroom(sc->sc_7927, mt7927_hal_txroom);
+	mt7927_engine_set_rxdone(sc->sc_7927, mt7927_hal_rx_done);
 	mt7927_bringup_set_country(sc->sc_7927, NULL);	/* "00" */
 	if (PE_parse_boot_argn("mtk7927cc", cc, sizeof(cc) - 1)) {
 		MWX_DEV_LOG(sc, "MT7927 country %s (mtk7927cc)\n", cc);
@@ -9040,6 +9085,8 @@ mt7927_hal_stop(struct mwx_softc *sc)
 	sc->sc_vif.band_idx = 0;
 	sc->sc_7927_hwkeys = 0;
 	sc->sc_7927_ptk_pending = false;
+	ml_purge(&sc->sc_7927_rxml);
+	sc->sc_7927_rxml_frames = 0;
 }
 
 /* Passive scan of every channel in the net80211 table. */
@@ -9974,8 +10021,34 @@ mt7927_hal_rx(void *arg, const uint8_t *p, uint32_t len)
 	memcpy(mtod(m, uint8_t *), p, len);
 	mbuf_setlen(m, len);
 	mbuf_pkthdr_setlen(m, len);
-	mwx_rx(sc, m, &ml);
-	if_input(ifp, &ml);
+	/*
+	 * Up the stack in batches, like NAPI: if_input() hands each list to
+	 * the interface and flushes its input queue once, so one call per
+	 * frame meant one flush (a trip through the network stack) per frame.
+	 */
+	mwx_rx(sc, m, &sc->sc_7927_rxml);
+	if (++sc->sc_7927_rxml_frames >= MT7927_RX_BATCH)
+		mt7927_hal_rx_done(sc);
+	(void)ml;
+}
+
+/* End of a pass over the RX rings (work loop thread): send the batch up. */
+static void
+mt7927_hal_rx_done(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct ifnet *ifp = &sc->sc_ic.ic_if;
+
+	sc->sc_7927_rxml_frames = 0;
+	if (ml_empty(&sc->sc_7927_rxml))
+		return;
+	sc->sc_7927_rx_batches++;
+	sc->sc_7927_rx_batched += ml_len(&sc->sc_7927_rxml);
+	if (!(ifp->if_flags & IFF_RUNNING) || sc->sc_suspended) {
+		ml_purge(&sc->sc_7927_rxml);
+		return;
+	}
+	if_input(ifp, &sc->sc_7927_rxml);
 }
 
 static int
@@ -10294,6 +10367,8 @@ mt7927_hal_poll(struct mwx_softc *sc)
 	if (sc->sc_7927_poll % 30 == 1) {
 		mt7927_engine_counters(sc->sc_7927, &intr, &isr, &frames, &other,
 		    &events, &timeouts);
+		MWX_DEV_LOG(sc, "MT7927 rx batches: %u, %u packets up the stack\n",
+		    sc->sc_7927_rx_batches, sc->sc_7927_rx_batched);
 		MWX_DEV_LOG(sc, "MT7927 poll: intr %u isr %u rx frames %u "
 		    "(net80211 %u, dropped ch %u short %u fcs %u icv %u trans %u) "
 		    "other %u events %u timeouts %u scans %u state %d\n", intr,
