@@ -1,0 +1,40 @@
+/*
+ * MT7927 (connac3) types shared by the MT7927 engine and the mwx glue in
+ * MtkMwx.cpp, and by tests/mt7927-probe.
+ */
+#ifndef MT7927_TYPES_H
+#define MT7927_TYPES_H
+
+#include <stdint.h>
+
+/* MT7927 phase 4b: what BSS_INFO / STA_REC need about the AP joined. */
+struct mt7927_bss {
+	uint8_t		bssid[6];
+	uint8_t		chan;		/* control channel */
+	uint8_t		band;		/* 1: 2.4 GHz, 2: 5 GHz */
+	uint16_t	bcn_int;
+	uint8_t		dtim;
+	uint8_t		qos;
+	uint16_t	aid;
+	uint16_t	peer_wcid;
+	uint8_t		phymode;	/* PHY_MODE_* (BSS_INFO basic) */
+	uint8_t		phy_type;	/* PHY_TYPE_BIT_* (STA_REC phy) */
+	uint16_t	basic_rates;	/* mac80211 basic_rates bitmap */
+	uint16_t	ra_legacy;	/* STA_REC ra: RA_LEGACY_OFDM | CCK */
+	uint8_t		ht_mcs[10];
+};
+
+/* MT7927 phase 4b: per-frame TXD inputs. */
+struct mt7927_txinfo {
+	uint16_t	wcid;
+	uint8_t		omac_idx;
+	uint8_t		band_idx;
+	uint8_t		q_idx;		/* LMAC queue: AC 0-3, ALTX0 0x10 */
+	uint8_t		tid;
+	uint8_t		hdrlen;
+	uint8_t		rate_idx;	/* basic rate table entry if fixed */
+	bool		fixed_rate;
+	bool		multicast;
+};
+
+#endif /* MT7927_TYPES_H */

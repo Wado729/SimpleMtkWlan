@@ -465,6 +465,8 @@ struct mwx_setkey_task_arg {
 	struct ieee80211_key	*k;
 };
 
+#include "mt7927_types.h"
+
 struct mwx_softc {
 	struct device		sc_dev;
 	struct ieee80211com	sc_ic;
@@ -577,6 +579,7 @@ struct mwx_softc {
 	/* MWX_HW_MT7927 */
 	struct mt7927_bringup	*sc_7927;
 	IOLock			*sc_7927_lock;
+	IOLock			*sc_7927_txlock;	/* mt7927_hal_output() */
 	volatile bool		sc_7927_abort;
 	bool			sc_7927_thread;		/* init thread started */
 	volatile bool		sc_7927_thread_done;
@@ -585,6 +588,13 @@ struct mwx_softc {
 	uint32_t		sc_7927_join_refused;
 	uint32_t		sc_7927_poll;
 	uint32_t		sc_7927_rx_drop[8];
+	/* phase 4b: join */
+	bool			sc_7927_joined;		/* BSS_INFO + STA_REC set */
+	bool			sc_7927_assoc;
+	uint32_t		sc_7927_assoc_polls;
+	uint32_t		sc_7927_tx_encfail;
+	struct mt7927_bss	sc_7927_bss;
+	uint8_t			sc_7927_txbuf[2304];
 };
 
 const uint8_t mwx_channels_2ghz[] = {
@@ -694,6 +704,15 @@ static int	mt7927_hal_scan(struct mwx_softc *);
 static void	mt7927_hal_suspend(struct mwx_softc *);
 static void	mt7927_hal_poll(struct mwx_softc *);
 static void	mt7927_hal_end_scan(struct mwx_softc *);
+static void	mt7927_hal_output(struct mwx_softc *, struct ifnet *);
+static void	mt7927_newstate(struct mwx_softc *, enum ieee80211_state,
+		    enum ieee80211_state, int);
+static int	mt7927_set_key(struct ieee80211com *, struct ieee80211_node *,
+		    struct ieee80211_key *);
+static void	mt7927_delete_key(struct ieee80211com *, struct ieee80211_node *,
+		    struct ieee80211_key *);
+static void	mt7927_join_poll(struct mwx_softc *);
+static void	mt7927_join_teardown(struct mwx_softc *, const char *);
 static int	mt7927_mac_fill_rx(struct mwx_softc *, struct mbuf *,
 		    struct ieee80211_rxinfo *);
 int	mwx_init_hw(struct ifnet *);
@@ -1244,10 +1263,7 @@ mwx_start(struct ifnet *ifp)
 		return;
 
 	if (sc->sc_hwtype == MWX_HW_MT7927) {
-		/* No connac3 TX path yet (phase 4b): drop what was queued. */
-		mq_purge(&ic->ic_mgtq);
-		while ((m = ifq_dequeue(&ifp->if_snd)) != NULL)
-			m_freem(m);
+		mt7927_hal_output(sc, ifp);
 		return;
 	}
 
@@ -1518,21 +1534,10 @@ mwx_newstate_task(void *ptr)
 	int s = splnet();
 	int rv = 0;
 
-	/*
-	 * MT7927 phase 4a: scanning only. Joining needs the connac3 station
-	 * and BSS records and TX path (phase 4b), so a join net80211 starts
-	 * is turned into another scan.
-	 */
-	if (sc->sc_hwtype == MWX_HW_MT7927 && nstate > IEEE80211_S_SCAN) {
-		if (sc->sc_7927_join_refused++ < 8)
-			MWX_DEV_LOG(sc, "MT7927 phase 4a: not joining \"%.*s\" "
-			    "(%s), scanning again\n",
-			    ic->ic_bss != NULL ? ic->ic_bss->ni_esslen : 0,
-			    ic->ic_bss != NULL ? (const char *)ic->ic_bss->ni_essid : "",
-			    ieee80211_state_name[nstate]);
-		nstate = IEEE80211_S_SCAN;
-		arg = -1;
-		sc->sc_ns_state = nstate;
+	if (sc->sc_hwtype == MWX_HW_MT7927) {
+		mt7927_newstate(sc, ostate, nstate, arg);
+		splx(s);
+		return;
 	}
 
 	switch (ostate) {
@@ -1658,6 +1663,8 @@ mwx_bgscan(struct ieee80211com *ic)
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
 	int err;
 
+	if (sc->sc_hwtype == MWX_HW_MT7927)
+		return EBUSY;	/* phase 4b: no scans while associated */
 	if (sc->sc_flags & MWX_FLAG_SCANNING)
 		return 0;
 
@@ -2279,6 +2286,20 @@ mwx_preinit(struct mwx_softc *sc)
 	ieee80211_channel_init(ifp);
 	/* VHT channels make net80211 claim 11ax too; HE is not supported. */
 	ic->ic_modecaps &= ~(1 << IEEE80211_MODE_11AX);
+	if (sc->sc_hwtype == MWX_HW_MT7927) {
+		/*
+		 * Phase 4b: 11a/g only until the HT/VHT STA_REC TLVs, rate
+		 * control and block ack are ported for connac3.
+		 */
+		for (i = 0; i <= IEEE80211_CHAN_MAX; i++)
+			ic->ic_channels[i].ic_flags &=
+			    ~(IEEE80211_CHAN_HT | IEEE80211_CHAN_VHT);
+		ieee80211_channel_init(ifp);
+		ic->ic_modecaps &= ~((1 << IEEE80211_MODE_11N) |
+		    (1 << IEEE80211_MODE_11AC) | (1 << IEEE80211_MODE_11AX));
+		ic->ic_flags &= ~(IEEE80211_F_HTON | IEEE80211_F_VHTON |
+		    IEEE80211_F_HEON);
+	}
 	MWX_DEV_LOG(sc, "preinit channel table ready\n");
 
 	if (IEEE80211_ADDR_EQ(etheranyaddr, sc->sc_ic.ic_myaddr))
@@ -2579,6 +2600,13 @@ common:
 	ic->ic_ampdu_tx_start = mwx_ampdu_tx_start;
 	ic->ic_ampdu_tx_stop = mwx_ampdu_tx_stop;
 	ic->ic_delete_key = mwx_delete_key;
+	if (sc->sc_hwtype == MWX_HW_MT7927) {
+		/* Phase 4b: keys in software, no block ack / A-MSDU yet. */
+		ic->ic_set_key = mt7927_set_key;
+		ic->ic_delete_key = mt7927_delete_key;
+		ic->ic_caps &= ~(IEEE80211_C_TX_AMPDU |
+		    IEEE80211_C_TX_AMSDU_IN_AMPDU);
+	}
 
 	/* Override 802.11 state transition machine. */
 	sc->sc_newstate = ic->ic_newstate;
@@ -4273,6 +4301,70 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 #define	MT7927_SKU_LEN			450	/* channel + MT_CONNAC3_SKU_POWER_LIMIT */
 #define	MT7927_MIB(b, ofs)		(((b) ? 0x820fd000U : 0x820ed000U) + (ofs))
 
+/* Phase 4b: join, data TX (mt7925/mcu.h, mt76_connac_mcu.h, mt76_connac3_mac.h). */
+#define	MT7927_UNI_ROC			MT7927_UNI_CMD(0x27)
+#define	MT7927_UNI_EVENT_ROC		0x27
+#define	MT7927_UNI_ROC_ACQUIRE		0
+#define	MT7927_UNI_ROC_ABORT		1
+#define	MT7927_UNI_EVENT_ROC_GRANT	0
+#define	MT7927_ROC_REQ_JOIN		0
+#define	MT7927_ROC_WAIT_MS		4000		/* 4 * HZ */
+
+#define	MT7927_BSS_TAG_BASIC		0
+#define	MT7927_BSS_TAG_RLM		2
+#define	MT7927_BSS_TAG_MBSSID		6
+#define	MT7927_BSS_TAG_RATE		11
+#define	MT7927_BSS_TAG_QBSS		15
+#define	MT7927_BSS_TAG_SEC		16
+#define	MT7927_BSS_TAG_IFS_TIME		23
+#define	MT7927_BSS_TAG_MLD		26
+#define	MT7927_STA_TAG_BASIC		0
+#define	MT7927_STA_TAG_RA		1
+#define	MT7927_STA_TAG_STATE		7
+#define	MT7927_STA_TAG_PHY		0x15
+#define	MT7927_STA_TAG_MLD_OFF		0x23
+#define	MT7927_STA_TAG_REMOVE		0x25
+#define	MT7927_STA_TAG_HDR_TRANS	0x2b
+#define	MT7927_CONNECTION_INFRA_AP	0x00010002	/* STA_TYPE_AP | NETWORK_INFRA */
+#define	MT7927_CONNECTION_INFRA_BC	0x00010020	/* STA_TYPE_BC | NETWORK_INFRA */
+#define	MT7927_CONN_STATE_PORT_SECURE	2
+#define	MT7927_EXTRA_INFO_VER		(1U << 0)
+#define	MT7927_EXTRA_INFO_NEW		(1U << 1)
+#define	MT7927_PHY_TYPE_ERP_INDEX	1
+#define	MT7927_PHY_TYPE_OFDM_INDEX	3
+#define	MT7927_BASIC_RATES_IDX(band)	(MT7927_BASIC_RATES_TBL + ((band) == 1 ? 0 : 4))
+
+/* connac3 TXD (mt76_connac3_mac.h) */
+#define	MT7927_TXD_SIZE			32
+#define	MT7927_TXP_SIZE			32	/* struct mt76_connac_hw_txp */
+#define	MT7927_TXD0_TX_BYTES(x)		((x) & 0xffff)
+#define	MT7927_TXD0_PKT_FMT_CT		(0U << 23)
+#define	MT7927_TXD0_Q_IDX(x)		((uint32_t)(x) << 25)
+#define	MT7927_TXD1_WLAN_IDX(x)		((x) & 0xfff)
+#define	MT7927_TXD1_TGID(x)		(((uint32_t)(x) & 3) << 12)
+#define	MT7927_TXD1_HDR_FORMAT_80211	(2U << 14)
+#define	MT7927_TXD1_HDR_INFO(x)		(((uint32_t)(x) & 0x1f) << 16)
+#define	MT7927_TXD1_TID(x)		(((uint32_t)(x) & 0xf) << 21)
+#define	MT7927_TXD1_OWN_MAC(x)		(((uint32_t)(x) & 0x3f) << 25)
+#define	MT7927_TXD1_FIXED_RATE		(1U << 31)
+#define	MT7927_TXD2_SUB_TYPE(x)		((x) & 0xf)
+#define	MT7927_TXD2_FRAME_TYPE(x)	(((uint32_t)(x) & 3) << 4)
+#define	MT7927_TXD3_NO_ACK		(1U << 0)
+#define	MT7927_TXD3_BCM			(1U << 4)
+#define	MT7927_TXD3_REM_TX_COUNT(x)	(((uint32_t)(x) & 0x1f) << 11)
+#define	MT7927_TXD3_BA_DISABLE		(1U << 28)
+#define	MT7927_TXD6_DAS			(1U << 2)
+#define	MT7927_TXD6_DIS_MAT		(1U << 3)
+#define	MT7927_TXD6_MSDU_CNT(x)		(((uint32_t)(x) & 0x3f) << 4)
+#define	MT7927_TXD6_TX_RATE(x)		(((uint32_t)(x) & 0x3f) << 16)
+#define	MT7927_TXP_MSDU_VALID		(1U << 15)	/* MT_MSDU_ID_VALID */
+#define	MT7927_TXP_LEN_LAST		(1U << 15)	/* MT_TXD_LEN_LAST */
+#define	MT7927_LMAC_ALTX0		0x10
+#define	MT7927_PKT_TYPE_TXRX_NOTIFY	0
+#define	MT7927_TXFREE_INFO_PAIR		(1U << 31)
+#define	MT7927_TXFREE_INFO_HEADER	(1U << 30)
+#define	MT7927_TXFREE_MSDU_MASK		0x7fff
+
 /* cfg80211 channel flags carried in SET_DOMAIN_INFO (enum ieee80211_channel_flags). */
 #define	MT7927_CHAN_NO_IR		(1U << 1)
 #define	MT7927_CHAN_RADAR		(1U << 3)
@@ -4372,6 +4464,8 @@ struct mt7927_ring {
 enum { MT7927_TX_BAND0, MT7927_TX_MCU, MT7927_TX_FWDL, MT7927_NTX };
 enum { MT7927_RX_BAND0, MT7927_RX_MCU, MT7927_RX_DATA2, MT7927_NRX };
 #define MT7927_STAGE_N		32	/* rx6 frame staging slots */
+#define MT7927_TX_TOKENS	64	/* data TX payload buffers (msdu ids) */
+#define MT7927_TX_TOKEN_SZ	2304
 #define MT7927_STAGE_SZ		2048
 
 struct mt7927_bringup {
@@ -4463,6 +4557,29 @@ struct mt7927_bringup {
 	uint16_t		stage_len[MT7927_STAGE_N];
 	uint8_t			stage[MT7927_STAGE_N][MT7927_STAGE_SZ]
 				    __attribute__((aligned(8)));
+	/* phase 4b: join ROC */
+	volatile bool		roc_granted;
+	bool			roc_active;
+	uint8_t			roc_token;
+	uint8_t			roc_status;
+	uint8_t			roc_chan;
+	uint32_t		roc_grant_ms;
+	uint32_t		roc_events;
+	/* phase 4b: data TX tokens (payload buffers named by msdu id) */
+	struct mt7927_dmamem	tok_mem;
+	volatile uint8_t	tok_busy[MT7927_TX_TOKENS];
+	uint32_t		tok_when[MT7927_TX_TOKENS];
+	uint32_t		tok_seq;
+	uint32_t		tok_next;
+	uint32_t		tx_queued;
+	uint32_t		tx_done;
+	uint32_t		tx_failed;
+	uint32_t		tx_free_events;
+	uint32_t		tx_free_badver;
+	uint32_t		tx_no_token;
+	uint32_t		tx_reclaimed;
+	uint32_t		tx_ring_full;
+	uint32_t		tx_logged;
 };
 
 static bool mt7927_bar_fault;
@@ -5193,6 +5310,9 @@ mt7927_tx_reap(struct mt7927_bringup *b, struct mt7927_ring *r)
 
 static void mt7927_service(struct mt7927_bringup *);
 static void mt7927_isr_running(struct mt7927_bringup *);
+static void mt7927_roc_event(struct mt7927_bringup *, const uint8_t *, uint32_t);
+static void mt7927_tx_free_event(struct mt7927_bringup *, const uint8_t *,
+    uint32_t);
 static uint32_t mt7927_le32(const uint8_t *);
 
 static int
@@ -5278,6 +5398,12 @@ mt7927_unsolicited(struct mt7927_bringup *b, struct mt7927_ring *r,
 	uint8_t eid = p[32 + 4];
 
 	b->unsol_events++;
+	if (eid == MT7927_UNI_EVENT_ROC) {
+		if (len > MT7927_MCU_RXD_LEN)
+			mt7927_roc_event(b, p + MT7927_MCU_RXD_LEN,
+			    len - MT7927_MCU_RXD_LEN);
+		return;
+	}
 	if (eid == MT7927_UNI_EVENT_FW_LOG) {
 		/* rxd(44) + rsv(4) + tag(2) len(2) fmt(1) rsv(3), then id */
 		const uint32_t id_off = MT7927_MCU_RXD_LEN + 4 + 8;
@@ -5383,11 +5509,17 @@ mt7927_drain(struct mt7927_bringup *b, struct mt7927_ring *r, bool deliver)
 				    b->resp_len);
 				OSSynchronizeIO();
 				b->wait_done = true;
+			} else if (eid == MT7927_UNI_EVENT_ROC) {
+				if (len > MT7927_MCU_RXD_LEN)
+					mt7927_roc_event(b, p + MT7927_MCU_RXD_LEN,
+					    len - MT7927_MCU_RXD_LEN);
 			} else if (b->unsolicited++ < 16) {
 				MWX_DEV_LOG(sc, "MT7927 event on %s: eid=0x%02x "
 				    "seq=%u ext=0x%02x len=%u (not waited for)\n",
 				    r->name, eid, seq, ext_eid, len);
 			}
+		} else if (type == MT7927_PKT_TYPE_TXRX_NOTIFY && b->running) {
+			mt7927_tx_free_event(b, p, len);
 		} else if (deliver && b->cb_rx != NULL &&
 		    (type == PKT_TYPE_NORMAL ||
 		    type == MT7927_PKT_TYPE_NORMAL_MCU)) {
@@ -6954,6 +7086,564 @@ mt7927_scan_cancel(struct mt7927_bringup *b, const struct mt7927_vif *v)
 }
 
 /*
+ * ---- Phase 4b: joining a BSS (mt7925 main.c, mcu.c, mac.c, pci_mac.c) ----
+ *
+ * mac80211 order for a station on the MT7927, non-MLO, 20 MHz:
+ *   assign_vif_chanctx  -> mt7927_reconfig_band(): DEV_INFO off/on with the
+ *                          band of the BSS (5 GHz = band 1)
+ *   sta_add (NONE)      -> WTBL ADM clear, BSS_INFO (basic, sec, rate, qos,
+ *                          mld, ifs, rlm, mbssid), STA_REC (basic, phy, ra,
+ *                          state NONE, hdr_trans)
+ *   mgd_prepare_tx      -> UNI ROC acquire (JOIN), wait for the grant event
+ *   auth / assoc frames -> data ring 0, connac3 TXD + hw TXP (cut-through)
+ *   sta_state ASSOC     -> BSS_INFO, STA_REC (state ASSOC)
+ *   BSS_CHANGED_ASSOC   -> STA_REC for the BSS's broadcast entry (ASSOC)
+ *   authorized          -> ROC abort
+ * Keys stay in software (net80211 CCMP) for now, so nothing here installs
+ * them in the WTBL.
+ */
+
+/* A message being built: UNI header, then TLVs; the header's second
+ * 16-bit word counts the TLVs (mt76_connac_mcu_add_nested_tlv()). */
+struct mt7927_msg {
+	uint8_t		buf[384];
+	uint32_t	len;
+};
+
+static void
+mt7927_msg_init(struct mt7927_msg *m, const void *hdr, uint32_t hlen)
+{
+	memset(m->buf, 0, sizeof(m->buf));
+	memcpy(m->buf, hdr, hlen);
+	m->len = hlen;
+}
+
+static uint8_t *
+mt7927_msg_tlv(struct mt7927_msg *m, uint16_t tag, uint16_t len)
+{
+	uint8_t *p = m->buf + m->len;
+	uint16_t n;
+
+	if (m->len + len > sizeof(m->buf))
+		return NULL;
+	p[0] = tag & 0xff;
+	p[1] = tag >> 8;
+	p[2] = len & 0xff;
+	p[3] = len >> 8;
+	m->len += len;
+	n = (uint16_t)(m->buf[2] | (m->buf[3] << 8)) + 1;
+	m->buf[2] = n & 0xff;
+	m->buf[3] = n >> 8;
+	return p;
+}
+
+static void
+mt7927_put16(uint8_t *p, uint16_t v)
+{
+	p[0] = v & 0xff;
+	p[1] = v >> 8;
+}
+
+static void
+mt7927_put32(uint8_t *p, uint32_t v)
+{
+	p[0] = v & 0xff;
+	p[1] = (v >> 8) & 0xff;
+	p[2] = (v >> 16) & 0xff;
+	p[3] = v >> 24;
+}
+
+/* Send with the op lock; the UNI reply's status word (after cid, pad[3]). */
+static int
+mt7927_uni_send_status(struct mt7927_bringup *b, uint32_t cmd,
+    const struct mt7927_msg *m, uint32_t *status)
+{
+	int rv;
+
+	mt7927_op_lock(b);
+	rv = mt7927_mcu_send(b, cmd, m->buf, m->len, true);
+	if (status != NULL)
+		*status = (rv == 0 && b->resp_len >= 8) ?
+		    mt7927_le32(b->resp + 4) : 0xffffffff;
+	mt7927_op_unlock(b);
+	return rv;
+}
+
+/* mt7925_mac_wtbl_update(MT_WTBL_UPDATE_ADM_COUNT_CLEAR) for a new peer. */
+void
+mt7927_wtbl_clear(struct mt7927_bringup *b, uint16_t idx)
+{
+	if (!mt7927_wtbl_update(b->sc, idx, MT7927_WTBL_UPDATE_ADM_CLR))
+		MWX_DEV_LOG(b->sc, "MT7927 WTBL %u: ADM clear busy\n", idx);
+}
+
+/* mt7927_reconfig_band(): DEV_INFO off, new band index, DEV_INFO on. */
+int
+mt7927_band_reconfig(struct mt7927_bringup *b, struct mt7927_vif *v,
+    uint8_t band_idx)
+{
+	int rv;
+
+	if (v->band_idx == band_idx)
+		return 0;
+	rv = mt7927_dev_add(b, v, false);
+	v->band_idx = band_idx;
+	if (rv == 0)
+		rv = mt7927_dev_add(b, v, true);
+	MWX_DEV_LOG(b->sc, "MT7927 band reconfig -> band %u: %d\n", band_idx, rv);
+	return rv;
+}
+
+/* mt7925_mcu_add_bss_info_sta(): BSS_INFO for the BSS we join. */
+int
+mt7927_bss_info(struct mt7927_bringup *b, const struct mt7927_vif *v,
+    const struct mt7927_bss *bss, bool enable)
+{
+	struct mt7927_msg m;
+	uint8_t hdr[4] = { v->idx, 0, 0, 0 };
+	uint8_t *t;
+	uint32_t status;
+	int rv;
+
+	mt7927_msg_init(&m, hdr, sizeof(hdr));
+
+	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_BASIC, 32);	/* bss_basic first */
+	t[4] = 1;						/* active (STA) */
+	t[5] = v->omac_idx;
+	t[6] = v->omac_idx > 0x10 ? 0 : v->omac_idx;		/* hw_bss_idx */
+	t[7] = v->band_idx;
+	mt7927_put32(t + 8, MT7927_CONNECTION_INFRA_STA);
+	t[12] = !enable;					/* conn_state */
+	t[13] = v->wmm_idx;
+	memcpy(t + 14, bss->bssid, 6);
+	mt7927_put16(t + 20, v->wcid);				/* bmc_tx_wlan_idx */
+	mt7927_put16(t + 22, bss->bcn_int);
+	t[24] = bss->dtim;
+	t[25] = bss->phymode;
+	mt7927_put16(t + 26, bss->peer_wcid);			/* sta_idx */
+	mt7927_put16(t + 28, bss->band == 1 ? MT7927_PHY_TYPE_ERP_INDEX :
+	    MT7927_PHY_TYPE_OFDM_INDEX);			/* nonht_basic_phy */
+	t[30] = 0;						/* phymode_ext */
+	t[31] = v->idx;						/* link_idx */
+
+	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_SEC, 8);
+	t[4] = 0;						/* MODE_OPEN */
+	t[5] = 1;
+	t[6] = 0;						/* no hw cipher */
+
+	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_RATE, 16);
+	mt7927_put16(t + 6, bss->band == 1 ? 0x000f :		/* HR_DSSS_ERP */
+	    ((1U << 6) | (1U << 8) | (1U << 10)));		/* OFDM_BASIC_RATE */
+	t[12] = bss->band == 1;					/* short_preamble */
+	t[13] = MT7927_BASIC_RATES_IDX(bss->band);		/* bc_fixed_rate */
+	t[14] = MT7927_BASIC_RATES_IDX(bss->band);		/* mc_fixed_rate */
+
+	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_QBSS, 8);
+	t[4] = bss->qos;
+
+	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_MLD, 20);
+	t[4] = 0xff;						/* group_mld_id */
+	t[5] = v->idx + 32;					/* own_mld_id */
+	memcpy(t + 6, v->addr, 6);
+	t[12] = 0xff;						/* remap_idx */
+	t[13] = 0xff;						/* link_id */
+
+	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_IFS_TIME, 20);
+	t[4] = 1;						/* slot_valid */
+	mt7927_put16(t + 8, bss->band == 1 ? 20 : 9);		/* slot_time */
+
+	if (enable) {
+		t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_RLM, 16);
+		t[4] = bss->chan;				/* control_channel */
+		t[5] = bss->chan;				/* center (20 MHz) */
+		t[7] = 0;					/* CMD_CBW_20MHZ */
+		t[8] = 2;					/* tx_streams */
+		t[9] = 2;					/* rx_streams */
+		t[10] = 0;					/* ht_op_info */
+		t[11] = 0;					/* sco */
+		t[12] = bss->band;				/* 1: 2.4, 2: 5 GHz */
+
+		t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_MBSSID, 8);
+	}
+	rv = mt7927_uni_send_status(b, MCU_UNI_CMD_BSS_INFO_UPDATE, &m, &status);
+	MWX_DEV_LOG(b->sc, "MT7927 BSS_INFO %s %02x:%02x:%02x:%02x:%02x:%02x ch %u "
+	    "band %u (idx %u) phymode 0x%02x sta %u -> %d (fw status 0x%x)\n",
+	    enable ? "join" : "leave", bss->bssid[0], bss->bssid[1], bss->bssid[2],
+	    bss->bssid[3], bss->bssid[4], bss->bssid[5], bss->chan, bss->band,
+	    v->band_idx, bss->phymode, bss->peer_wcid, rv, status);
+	return rv;
+}
+
+/*
+ * mt7925_mcu_sta_cmd(): STA_REC for the AP (peer) or for the BSS's broadcast
+ * entry (the vif's own WCID, as mac80211 passes link_sta == NULL).
+ */
+int
+mt7927_sta_rec(struct mt7927_bringup *b, const struct mt7927_vif *v,
+    const struct mt7927_bss *bss, bool peer, bool enable, uint8_t state,
+    bool newly)
+{
+	struct mt7927_msg m;
+	uint16_t wcid = peer ? bss->peer_wcid : v->wcid;
+	uint8_t hdr[8];
+	uint8_t *t;
+	uint32_t status;
+	int rv;
+
+	hdr[0] = v->idx;
+	hdr[1] = wcid & 0xff;					/* wlan_idx_lo */
+	hdr[2] = hdr[3] = 0;					/* tlv_num */
+	hdr[4] = 1;						/* is_tlv_append */
+	hdr[5] = peer ? v->omac_idx : 0xe;			/* muar_idx */
+	hdr[6] = wcid >> 8;					/* wlan_idx_hi */
+	hdr[7] = 0;
+	mt7927_msg_init(&m, hdr, sizeof(hdr));
+
+	if (enable) {
+		t = mt7927_msg_tlv(&m, MT7927_STA_TAG_BASIC, 20);
+		mt7927_put32(t + 4, peer ? MT7927_CONNECTION_INFRA_AP :
+		    MT7927_CONNECTION_INFRA_BC);
+		t[8] = MT7927_CONN_STATE_PORT_SECURE;
+		t[9] = peer ? bss->qos : 0;
+		mt7927_put16(t + 10, bss->aid);
+		memcpy(t + 12, bss->bssid, 6);
+		mt7927_put16(t + 18, MT7927_EXTRA_INFO_VER |
+		    (newly ? MT7927_EXTRA_INFO_NEW : 0));
+		if (peer) {
+			t = mt7927_msg_tlv(&m, MT7927_STA_TAG_PHY, 12);
+			mt7927_put16(t + 4, bss->basic_rates);
+			t[6] = bss->phy_type;
+
+			t = mt7927_msg_tlv(&m, MT7927_STA_TAG_RA, 16);
+			mt7927_put16(t + 4, bss->ra_legacy);
+			memcpy(t + 6, bss->ht_mcs, 10);
+
+			t = mt7927_msg_tlv(&m, MT7927_STA_TAG_STATE, 16);
+			t[4] = state;
+		}
+		t = mt7927_msg_tlv(&m, MT7927_STA_TAG_HDR_TRANS, 8);
+		t[4] = 0;					/* from_ds */
+		t[5] = 1;					/* to_ds (station) */
+		t[6] = 1;					/* dis_rx_hdr_tran */
+	} else {
+		t = mt7927_msg_tlv(&m, MT7927_STA_TAG_REMOVE, 8);
+		t = mt7927_msg_tlv(&m, MT7927_STA_TAG_MLD_OFF, 4);
+	}
+	rv = mt7927_uni_send_status(b, MCU_UNI_CMD_STA_REC_UPDATE, &m, &status);
+	MWX_DEV_LOG(b->sc, "MT7927 STA_REC %s wcid %u %s state %u%s -> %d (fw "
+	    "status 0x%x)\n", peer ? "peer" : "bss-bc", wcid,
+	    enable ? "add" : "remove", state, newly ? " new" : "", rv, status);
+	return rv;
+}
+
+int mt7927_roc_abort(struct mt7927_bringup *, const struct mt7927_vif *);
+
+/* mt7925_mcu_set_roc() + mt7925_set_roc(): acquire and wait for the grant. */
+int
+mt7927_roc(struct mt7927_bringup *b, const struct mt7927_vif *v,
+    uint8_t chan, uint8_t band, uint32_t duration_ms)
+{
+	struct mt7927_msg m;
+	uint8_t hdr[4] = { 0, 0, 0, 0 };
+	uint8_t *t, token;
+	int rv, waited;
+
+	if (b->roc_active)
+		return EBUSY;
+	token = ++b->roc_token;
+	b->roc_granted = false;
+	b->roc_grant_ms = 0;
+	mt7927_msg_init(&m, hdr, sizeof(hdr));
+	/* a plain header: rsv[4] carries no TLV count here */
+	t = m.buf + m.len;
+	memset(t, 0, 24);
+	mt7927_put16(t, MT7927_UNI_ROC_ACQUIRE);
+	mt7927_put16(t + 2, 24);
+	t[4] = v->idx;						/* bss_idx */
+	t[5] = token;
+	t[6] = chan;						/* control_channel */
+	t[7] = 0;						/* sco */
+	t[8] = band;
+	t[9] = 0;						/* CMD_CBW_20MHZ */
+	t[10] = chan;						/* center_chan */
+	t[12] = 0;						/* bw_from_ap */
+	t[13] = chan;						/* center_chan_from_ap */
+	t[15] = MT7927_ROC_REQ_JOIN;
+	mt7927_put32(t + 16, duration_ms);			/* maxinterval */
+	t[20] = 0xff;						/* dbdcband: auto */
+	m.len += 24;
+
+	mt7927_op_lock(b);
+	rv = mt7927_mcu_send(b, MT7927_UNI_ROC, m.buf, m.len, true);
+	mt7927_op_unlock(b);
+	if (rv != 0) {
+		MWX_DEV_LOG(b->sc, "MT7927 ROC acquire ch %u -> %d\n", chan, rv);
+		return rv;
+	}
+	b->roc_active = true;
+	for (waited = 0; !b->roc_granted && waited < MT7927_ROC_WAIT_MS;
+	    waited++) {
+		if (mt7927_aborted(b))
+			break;
+		mt7927_service(b);
+		if (b->roc_granted)
+			break;
+		mt7927_wait(b, 1);
+	}
+	if (!b->roc_granted) {
+		MWX_DEV_LOG(b->sc, "MT7927 ROC ch %u token %u: no grant after %d ms\n",
+		    chan, token, waited);
+		mt7927_roc_abort(b, v);
+		return ETIMEDOUT;
+	}
+	MWX_DEV_LOG(b->sc, "MT7927 ROC ch %u token %u granted after %d ms "
+	    "(status %u, ch %u, %u ms)\n", chan, token, waited, b->roc_status,
+	    b->roc_chan, b->roc_grant_ms);
+	return 0;
+}
+
+int
+mt7927_roc_abort(struct mt7927_bringup *b, const struct mt7927_vif *v)
+{
+	uint8_t req[4 + 12];
+	int rv;
+
+	if (!b->roc_active)
+		return 0;
+	memset(req, 0, sizeof(req));
+	mt7927_put16(req + 4, MT7927_UNI_ROC_ABORT);
+	mt7927_put16(req + 6, 12);
+	req[8] = v->idx;
+	req[9] = b->roc_token;
+	req[10] = 0xff;						/* dbdcband */
+	mt7927_op_lock(b);
+	rv = mt7927_mcu_send(b, MT7927_UNI_ROC, req, sizeof(req), true);
+	mt7927_op_unlock(b);
+	b->roc_active = false;
+	b->roc_granted = false;
+	MWX_DEV_LOG(b->sc, "MT7927 ROC abort token %u -> %d\n", b->roc_token, rv);
+	return rv;
+}
+
+bool
+mt7927_roc_state(struct mt7927_bringup *b, uint32_t *grant_ms)
+{
+	if (grant_ms != NULL)
+		*grant_ms = b->roc_grant_ms;
+	return b->roc_active;
+}
+
+/* UNI ROC event (unsolicited): rsv[4], then the grant TLV. */
+static void
+mt7927_roc_event(struct mt7927_bringup *b, const uint8_t *p, uint32_t len)
+{
+	const uint8_t *t = p + 4;
+
+	if (len < 4 + 16 || mt7927_le16(t) != MT7927_UNI_EVENT_ROC_GRANT ||
+	    mt7927_le16(t + 2) < 16)
+		return;
+	b->roc_events++;
+	if (t[5] != b->roc_token)			/* tokenid */
+		return;
+	b->roc_status = t[6];
+	b->roc_chan = t[7];				/* primarychannel */
+	b->roc_grant_ms = (mt7927_le16(t + 2) >= 20 && len >= 4 + 20) ?
+	    mt7927_le32(t + 16) : 0;			/* max_interval */
+	OSSynchronizeIO();
+	b->roc_granted = true;
+}
+
+/* ---- data TX: connac3 TXD + hw TXP on ring 0, payload in a token buffer ---- */
+
+static int
+mt7927_tx_alloc(struct mt7927_bringup *b)
+{
+	int rv;
+
+	if (b->tok_mem.va != NULL)
+		return 0;
+	rv = mt7927_dmamem_alloc(&b->tok_mem,
+	    (size_t)MT7927_TX_TOKENS * MT7927_TX_TOKEN_SZ);
+	if (rv == 0) {
+		memset((void *)b->tok_busy, 0, sizeof(b->tok_busy));
+		b->tok_seq = 0;
+	}
+	return rv;
+}
+
+static void
+mt7927_tx_free_mem(struct mt7927_bringup *b)
+{
+	if (b->tok_mem.va != NULL)
+		mt7927_dmamem_free(&b->tok_mem);
+	memset((void *)b->tok_busy, 0, sizeof(b->tok_busy));
+}
+
+/* PKT_TYPE_TXRX_NOTIFY (mt7925_mac_tx_free()): give the tokens back. */
+static void
+mt7927_tx_free_event(struct mt7927_bringup *b, const uint8_t *p, uint32_t len)
+{
+	uint32_t total, count = 0, off, ver;
+
+	b->tx_free_events++;
+	if (len < 8)
+		return;
+	total = (mt7927_le32(p) >> 16) & 0x3ff;			/* MSDU_CNT */
+	ver = (mt7927_le32(p + 4) >> 16) & 0xf;
+	if (ver < 4 && b->tx_free_badver++ < 4)
+		MWX_DEV_LOG(b->sc, "MT7927 TX free event version %u\n", ver);
+	for (off = 8; count < total && off + 4 <= len; off += 4) {
+		uint32_t info = mt7927_le32(p + off);
+		int i;
+
+		if (info & (MT7927_TXFREE_INFO_PAIR | MT7927_TXFREE_INFO_HEADER)) {
+			if ((info & MT7927_TXFREE_INFO_HEADER) &&
+			    ((info >> 28) & 3) != 0)
+				b->tx_failed++;
+			continue;
+		}
+		for (i = 0; i < 2; i++) {
+			uint32_t msdu = (info >> (15 * i)) & MT7927_TXFREE_MSDU_MASK;
+
+			if (msdu == MT7927_TXFREE_MSDU_MASK)
+				continue;
+			count++;
+			if (msdu < MT7927_TX_TOKENS && b->tok_busy[msdu]) {
+				OSSynchronizeIO();
+				b->tok_busy[msdu] = 0;
+				b->tx_done++;
+			}
+		}
+	}
+}
+
+/*
+ * Queue one 802.11 frame (already encrypted if it needs to be). Takes the
+ * svc lock: callers must not hold it. Never waits.
+ */
+int
+mt7927_tx_frame(struct mt7927_bringup *b, const struct mt7927_txinfo *ti,
+    const uint8_t *frame, uint32_t len)
+{
+	struct mt7927_ring *r = &b->tx[MT7927_TX_BAND0];
+	uint8_t txw[MT7927_TXD_SIZE + MT7927_TXP_SIZE];
+	uint32_t w[8], i, best = MT7927_TX_TOKENS, tok = MT7927_TX_TOKENS;
+	uint32_t pa;
+	uint16_t next;
+	struct mwx_desc *d;
+	uint8_t fc0;
+
+	if (!b->running || b->tok_mem.va == NULL || r->desc == NULL)
+		return ENXIO;
+	if (len < 10 || len > MT7927_TX_TOKEN_SZ)
+		return EINVAL;
+	fc0 = frame[0];
+
+	mt7927_svc_lock(b);
+	mt7927_tx_reap(b, r);
+	next = (r->head + 1) % r->count;
+	if (next == r->tail) {
+		mt7927_svc_unlock(b);
+		b->tx_ring_full++;
+		return ENOBUFS;
+	}
+	for (i = 0; i < MT7927_TX_TOKENS; i++) {
+		uint32_t t = (b->tok_next + i) % MT7927_TX_TOKENS;
+
+		if (!b->tok_busy[t]) {
+			tok = t;
+			break;
+		}
+		if (best == MT7927_TX_TOKENS ||
+		    (int32_t)(b->tok_when[t] - b->tok_when[best]) < 0)
+			best = t;
+	}
+	if (tok == MT7927_TX_TOKENS) {
+		/* No TX free event came back for these: take the oldest
+		 * once enough newer frames went out after it. */
+		if (best == MT7927_TX_TOKENS ||
+		    b->tok_seq - b->tok_when[best] < MT7927_TX_TOKENS / 2) {
+			mt7927_svc_unlock(b);
+			b->tx_no_token++;
+			return ENOBUFS;
+		}
+		tok = best;
+		b->tx_reclaimed++;
+	}
+	b->tok_busy[tok] = 1;
+	b->tok_when[tok] = ++b->tok_seq;
+	b->tok_next = (tok + 1) % MT7927_TX_TOKENS;
+	memcpy((uint8_t *)b->tok_mem.va + (size_t)tok * MT7927_TX_TOKEN_SZ,
+	    frame, len);
+	pa = b->tok_mem.pa + tok * MT7927_TX_TOKEN_SZ;
+
+	/* mt7925_mac_write_txwi() + _80211() */
+	w[0] = MT7927_TXD0_TX_BYTES(len + MT7927_TXD_SIZE) |
+	    MT7927_TXD0_PKT_FMT_CT | MT7927_TXD0_Q_IDX(ti->q_idx);
+	w[1] = MT7927_TXD1_WLAN_IDX(ti->wcid) |
+	    MT7927_TXD1_OWN_MAC(ti->omac_idx) |
+	    (ti->band_idx && ti->band_idx != 0xff ?
+	    MT7927_TXD1_TGID(ti->band_idx) : 0) |
+	    MT7927_TXD1_HDR_FORMAT_80211 |
+	    MT7927_TXD1_HDR_INFO(ti->hdrlen / 2) | MT7927_TXD1_TID(ti->tid) |
+	    (ti->fixed_rate ? MT7927_TXD1_FIXED_RATE : 0);
+	w[2] = MT7927_TXD2_FRAME_TYPE((fc0 >> 2) & 3) |
+	    MT7927_TXD2_SUB_TYPE(fc0 >> 4);
+	w[3] = MT7927_TXD3_REM_TX_COUNT(15) |
+	    (ti->multicast ? MT7927_TXD3_BCM | MT7927_TXD3_NO_ACK : 0) |
+	    (ti->fixed_rate ? MT7927_TXD3_BA_DISABLE : 0);
+	w[4] = 0;
+	w[5] = 0;						/* PID 0: no TXS */
+	w[6] = MT7927_TXD6_DAS | MT7927_TXD6_MSDU_CNT(1) | MT7927_TXD6_DIS_MAT |
+	    (ti->fixed_rate ? MT7927_TXD6_TX_RATE(ti->rate_idx) : 0);
+	w[7] = 0;
+	for (i = 0; i < 8; i++)
+		mt7927_put32(txw + 4 * i, w[i]);
+	/* mt76_connac_write_hw_txp(): one MSDU, one buffer */
+	memset(txw + MT7927_TXD_SIZE, 0, MT7927_TXP_SIZE);
+	mt7927_put16(txw + MT7927_TXD_SIZE, tok | MT7927_TXP_MSDU_VALID);
+	mt7927_put16(txw + MT7927_TXD_SIZE + 2, 0xffff);	/* unused ids */
+	mt7927_put16(txw + MT7927_TXD_SIZE + 4, 0xffff);
+	mt7927_put16(txw + MT7927_TXD_SIZE + 6, 0xffff);
+	mt7927_put32(txw + MT7927_TXD_SIZE + 8, pa);		/* ptr[0].buf0 */
+	mt7927_put16(txw + MT7927_TXD_SIZE + 12, len | MT7927_TXP_LEN_LAST);
+
+	memcpy(mt7927_ring_buf(r, r->head), txw, sizeof(txw));
+	d = &r->desc[r->head];
+	d->buf0 = htole32(mt7927_ring_buf_pa(r, r->head));
+	d->buf1 = 0;
+	d->info = 0;
+	OSSynchronizeIO();
+	d->ctrl = htole32(MT_DMA_CTL_SD_LEN0(sizeof(txw)) | MT_DMA_CTL_LAST_SEC0);
+	OSSynchronizeIO();
+	r->head = next;
+	mt7927_wr(b->sc, r->regbase + MT_DMA_CPU_IDX, r->head);
+	b->tx_queued++;
+	if (b->tx_logged < 24) {
+		b->tx_logged++;
+		MWX_DEV_LOG(b->sc, "MT7927 tx fc %02x len %u wcid %u q 0x%02x tok %u "
+		    "%s txd %08x %08x %08x %08x %08x %08x %08x\n", fc0, len,
+		    ti->wcid, ti->q_idx, tok, ti->fixed_rate ? "fixed" : "ra",
+		    w[0], w[1], w[2], w[3], w[5], w[6], w[7]);
+	}
+	mt7927_svc_unlock(b);
+	return 0;
+}
+
+void
+mt7927_engine_tx_counters(struct mt7927_bringup *b, uint32_t *queued,
+    uint32_t *done, uint32_t *free_events, uint32_t *no_token,
+    uint32_t *reclaimed, uint32_t *ring_full)
+{
+	*queued = b->tx_queued;
+	*done = b->tx_done;
+	*free_events = b->tx_free_events;
+	*no_token = b->tx_no_token;
+	*reclaimed = b->tx_reclaimed;
+	*ring_full = b->tx_ring_full;
+}
+
+/*
  * mt7925_mcu_set_rate_txpower() as mac80211 triggers it when the first
  * interface opens (IEEE80211_CONF_CHANGE_POWER): UNI SET_POWER_LIMIT, three
  * channels per message, 2.4 then 5 GHz. With no device-tree limits Linux
@@ -7096,6 +7786,8 @@ mt7927_teardown(struct mt7927_bringup *b)
 			mt7927_ring_free(&b->rx[i]);
 		b->rings_alloc = false;
 	}
+	mt7927_tx_free_mem(b);
+	b->roc_active = false;
 	MWX_DEV_LOG(sc, "MT7927 teardown done (interrupts seen %u, bits 0x%08x)\n",
 	    b->intr_count, b->intr_seen);
 }
@@ -7378,7 +8070,7 @@ mt7927_engine_start(struct mt7927_bringup *b, const uint8_t *patch,
 	int passed;
 
 	passed = mt7927_run_stages(b, 5, patch, patch_len, ram, ram_len, abort);
-	if (passed < 5) {
+	if (passed < 5 || mt7927_tx_alloc(b) != 0) {
 		mt7927_teardown(b);
 		return EIO;
 	}
@@ -7566,7 +8258,8 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 	char cc[4] = { 0 };
 
 	sc->sc_7927_lock = IOLockAlloc();
-	if (sc->sc_7927_lock == NULL)
+	sc->sc_7927_txlock = IOLockAlloc();
+	if (sc->sc_7927_lock == NULL || sc->sc_7927_txlock == NULL)
 		return ENOMEM;
 	sc->sc_7927 = mt7927_engine_create(sc, pa->pa_tag, pa->workloop);
 	if (sc->sc_7927 == NULL)
@@ -7771,6 +8464,7 @@ mt7927_hal_stop(struct mwx_softc *sc)
 
 	if (!mt7927_engine_running(sc->sc_7927))
 		return;
+	mt7927_join_teardown(sc, "interface down");
 	mt7927_vif_fill(sc, &v);
 	if (sc->sc_flags & MWX_FLAG_SCANNING) {
 		mt7927_scan_cancel(sc->sc_7927, &v);
@@ -7806,6 +8500,398 @@ mt7927_hal_scan(struct mwx_softc *sc)
 		sc->sc_7927_scan_ticks = 0;
 	}
 	return rv;
+}
+
+/* ---- Phase 4b glue: net80211 join on the MT7927 engine ---- */
+
+#define	MT7927_PEER_WCID	1	/* first station WTBL entry (mt76_wcid_alloc) */
+#define	MT7927_ROC_JOIN_MS	3000
+
+/* What BSS_INFO / STA_REC need about the AP net80211 chose. */
+static void
+mt7927_bss_fill(struct mwx_softc *sc, struct ieee80211_node *ni,
+    struct mt7927_bss *bss)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	bool five = !IEEE80211_IS_CHAN_2GHZ(ni->ni_chan);
+	bool ht = (ni->ni_flags & IEEE80211_NODE_HT) != 0;
+	bool vht = (ni->ni_flags & IEEE80211_NODE_VHT) != 0;
+	uint16_t supp = 0, basic = 0;
+	int i, j, nofdm = 0;
+	static const uint8_t ofdm[] = { 12, 18, 24, 36, 48, 72, 96, 108 };
+	static const uint8_t cck[] = { 2, 4, 11, 22 };
+
+	memset(bss, 0, sizeof(*bss));
+	IEEE80211_ADDR_COPY(bss->bssid, ni->ni_bssid);
+	bss->chan = (uint8_t)ieee80211_chan2ieee(ic, ni->ni_chan);
+	bss->band = five ? 2 : 1;
+	bss->bcn_int = ni->ni_intval ? ni->ni_intval : 100;
+	bss->dtim = ni->ni_dtimperiod ? ni->ni_dtimperiod : 1;
+	bss->aid = IEEE80211_AID(ni->ni_associd);
+	bss->qos = (ni->ni_flags & IEEE80211_NODE_QOS) != 0;
+	bss->peer_wcid = MT7927_PEER_WCID;
+	/* mt76_connac_get_phy_mode() / _v2() from the peer's capabilities */
+	if (five) {
+		bss->phymode = 0x01 | (ht ? 0x10 : 0) | (vht ? 0x20 : 0);
+		bss->phy_type = (1U << MT7927_PHY_TYPE_OFDM_INDEX) |
+		    (ht ? 0x10 : 0) | (vht ? 0x20 : 0);
+	} else {
+		bss->phymode = 0x02 | 0x04 | (ht ? 0x08 : 0);	/* B | G | GN */
+		bss->phy_type = 0x01 | (1U << MT7927_PHY_TYPE_ERP_INDEX) |
+		    (ht ? 0x10 : 0);
+	}
+	/* supp_rates / basic_rates as mac80211 bitmaps over the sband's rates */
+	for (i = 0; i < ni->ni_rates.rs_nrates; i++) {
+		uint8_t r = ni->ni_rates.rs_rates[i] & IEEE80211_RATE_VAL;
+		bool isbasic = (ni->ni_rates.rs_rates[i] & IEEE80211_RATE_BASIC) != 0;
+
+		for (j = 0; j < (int)nitems(ofdm); j++)
+			if (r == ofdm[j]) {
+				supp |= 1U << (five ? j : j + 4);
+				if (isbasic)
+					basic |= 1U << (five ? j : j + 4);
+				nofdm++;
+			}
+		if (!five)
+			for (j = 0; j < (int)nitems(cck); j++)
+				if (r == cck[j]) {
+					supp |= 1U << j;
+					if (isbasic)
+						basic |= 1U << j;
+				}
+	}
+	if (supp == 0)
+		supp = five ? 0xff : 0xfff;
+	bss->basic_rates = basic ? basic : (five ? 0x15 : 0x0f);
+	/* RA_LEGACY_OFDM GENMASK(13, 6), RA_LEGACY_CCK GENMASK(3, 0) */
+	if (five)
+		bss->ra_legacy = (supp & 0xff) << 6;
+	else
+		bss->ra_legacy = (((supp >> 4) & 0xff) << 6) | (supp & 0xf);
+	if (ht)
+		memcpy(bss->ht_mcs, ni->ni_rxmcs, 10);
+}
+
+static void
+mt7927_join_teardown(struct mwx_softc *sc, const char *why)
+{
+	struct mt7927_vif v;
+
+	if (!sc->sc_7927_joined)
+		return;
+	mt7927_vif_fill(sc, &v);
+	mt7927_roc_abort(sc->sc_7927, &v);
+	mt7927_sta_rec(sc->sc_7927, &v, &sc->sc_7927_bss, true, false, 0, false);
+	mt7927_bss_info(sc->sc_7927, &v, &sc->sc_7927_bss, false);
+	sc->sc_7927_joined = false;
+	sc->sc_7927_assoc = false;
+	MWX_DEV_LOG(sc, "MT7927 left %s (%s)\n",
+	    ether_sprintf(sc->sc_7927_bss.bssid), why);
+}
+
+/* AUTH: band, BSS_INFO, STA_REC for the AP, then get on its channel. */
+static int
+mt7927_join_prepare(struct mwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	struct mt7927_vif v;
+	struct mt7927_bss bss;
+	uint8_t band_idx;
+	int rv;
+
+	if (ni == NULL || ni->ni_chan == NULL ||
+	    ni->ni_chan == IEEE80211_CHAN_ANYC)
+		return EINVAL;
+	mt7927_bss_fill(sc, ni, &bss);
+	if (sc->sc_7927_joined &&
+	    !IEEE80211_ADDR_EQ(sc->sc_7927_bss.bssid, bss.bssid))
+		mt7927_join_teardown(sc, "new AP");
+	if (sc->sc_7927_joined) {
+		/* AUTH again on the same AP: keep the records, new ROC. */
+		mt7927_vif_fill(sc, &v);
+		mt7927_roc_abort(sc->sc_7927, &v);
+		return mt7927_roc(sc->sc_7927, &v, bss.chan, bss.band,
+		    MT7927_ROC_JOIN_MS);
+	}
+	mt7927_vif_fill(sc, &v);
+	if (sc->sc_flags & MWX_FLAG_SCANNING) {
+		mt7927_scan_cancel(sc->sc_7927, &v);
+		sc->sc_flags &= ~MWX_FLAG_SCANNING;
+	}
+	band_idx = bss.band == 1 ? 0 : 1;	/* mt7927_band_idx() */
+	if ((rv = mt7927_band_reconfig(sc->sc_7927, &v, band_idx)) != 0)
+		return rv;
+	sc->sc_vif.band_idx = v.band_idx;
+	MWX_DEV_LOG(sc, "MT7927 joining \"%.*s\" %s ch %u (%s GHz) rssi %d "
+	    "%s%s rates basic 0x%x ra 0x%x\n", ni->ni_esslen,
+	    (const char *)ni->ni_essid, ether_sprintf(bss.bssid), bss.chan,
+	    bss.band == 1 ? "2.4" : "5", ni->ni_rssi,
+	    (ni->ni_flags & IEEE80211_NODE_HT) ? "HT " : "",
+	    (ni->ni_flags & IEEE80211_NODE_VHT) ? "VHT " : "",
+	    bss.basic_rates, bss.ra_legacy);
+	mt7927_wtbl_clear(sc->sc_7927, bss.peer_wcid);
+	sc->sc_7927_bss = bss;
+	sc->sc_7927_joined = true;
+	if ((rv = mt7927_bss_info(sc->sc_7927, &v, &bss, true)) != 0 ||
+	    (rv = mt7927_sta_rec(sc->sc_7927, &v, &bss, true, true, 0, true)) != 0)
+		return rv;
+	return mt7927_roc(sc->sc_7927, &v, bss.chan, bss.band,
+	    MT7927_ROC_JOIN_MS);
+}
+
+/* RUN: STA_REC to ASSOC with the AID, then the BSS's broadcast entry. */
+static int
+mt7927_join_assoc(struct mwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct mt7927_vif v;
+	int rv;
+
+	if (!sc->sc_7927_joined)
+		return EINVAL;
+	mt7927_vif_fill(sc, &v);
+	sc->sc_7927_bss.aid = IEEE80211_AID(ic->ic_bss->ni_associd);
+	if ((rv = mt7927_bss_info(sc->sc_7927, &v, &sc->sc_7927_bss, true)) == 0 &&
+	    (rv = mt7927_sta_rec(sc->sc_7927, &v, &sc->sc_7927_bss, true, true,
+	    2, false)) == 0)
+		rv = mt7927_sta_rec(sc->sc_7927, &v, &sc->sc_7927_bss, false, true,
+		    2, false);
+	sc->sc_7927_assoc = rv == 0;
+	sc->sc_7927_assoc_polls = 0;
+	MWX_DEV_LOG(sc, "MT7927 associated with %s aid %u -> %d\n",
+	    ether_sprintf(sc->sc_7927_bss.bssid), sc->sc_7927_bss.aid, rv);
+	return rv;
+}
+
+/* mwx_newstate_task() for the MT7927. */
+static void
+mt7927_newstate(struct mwx_softc *sc, enum ieee80211_state ostate,
+    enum ieee80211_state nstate, int arg)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	int rv = 0;
+
+	MWX_DEV_LOG(sc, "newstate task %s -> %s arg=%d\n",
+	    ieee80211_state_name[ostate], ieee80211_state_name[nstate], arg);
+	if (nstate < IEEE80211_S_AUTH)
+		mt7927_join_teardown(sc, ieee80211_state_name[nstate]);
+
+	switch (nstate) {
+	case IEEE80211_S_SCAN:
+		if (ostate == IEEE80211_S_SCAN &&
+		    (sc->sc_flags & MWX_FLAG_SCANNING))
+			return;
+		rv = mwx_scan(sc);
+		break;
+	case IEEE80211_S_AUTH:
+		rv = mt7927_join_prepare(sc);
+		break;
+	case IEEE80211_S_ASSOC:
+		break;
+	case IEEE80211_S_RUN:
+		if (ic->ic_opmode == IEEE80211_M_MONITOR)
+			break;
+		rv = mt7927_join_assoc(sc);
+		break;
+	default:
+		break;
+	}
+	if (rv != 0 && nstate >= IEEE80211_S_AUTH) {
+		MWX_DEV_LOG(sc, "MT7927 %s failed (%d), back to scanning\n",
+		    ieee80211_state_name[nstate], rv);
+		mt7927_join_teardown(sc, "setup failed");
+		/* the scan is started by the next newstate task */
+		ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+		return;
+	}
+	sc->sc_newstate(ic, nstate, arg);
+}
+
+/* Poll (about once a second): give the join ROC back once authorized. */
+static void
+mt7927_join_poll(struct mwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct mt7927_vif v;
+	uint32_t grant_ms;
+
+	if (!sc->sc_7927_assoc ||
+	    !mt7927_roc_state(sc->sc_7927, &grant_ms))
+		return;
+	sc->sc_7927_assoc_polls++;
+	if ((ic->ic_bss != NULL && ic->ic_bss->ni_port_valid) ||
+	    sc->sc_7927_assoc_polls > 10) {
+		mt7927_vif_fill(sc, &v);
+		MWX_DEV_LOG(sc, "MT7927 releasing join ROC (%s)\n",
+		    ic->ic_bss != NULL && ic->ic_bss->ni_port_valid ?
+		    "authorized" : "timeout");
+		mt7927_roc_abort(sc->sc_7927, &v);
+	}
+}
+
+/* Keys stay in software: net80211 encrypts TX and decrypts RX. */
+static int
+mt7927_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
+    struct ieee80211_key *k)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+	int err = ieee80211_set_key(ic, ni, k);
+
+	MWX_DEV_LOG(sc, "MT7927 %s key id %d cipher %d (software) -> %d\n",
+	    (k->k_flags & IEEE80211_KEY_GROUP) ? "group" : "pairwise",
+	    k->k_id, k->k_cipher, err);
+	return err;
+}
+
+static void
+mt7927_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
+    struct ieee80211_key *k)
+{
+	if (k->k_flags & IEEE80211_KEY_SWCRYPTO)
+		ieee80211_delete_key(ic, ni, k);
+}
+
+/* LLC/SNAP + EAPOL ethertype right after the 802.11 header. */
+static bool
+mt7927_is_eapol(const uint8_t *f, uint32_t len, uint32_t hdrlen)
+{
+	static const uint8_t snap[8] = { 0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e };
+
+	return len >= hdrlen + 8 && memcmp(f + hdrlen, snap, 8) == 0;
+}
+
+/* mwx_start() for the MT7927: management frames, then data once in RUN. */
+static void
+mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni;
+	struct ieee80211_frame *wh;
+	struct mt7927_txinfo ti;
+	struct mbuf *m;
+	uint32_t len;
+	uint8_t type;
+	int rv;
+
+	for (;;) {
+		m = mq_dequeue(&ic->ic_mgtq);
+		if (m != NULL) {
+			ni = (struct ieee80211_node *)mbuf_pkthdr_rcvif(m);
+		} else {
+			if (ic->ic_state != IEEE80211_S_RUN ||
+			    (ic->ic_xflags & IEEE80211_F_TX_MGMT_ONLY))
+				break;
+			m = ifq_dequeue(&ifp->if_snd);
+			if (m == NULL)
+				break;
+			if (mbuf_len(m) < sizeof(struct ether_header) &&
+			    (m = m_pullup(m, sizeof(struct ether_header))) == NULL) {
+				ifp->if_oerrors++;
+				continue;
+			}
+#if NBPFILTER > 0
+			if (ifp->if_bpf != NULL)
+				bpf_mtap(ifp->if_bpf, m, BPF_DIRECTION_OUT);
+#endif
+			if ((m = ieee80211_encap(ifp, m, &ni)) == NULL) {
+				ifp->if_oerrors++;
+				continue;
+			}
+		}
+		if (mbuf_len(m) < sizeof(*wh) &&
+		    (m = m_pullup(m, sizeof(*wh))) == NULL) {
+			if (ni != NULL)
+				ieee80211_release_node(ic, ni);
+			ifp->if_oerrors++;
+			continue;
+		}
+		wh = mtod(m, struct ieee80211_frame *);
+		if (wh->i_fc[1] & IEEE80211_FC1_PROTECTED) {
+			struct ieee80211_key *k = ieee80211_get_txkey(ic, wh, ni);
+
+			if ((m = ieee80211_encrypt(ic, m, k)) == NULL) {
+				if (ni != NULL)
+					ieee80211_release_node(ic, ni);
+				ifp->if_oerrors++;
+				sc->sc_7927_tx_encfail++;
+				continue;
+			}
+			wh = mtod(m, struct ieee80211_frame *);
+		}
+#if NBPFILTER > 0
+		if (ic->ic_rawbpf != NULL)
+			bpf_mtap(ic->ic_rawbpf, m, BPF_DIRECTION_OUT);
+#endif
+		len = (uint32_t)mbuf_pkthdr_len(m);
+		if (len > sizeof(sc->sc_7927_txbuf)) {
+			m_freem(m);
+			if (ni != NULL)
+				ieee80211_release_node(ic, ni);
+			ifp->if_oerrors++;
+			continue;
+		}
+		m_copydata(m, 0, (int)len, sc->sc_7927_txbuf);
+		m_freem(m);
+		wh = (struct ieee80211_frame *)sc->sc_7927_txbuf;
+		type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
+
+		memset(&ti, 0, sizeof(ti));
+		ti.hdrlen = (uint8_t)ieee80211_get_hdrlen(wh);
+		ti.multicast = IEEE80211_IS_MULTICAST(wh->i_addr1);
+		ti.omac_idx = sc->sc_vif.omac_idx;
+		ti.band_idx = sc->sc_vif.band_idx;
+		ti.wcid = (!ti.multicast && sc->sc_7927_joined) ?
+		    MT7927_PEER_WCID : sc->sc_vif.vif_mn.wcid;
+		ti.rate_idx = MT7927_BASIC_RATES_IDX(
+		    sc->sc_7927_joined ? sc->sc_7927_bss.band :
+		    (sc->sc_vif.band_idx ? 2 : 1));
+		if (type == IEEE80211_FC0_TYPE_DATA) {
+			uint8_t tid = 0, ac;
+
+			if (ieee80211_has_qos(wh))
+				tid = ieee80211_get_qos(wh) & IEEE80211_QOS_TID;
+			ac = ieee80211_up_to_ac(ic, tid);	/* EDCA_AC_* */
+			/* LMAC order: BK 0, BE 1, VI 2, VO 3 */
+			ti.q_idx = ac == EDCA_AC_BK ? 0 : ac == EDCA_AC_BE ? 1 :
+			    ac == EDCA_AC_VI ? 2 : 3;
+			ti.tid = tid;
+			ti.fixed_rate = ti.multicast ||
+			    mt7927_is_eapol(sc->sc_7927_txbuf, len, ti.hdrlen);
+		} else {
+			ti.q_idx = MT7927_LMAC_ALTX0;
+			ti.tid = 0;				/* MT_TX_NORMAL */
+			ti.fixed_rate = true;
+		}
+		rv = mt7927_tx_frame(sc->sc_7927, &ti, sc->sc_7927_txbuf, len);
+		if (ni != NULL)
+			ieee80211_release_node(ic, ni);
+		if (rv != 0) {
+			ifp->if_oerrors++;
+			if (rv == ENOBUFS) {
+				ifq_set_oactive(&ifp->if_snd);
+				break;
+			}
+			continue;
+		}
+		if (ifp->netStat)
+			ifp->netStat->outputPackets++;
+	}
+}
+
+/*
+ * mwx_start() runs on Skywalk's output thread and on the work loop (frames
+ * net80211 sends while handling RX): one at a time, as they share the copy
+ * buffer.
+ */
+static void
+mt7927_hal_output(struct mwx_softc *sc, struct ifnet *ifp)
+{
+	if (sc->sc_7927_txlock == NULL)
+		return;
+	IOLockLock(sc->sc_7927_txlock);
+	mt7927_hal_output_locked(sc, ifp);
+	IOLockUnlock(sc->sc_7927_txlock);
 }
 
 /* Firmware event (interrupt or MCU-waiter thread): only cheap work here. */
@@ -7967,6 +9053,25 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		}
 	} else {
 		sc->sc_7927_scan_ticks = 0;
+	}
+	mt7927_join_poll(sc);
+	{
+		struct ifnet *ifp = &sc->sc_ic.ic_if;
+
+		if (ifq_is_oactive(&ifp->if_snd)) {
+			ifq_clr_oactive(&ifp->if_snd);
+			mwx_start(ifp);
+		}
+	}
+	if (sc->sc_7927_poll % 30 == 1 ||
+	    (sc->sc_7927_joined && sc->sc_7927_poll % 5 == 1)) {
+		uint32_t q, d, fe, nt, rc, rf;
+
+		mt7927_engine_tx_counters(sc->sc_7927, &q, &d, &fe, &nt, &rc, &rf);
+		MWX_DEV_LOG(sc, "MT7927 tx: queued %u done %u free events %u "
+		    "no token %u reclaimed %u ring full %u encfail %u, oerrors %u\n",
+		    q, d, fe, nt, rc, rf, sc->sc_7927_tx_encfail,
+		    sc->sc_ic.ic_if.if_oerrors);
 	}
 	if (sc->sc_7927_poll % 30 == 1) {
 		mt7927_engine_counters(sc->sc_7927, &intr, &isr, &frames, &other,
@@ -11477,6 +12582,8 @@ mwx_ampdu_rx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
 	struct ieee80211_rx_ba *ba = &ni->ni_rx_ba[tid];
 	int rv;
 
+	if (sc->sc_hwtype == MWX_HW_MT7927)
+		return ENOTSUP;
 	rv = mwx_mcu_sta_ba(sc, ni, tid, ba->ba_winstart, ba->ba_winsize, 1, 0, 0);
 	MWX_DEV_LOG(sc, "rx BA start tid=%u ssn=%u win=%u rv=%d\n", tid,
 	    ba->ba_winstart, ba->ba_winsize, rv);
@@ -11490,6 +12597,8 @@ mwx_ampdu_rx_stop(struct ieee80211com *ic, struct ieee80211_node *ni,
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
 	int rv;
 
+	if (sc->sc_hwtype == MWX_HW_MT7927)
+		return;
 	rv = mwx_mcu_sta_ba(sc, ni, tid, 0, 0, 0, 0, 0);
 	MWX_DEV_LOG(sc, "rx BA stop tid=%u rv=%d\n", tid, rv);
 }
@@ -11508,6 +12617,8 @@ mwx_ampdu_tx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
 	uint16_t win = ba->ba_winsize;
 	int amsdu, rv;
 
+	if (sc->sc_hwtype == MWX_HW_MT7927)
+		return ENOTSUP;
 	if (win == 0 || win > 64)
 		win = 64;
 	amsdu = sc->sc_tx_amsdu && (ba->ba_params & IEEE80211_ADDBA_AMSDU);
@@ -11893,3 +13004,96 @@ MtkMwx::debugPoll()
 		mwx_intr(sc);
 	}
 }
+
+#ifndef MT7927_HOST_TEST
+/*
+ * ---------------------------------------------------------------------------
+ * MT7927 OS helpers for the engine and glue above, shared by both kexts
+ * (SimpleMtkWlan and AirportMtkWlan). The chip runs as a third hardware type
+ * of this driver behind -mtk7927probe. The firmware is read
+ * from disk at runtime by a kernel thread once the Data volume is mounted,
+ * never compiled into the kext:
+ *   /Library/Firmware/mediatek/mt7927/WIFI_MT6639_PATCH_MCU_2_1_hdr.bin
+ *   /Library/Firmware/mediatek/mt7927/WIFI_RAM_CODE_MT6639_2_1.bin
+ * ---------------------------------------------------------------------------
+ */
+#include <sys/vnode.h>
+#include <sys/uio.h>
+#include <sys/fcntl.h>
+#include <kern/thread.h>
+
+#define MT7927_FW_MAX_SIZE	(4 * 1024 * 1024)
+
+int
+mt7927_read_file(const char *path, uint8_t **out, size_t *outLen)
+{
+    vfs_context_t ctx = vfs_context_create(NULL);
+    vnode_t vp = NULLVP;
+    struct vnode_attr va;
+    uio_t uio = NULL;
+    uint8_t *buf = NULL;
+    size_t size = 0;
+    int err;
+
+    if (ctx == NULL)
+        return ENOMEM;
+    err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+    if (err != 0) {
+        vfs_context_rele(ctx);
+        return err;
+    }
+    VATTR_INIT(&va);
+    VATTR_WANTED(&va, va_data_size);
+    err = vnode_getattr(vp, &va, ctx);
+    if (err == 0 && !VATTR_IS_SUPPORTED(&va, va_data_size))
+        err = ENOTSUP;
+    if (err == 0) {
+        if (va.va_data_size <= 0 || va.va_data_size > MT7927_FW_MAX_SIZE)
+            err = EFBIG;
+        else
+            size = (size_t)va.va_data_size;
+    }
+    if (err == 0 && (buf = (uint8_t *)IOMalloc(size)) == NULL)
+        err = ENOMEM;
+    if (err == 0) {
+        uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
+        if (uio == NULL)
+            err = ENOMEM;
+        else
+            err = uio_addiov(uio, CAST_USER_ADDR_T(buf), size);
+    }
+    if (err == 0)
+        err = VNOP_READ(vp, uio, 0, ctx);
+    if (err == 0 && uio_resid(uio) != 0)
+        err = EIO;
+    if (uio != NULL)
+        uio_free(uio);
+    vnode_close(vp, FREAD, ctx);
+    vfs_context_rele(ctx);
+    if (err != 0) {
+        if (buf != NULL)
+            IOFree(buf, size);
+        return err;
+    }
+    *out = buf;
+    *outLen = size;
+    return 0;
+}
+
+bool
+mt7927_start_thread(void (*fn)(void *, wait_result_t), void *arg)
+{
+    thread_t thread;
+
+    if (kernel_thread_start(fn, arg, &thread) != KERN_SUCCESS)
+        return false;
+    thread_deallocate(thread);
+    return true;
+}
+
+void
+mt7927_thread_exit(void)
+{
+    thread_terminate(current_thread());
+}
+#endif /* MT7927_HOST_TEST */

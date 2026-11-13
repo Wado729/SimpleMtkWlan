@@ -161,6 +161,15 @@ public:
 
     bool createMediumTables(const IONetworkMedium **primary);
     void releaseAll();
+    /* MT7927: the Skywalk interface is created once the firmware is up. */
+    bool finishStart(IOService *provider);
+    bool finishStartFailed(IOService *provider);
+    static IOReturn finishStartAction(OSObject *owner, void *, void *, void *, void *);
+    static void mt7927AttachThread(void *arg, wait_result_t wr);
+    volatile bool fMt7927Stop;
+    volatile bool fMt7927ThreadDone;
+    bool fMt7927Thread;
+    IOService *fMt7927Provider;
     /*
      * macOS (Apple80211's _isInfraInterface, used by airportd and the installer)
      * only takes an interface whose registry entry has IO80211InterfaceRole =

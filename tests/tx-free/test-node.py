@@ -32,6 +32,7 @@ mbuf*ieee80211_encap(ifnet*,mbuf*m,ieee80211_node**ni){*ni=m->node;(*ni)->refs++
 void ieee80211_release_node(ieee80211com*,ieee80211_node*ni){assert(ni->refs>0);ni->refs--;}
 int result;
 int mwx_tx(mwx_softc*,mbuf*,ieee80211_node*ni){assert(ni->refs==1);return result;}
+int mt7927_out;void mt7927_hal_output(mwx_softc*,ifnet*){mt7927_out++;}
 '''
 main=r'''
 int main(){
@@ -43,9 +44,9 @@ int main(){
  {mwx_softc sc; ifnet ifp; ifp.if_softc=&sc;ieee80211_node ni;mbuf m{&ni};room=0;paused=0;ifp.if_snd.m=&m;
   mwx_start(&ifp);assert(ifp.if_snd.m==&m&&paused==1&&sc.sc_tx_full_cnt==1&&ni.refs==0);room=1;}
  {mwx_softc sc;sc.sc_hwtype=MWX_HW_MT7927;ifnet ifp;ifp.if_softc=&sc;ieee80211_node ni;mbuf m{&ni},m2{&ni};
-  sc.sc_ic.ic_mgtq.m=&m;ifp.if_snd.m=&m2;freed=purged=0;mwx_start(&ifp);
-  assert(!sc.sc_ic.ic_mgtq.m&&!ifp.if_snd.m&&purged==1&&freed==1&&ni.refs==0);}
- puts("PASS: extracted mwx_start balances enqueue node references for data/management, success/failure; pauses without dropping when TX is full; MT7927 (no TX path yet) drops both queues.");
+  sc.sc_ic.ic_mgtq.m=&m;ifp.if_snd.m=&m2;freed=purged=0;mt7927_out=0;mwx_start(&ifp);
+  assert(mt7927_out==1&&sc.sc_ic.ic_mgtq.m==&m&&ifp.if_snd.m==&m2&&purged==0&&freed==0&&ni.refs==0);}
+ puts("PASS: extracted mwx_start balances enqueue node references for data/management, success/failure; pauses without dropping when TX is full; MT7927 hands both queues to its own output path.");
 }
 '''
 tmp=tempfile.TemporaryDirectory(prefix='mtk-tx-test-');art=Path(tmp.name)

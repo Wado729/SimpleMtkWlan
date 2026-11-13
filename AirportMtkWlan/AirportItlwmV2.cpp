@@ -14,6 +14,7 @@
 
 #include "AirportItlwmSkywalkInterface.hpp"
 #include "IOPCIEDeviceWrapper.hpp"
+#include "MtkLog.hpp"
 
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(AirportItlwm, IO80211Controller);
@@ -154,6 +155,10 @@ void AirportItlwm::watchdogAction(IOTimerEventSource *timer)
      */
     if (_fCommandGate && _fCommandGate->attemptAction(halDebugPollGated) != kIOReturnSuccess)
         XYLog("watchdog: main work loop busy, poll skipped\n");
+    /* the driver log on the PCI device ("MtkDebugLog"), as SimpleMtkWlan does */
+    static int publishTick;
+    if (++publishTick % 5 == 0)
+        mtk_dbg_publish();
 
     watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
 }
@@ -328,7 +333,8 @@ bool AirportItlwm::start(IOService *provider)
     pciNub->setBusMasterEnable(true);
     pciNub->setIOEnable(true);
     pciNub->setMemoryEnable(true);
-    pciNub->configWrite8(0x41, 0);
+    if (pciNub->configRead16(kIOPCIConfigDeviceID) != 0x7927)
+        pciNub->configWrite8(0x41, 0);
     if (pciNub->requestPowerDomainState(kIOPMPowerOn,
                                         (IOPowerConnection *) getParentEntry(gIOPowerPlane), IOPMLowestState) != IOPMNoErr) {
         super::stop(provider);
@@ -408,6 +414,86 @@ bool AirportItlwm::start(IOService *provider)
 #endif
     scanSource->enable();
 
+    if (pciNub->configRead16(kIOPCIConfigDeviceID) == 0x7927) {
+        /*
+         * MT7927: the firmware, and with it the MAC address, is read from
+         * the Data volume about a minute into boot, and the Skywalk
+         * interface needs the address to register. It is created by a
+         * thread once the HAL has it (as SimpleMtkWlan does).
+         */
+        fMt7927Stop = false;
+        fMt7927ThreadDone = false;
+        fMt7927Provider = provider;
+        retain();
+        if (!mt7927_start_thread(&AirportItlwm::mt7927AttachThread, this)) {
+            release();
+            XYLog("MT7927: could not start the attach thread\n");
+            fHalService->detach(pciNub);
+            super::stop(provider);
+            releaseAll();
+            return false;
+        }
+        fMt7927Thread = true;
+        XYLog("MT7927: Wi-Fi interface is created once the firmware is up\n");
+        return true;
+    }
+    return finishStart(provider);
+}
+
+IOReturn AirportItlwm::finishStartAction(OSObject *owner, void *, void *, void *, void *)
+{
+    AirportItlwm *self = OSDynamicCast(AirportItlwm, owner);
+
+    if (self == NULL || self->fMt7927Stop)
+        return kIOReturnAborted;
+    return self->finishStart(self->fMt7927Provider) ? kIOReturnSuccess : kIOReturnError;
+}
+
+void AirportItlwm::mt7927AttachThread(void *arg, wait_result_t)
+{
+    AirportItlwm *self = (AirportItlwm *)arg;
+    struct ieee80211com *ic = self->fHalService->get80211Controller();
+    int i;
+
+    /* Firmware wait (180 s) plus bring-up, with margin. */
+    for (i = 0; i < 480 && !self->fMt7927Stop; i++) {
+        if (!IEEE80211_ADDR_EQ(etheranyaddr, ic->ic_myaddr))
+            break;
+        IOSleep(500);
+    }
+    if (!self->fMt7927Stop) {
+        if (IEEE80211_ADDR_EQ(etheranyaddr, ic->ic_myaddr)) {
+            XYLog("MT7927: no MAC address from the firmware; no interface\n");
+        } else {
+            IOReturn ret = _fCommandGate != NULL ?
+                _fCommandGate->runAction(&AirportItlwm::finishStartAction) :
+                kIOReturnNotReady;
+            XYLog("MT7927: Wi-Fi interface attach -> 0x%x\n", ret);
+        }
+    }
+    mtk_dbg_publish();
+    self->fMt7927ThreadDone = true;
+    self->release();
+    mt7927_thread_exit();
+}
+
+bool AirportItlwm::finishStartFailed(IOService *provider)
+{
+    /*
+     * From the MT7927 attach thread (on the command gate) only report it:
+     * the gate cannot be torn down from inside its own action.
+     */
+    if (fMt7927Thread)
+        return false;
+    super::stop(provider);
+    releaseAll();
+    return false;
+}
+
+bool AirportItlwm::finishStart(IOService *provider)
+{
+    struct IOSkywalkEthernetInterface::RegistrationInfo registInfo;
+
     fNetIf = new AirportItlwmSkywalkInterface;
 #ifdef AIRPORT_WCL
     if (!fNetIf || !static_cast<AirportItlwmSkywalkInterface *>(fNetIf)->init(this)) {
@@ -415,9 +501,7 @@ bool AirportItlwm::start(IOService *provider)
     if (!fNetIf->init(this)) {
 #endif
         XYLog("Skywalk interface init fail\n");
-        super::stop(provider);
-        releaseAll();
-        return false;
+        return finishStartFailed(provider);
     }
     fNetIf->setInterfaceRole(1);
     checkInterfaceRole("after setInterfaceRole", false);
@@ -426,23 +510,17 @@ bool AirportItlwm::start(IOService *provider)
 #ifndef AIRPORT_WCL
     if (!initCCLogs()) {
         XYLog("CCLog init fail\n");
-        super::stop(provider);
-        releaseAll();
-        return false;
+        return finishStartFailed(provider);
     }
 #endif
     checkInterfaceRole("before attach", false);
     if (!fNetIf->attach(this)) {
         XYLog("attach to service fail\n");
-        super::stop(provider);
-        releaseAll();
-        return false;
+        return finishStartFailed(provider);
     }
     if (!attachInterface(fNetIf, this)) {
         XYLog("attach to interface fail\n");
-        super::stop(provider);
-        releaseAll();
-        return false;
+        return finishStartFailed(provider);
     }
     if (!IONetworkController::attachInterface((IONetworkInterface **)&bsdInterface,
 #ifdef AIRPORT_WCL
@@ -452,24 +530,18 @@ bool AirportItlwm::start(IOService *provider)
 #endif
                                              )) {
         XYLog("attach to IONetworkController interface fail\n");
-        super::stop(provider);
-        releaseAll();
-        return false;
+        return finishStartFailed(provider);
     }
     memset(&registInfo, 0, sizeof(registInfo));
     if (!fNetIf->initRegistrationInfo(&registInfo, 1, sizeof(registInfo))) {
         XYLog("initRegistrationInfo fail\n");
-        super::stop(provider);
-        releaseAll();
-        return false;
+        return finishStartFailed(provider);
     }
 #ifdef AIRPORT_WCL
     fNetIf->mExpansionData->fRegistrationInfo = (struct IOSkywalkNetworkInterface::RegistrationInfo *)IOMalloc(sizeof(struct IOSkywalkNetworkInterface::RegistrationInfo));
     fNetIf->mExpansionData2->fRegistrationInfo = (struct IOSkywalkEthernetInterface::RegistrationInfo *)IOMalloc(sizeof(struct IOSkywalkEthernetInterface::RegistrationInfo));
     if (!fNetIf->mExpansionData->fRegistrationInfo || !fNetIf->mExpansionData2->fRegistrationInfo) {
-        super::stop(provider);
-        releaseAll();
-        return false;
+        return finishStartFailed(provider);
     }
     memcpy(fNetIf->mExpansionData->fRegistrationInfo, &registInfo, sizeof(registInfo));
     memcpy(fNetIf->mExpansionData2->fRegistrationInfo, &registInfo, sizeof(registInfo));
@@ -477,17 +549,13 @@ bool AirportItlwm::start(IOService *provider)
         fNetIf->deferBSDAttach(true);
     checkInterfaceRole("before interface start", false);
     if (!fNetIf->start(this)) {
-        super::stop(provider);
-        releaseAll();
-        return false;
+        return finishStartFailed(provider);
     }
 
 #else
     if (!fNetIf->initRegistrationInfo(&registInfo, 1, sizeof(registInfo))) {
         XYLog("initRegistrationInfo fail\n");
-        super::stop(provider);
-        releaseAll();
-        return false;
+        return finishStartFailed(provider);
     }
     fNetIf->mExpansionData->fRegistrationInfo = (struct IOSkywalkNetworkInterface::RegistrationInfo *)IOMalloc(sizeof(struct IOSkywalkNetworkInterface::RegistrationInfo));
     fNetIf->mExpansionData2->fRegistrationInfo = (struct IOSkywalkEthernetInterface::RegistrationInfo *)IOMalloc(sizeof(struct IOSkywalkEthernetInterface::RegistrationInfo));
@@ -520,6 +588,14 @@ void AirportItlwm::stop(IOService *provider)
 {
     XYLog("%s\n", __PRETTY_FUNCTION__);
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
+    if (fMt7927Thread) {
+        int i;
+
+        fMt7927Stop = true;
+        for (i = 0; i < 100 && !fMt7927ThreadDone; i++)
+            IOSleep(50);
+        fMt7927Thread = false;
+    }
     if (roleTimer) {
         roleTimer->cancelTimeout();
         _fWorkloop->removeEventSource(roleTimer);
@@ -530,11 +606,15 @@ void AirportItlwm::stop(IOService *provider)
         static_cast<AirportItlwmSkywalkInterface *>(fNetIf)->stopWCL();
 #endif
     super::stop(provider);
-    disableAdapter(bsdInterface);
+    if (bsdInterface)
+        disableAdapter(bsdInterface);
     setLinkStatus(kIONetworkLinkValid);
     fHalService->detach(pciNub);
-    ether_ifdetach(ifp);
-    detachInterface(fNetIf, true);
+    if (fNetIf) {
+        /* MT7927: none yet if stopped before the firmware came up */
+        ether_ifdetach(ifp);
+        detachInterface(fNetIf, true);
+    }
     OSSafeReleaseNULL(fNetIf);
     releaseAll();
 }

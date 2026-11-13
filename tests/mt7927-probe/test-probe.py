@@ -17,6 +17,7 @@ start = src.index('#define\tMT7927_BAR_MIN_SIZE')
 end = src.index('/*\n * To be honest this is ridiculous.')
 block = src[start:end]
 regs = (b / 'SimpleMtkWlan/hal_mwx/if_mwxreg.h').resolve()
+types = (b / 'SimpleMtkWlan/hal_mwx/mt7927_types.h').resolve()
 
 pre = r'''
 #include <cassert>
@@ -44,6 +45,7 @@ pre = r'''
 #define OSSynchronizeIO() do {} while (0)
 typedef unsigned char UInt8; typedef int32_t SInt32;
 #include "''' + str(regs) + r'''"
+#include "''' + str(types) + r'''"
 std::string logbuf;
 #define MWX_DEV_LOG(sc, fmt, ...) do { char _b[600]; snprintf(_b, sizeof(_b), fmt, ##__VA_ARGS__); logbuf += _b; } while (0)
 static void OSBitOrAtomic(uint32_t v, volatile uint32_t *p) { *p |= v; }
@@ -86,6 +88,16 @@ struct Chip {
   int scan_beacons = 0; bool scan_done_event = true; int beacon_ring = 4;
   std::vector<std::pair<uint8_t,uint8_t>> txpwr; int txpwr_last = 0;
   uint32_t fw_start_option = 0xffff, fw_start_addr = 0xffff;
+  /* phase 4b */
+  std::vector<uint16_t> bss_tags; uint16_t bss_ntlv = 0; uint8_t bss_bssid[6] = {0}; int bss_conn_state = -1;
+  uint8_t bss_phymode = 0, bss_rate_idx = 0, bss_rlm_ch = 0, bss_rlm_band = 0, bss_band = 0xff; uint16_t bss_basic_rate = 0;
+  struct StaRec { uint16_t wcid; uint8_t muar; uint16_t ntlv; std::vector<uint16_t> tags; uint32_t conn_type; int conn_state;
+                  uint16_t aid; uint8_t peer[6]; uint16_t extra; int state; uint16_t ra_legacy, basic_rate; uint8_t phy_type; };
+  std::vector<StaRec> sta_recs;
+  int roc_acquired = 0, roc_aborted = 0; uint8_t roc_ch = 0, roc_band = 0, roc_token = 0, roc_type = 0xff; uint32_t roc_maxint = 0;
+  bool roc_grant = true;
+  struct TxFrame { uint32_t txd[8]; uint16_t msdu, msdu1; uint32_t pa; uint16_t len; std::vector<uint8_t> frame; };
+  std::vector<TxFrame> txf; bool tx_free_auto = true;
   size_t accesses = 0; int wfsys_resets = 0; bool dma_ever_enabled = false;
 } chip;
 static uint32_t l1() { return chip.bar[MT7925_HIF_REMAP_L1]; }
@@ -129,7 +141,7 @@ static void wr(uint32_t off, uint32_t v) {
   if (off == MT_WFDMA0_GLO_CFG && (v & MT_WFDMA0_GLO_CFG_TX_DMA_EN)) chip.dma_ever_enabled = true;
   if (off == MT_WFDMA0_RST_DTX_PTR) for (int r : {0, 15, 16}) { chip.bar[MT7927_RING_REG(MT7927_TX_RING_BASE, r) + 8] = 0;
                                                                chip.bar[MT7927_RING_REG(MT7927_TX_RING_BASE, r) + 12] = 0; }
-  for (int r : {15, 16}) if (off == MT7927_RING_REG(MT7927_TX_RING_BASE, r) + MT_DMA_CPU_IDX) chip_tx_kick(r);
+  for (int r : {0, 15, 16}) if (off == MT7927_RING_REG(MT7927_TX_RING_BASE, r) + MT_DMA_CPU_IDX) chip_tx_kick(r);
 }
 uint32_t bus_space_read_4(int, char *, uint32_t off) { return rd(off); }
 void bus_space_write_4(int, char *, uint32_t off, uint32_t v) { wr(off, v); }
@@ -148,11 +160,16 @@ static void mt7927_signal(struct mt7927_bringup *) {}
 /* locks: single-threaded here; check pairing and that the service lock never nests */
 int svc_depth = 0, svc_max = 0, op_depth = 0, op_taken = 0;
 static void mt7927_svc_lock(struct mt7927_bringup *) { assert(svc_depth == 0 && "svc lock nested"); svc_depth++; svc_max = svc_max > svc_depth ? svc_max : svc_depth; }
-static void mt7927_svc_unlock(struct mt7927_bringup *) { assert(svc_depth == 1); svc_depth--; }
+/* An interrupt raised while the lock is held runs once it is released (the
+ * work loop blocks on the IOLock on hardware). */
+static bool irq_deferred = false; static void deliver_irq();
+static void mt7927_svc_unlock(struct mt7927_bringup *) { assert(svc_depth == 1); svc_depth--;
+  if (irq_deferred) { irq_deferred = false; deliver_irq(); } }
 static void mt7927_op_lock(struct mt7927_bringup *) { op_depth++; op_taken++; }
 static void mt7927_op_unlock(struct mt7927_bringup *) { assert(op_depth > 0); op_depth--; }
 /* ---- simulated MSI: deliver when STA & ENA and a handler is registered ---- */
 static void deliver_irq() {
+  if (svc_depth > 0) { irq_deferred = true; return; }
   if (irq_registered && (chip.bar[MT_WFDMA0_HOST_INT_STA] & chip.bar[MT_WFDMA0_HOST_INT_ENA]))
     mt7927_intr(irq_arg);
 }
@@ -176,6 +193,19 @@ static void post_event(uint8_t seq, uint8_t eid, uint8_t ext_eid, const std::vec
   uint16_t l = len - 32; memcpy(p + 32, &l, 2); p[32 + 4] = eid; p[32 + 5] = seq; p[32 + 6] = opt; p[32 + 8] = ext_eid;
   if (!payload.empty()) memcpy(p + 44, payload.data(), payload.size());
   d->ctrl = MT_DMA_CTL_DMA_DONE | MT_DMA_CTL_LAST_SEC0 | (len << 16);
+  chip.bar[base + 12] = (dma + 1) % n;
+  raise(MT7927_INT_RX_DONE_WM);
+}
+/* TXRX_NOTIFY (connac3 tx free, version 5): pair(wcid), header, msdu ids */
+static void post_txfree(uint16_t wcid, uint16_t msdu) {
+  uint32_t base = MT7927_RING_REG(MT7927_RX_RING_BASE, 6);
+  uint32_t n = chip.bar[base + 4], cpu = chip.bar[base + 8], dma = chip.bar[base + 12];
+  assert(n && dma != cpu && "RX ring 6 has no free buffer");
+  struct mwx_desc *d = (struct mwx_desc *)pa2va(chip.bar[base] + dma * 16, 16);
+  uint32_t w[5] = { (0u << 27) | (1u << 16) | 20u, 5u << 16, (1u << 31) | ((uint32_t)wcid << 12),
+                    (1u << 30) | (1u << 24), (uint32_t)msdu | (0x7fffu << 15) };
+  uint8_t *p = pa2va(d->buf0, 20); memcpy(p, w, 20);
+  d->ctrl = MT_DMA_CTL_DMA_DONE | MT_DMA_CTL_LAST_SEC0 | (20u << 16);
   chip.bar[base + 12] = (dma + 1) % n;
   raise(MT7927_INT_RX_DONE_WM);
 }
@@ -241,12 +271,53 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
     case 0x01:                                            /* DEV_INFO_UPDATE */
       assert(!query && plen == 16 && tag == 0 && tl == 12); chip.uni_order.push_back("dev");
       chip.dev_active = pl[8]; chip.dev_band = pl[1]; memcpy(chip.dev_addr, pl + 10, 6); break;
-    case 0x02:                                            /* BSS_INFO_UPDATE basic */
-      assert(!query && plen == 36 && tag == 0 && tl == 32); chip.uni_order.push_back("bss");
+    case 0x02:                                            /* BSS_INFO_UPDATE */
+      assert(!query && tag == 0 && tl == 32); chip.uni_order.push_back("bss");
       chip.bss_idx = pl[0]; chip.bss_active = pl[8]; memcpy(&chip.bss_conn, pl + 12, 4);
       memcpy(&chip.bss_wcid, pl + 30, 2);                 /* sta_idx */
-      { uint16_t bmc; memcpy(&bmc, pl + 24, 2); assert(bmc == chip.bss_wcid); }
+      if (plen == 36) { uint16_t bmc; memcpy(&bmc, pl + 24, 2); assert(bmc == chip.bss_wcid); break; }
+      { /* join: basic first, then TLVs counted in the header's second word */
+        memcpy(&chip.bss_ntlv, pl + 2, 2); chip.bss_tags.clear();
+        chip.bss_conn_state = pl[16]; memcpy(chip.bss_bssid, pl + 18, 6); chip.bss_phymode = pl[29]; chip.bss_band = pl[11];
+        uint32_t off = 4;
+        while (off + 4 <= plen) { uint16_t tg, ln; memcpy(&tg, pl + off, 2); memcpy(&ln, pl + off + 2, 2);
+          assert(ln >= 4 && off + ln <= plen); chip.bss_tags.push_back(tg);
+          if (tg == 11) { assert(ln == 16); memcpy(&chip.bss_basic_rate, pl + off + 6, 2); chip.bss_rate_idx = pl[off + 13];
+                          assert(pl[off + 14] == chip.bss_rate_idx); }
+          if (tg == 2) { assert(ln == 16); chip.bss_rlm_ch = pl[off + 4]; chip.bss_rlm_band = pl[off + 12]; }
+          if (tg == 16) assert(ln == 8);
+          if (tg == 15) assert(ln == 8);
+          if (tg == 26) assert(ln == 20 && pl[off + 13] == 0xff);
+          if (tg == 23) assert(ln == 20 && pl[off + 4] == 1);
+          off += ln; }
+        assert(off == plen && chip.bss_ntlv == chip.bss_tags.size()); }
       break;
+    case 0x03: {                                          /* STA_REC_UPDATE */
+      assert(!query && plen >= 12);
+      Chip::StaRec sr{}; sr.wcid = pl[1] | (pl[6] << 8); sr.muar = pl[5]; memcpy(&sr.ntlv, pl + 2, 2); assert(pl[4] == 1);
+      sr.conn_state = -1; sr.state = -1;
+      uint32_t off = 8;
+      while (off + 4 <= plen) { uint16_t tg, ln; memcpy(&tg, pl + off, 2); memcpy(&ln, pl + off + 2, 2);
+        assert(ln >= 4 && off + ln <= plen); sr.tags.push_back(tg);
+        if (tg == 0) { assert(ln == 20); memcpy(&sr.conn_type, pl + off + 4, 4); sr.conn_state = pl[off + 8];
+                       memcpy(&sr.aid, pl + off + 10, 2); memcpy(sr.peer, pl + off + 12, 6); memcpy(&sr.extra, pl + off + 18, 2); }
+        if (tg == 0x15) { assert(ln == 12); memcpy(&sr.basic_rate, pl + off + 4, 2); sr.phy_type = pl[off + 6]; }
+        if (tg == 1) { assert(ln == 16); memcpy(&sr.ra_legacy, pl + off + 4, 2); }
+        if (tg == 7) { assert(ln == 16); sr.state = pl[off + 4]; }
+        if (tg == 0x2b) { assert(ln == 8 && pl[off + 4] == 0 && pl[off + 5] == 1 && pl[off + 6] == 1); }
+        if (tg == 0x25) assert(ln == 8);
+        if (tg == 0x23) assert(ln == 4);
+        off += ln; }
+      assert(off == plen && sr.ntlv == sr.tags.size());
+      chip.sta_recs.push_back(sr);
+      r = {0,0,0,0, 0,0,0,0};                             /* cid, pad, status 0 */
+      break; }
+    case 0x27: {                                          /* ROC */
+      assert(!query);
+      if (tag == 0) { assert(tl == 24 && plen == 28); chip.roc_acquired++; chip.roc_token = pl[9]; chip.roc_ch = pl[10];
+        chip.roc_band = pl[12]; chip.roc_type = pl[19]; memcpy(&chip.roc_maxint, pl + 20, 4); assert(pl[24] == 0xff); }
+      else { assert(tag == 1 && tl == 12 && plen == 16 && pl[9] == chip.roc_token && pl[10] == 0xff); chip.roc_aborted++; }
+      break; }
     case 0x16: {                                          /* SCAN_REQ */
       assert(!query); chip.scan_seq = pl[0]; chip.scan_hdr_bss = pl[1];
       uint16_t t0; memcpy(&t0, pl + 4, 2);
@@ -280,6 +351,10 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
       const char *t = "(test) wifi firmware log line\n"; std::vector<uint8_t> lg(12, 0);
       lg.insert(lg.end(), t, t + strlen(t)); post_event(0, MT7927_UNI_EVENT_FW_LOG, 0, lg, MT7927_RXD_OPT_UNSOLICITED); }
     if (ucid == 0x28) post_event(0, 0x28, 0, {0,0,0,0, 0,0,8,0, 1,0,0,0}, MT7927_RXD_OPT_UNSOLICITED);
+    if (ucid == 0x27 && tag == 0 && chip.roc_grant) {
+      std::vector<uint8_t> g(4 + 20, 0); g[4] = 0; g[6] = 20; g[8] = pl[8]; g[9] = chip.roc_token; g[10] = 0; g[11] = chip.roc_ch;
+      g[13] = chip.roc_band; g[17] = 0; uint32_t mi = chip.roc_maxint; memcpy(&g[20], &mi, 4);
+      post_event(0, 0x27, 0, g, MT7927_RXD_OPT_UNSOLICITED); }
     if (ucid == 0x16 && !chip.scan_ch.empty() && chip.scan_cancel == 0) {
       for (auto &c : chip.scan_ch) if (chip.scan_beacons < 2) { post_beacon(c.second, chip.scan_beacons); chip.scan_beacons++; }
       if (chip.scan_done_event)
@@ -337,6 +412,16 @@ static void chip_tx_kick(int ring) {
     struct mwx_desc *d = (struct mwx_desc *)pa2va(chip.bar[base] + dma * 16, 16);
     assert(!(d->ctrl & MT_DMA_CTL_DMA_DONE) && (d->ctrl & MT_DMA_CTL_LAST_SEC0));
     uint32_t len = (d->ctrl >> 16) & 0x3fff; const uint8_t *p = pa2va(d->buf0, len);
+    if (ring == 0) {                                     /* data: TXD + hw TXP, payload by pointer */
+      assert(len == 64);
+      Chip::TxFrame t{}; memcpy(t.txd, p, 32); memcpy(&t.msdu, p + 32, 2); memcpy(&t.msdu1, p + 34, 2);
+      memcpy(&t.pa, p + 40, 4); memcpy(&t.len, p + 44, 2);
+      assert((t.msdu & 0x8000) && (t.len & 0x8000) && t.msdu1 == 0xffff);
+      uint32_t fl = t.len & 0x7fff; assert((t.txd[0] & 0xffff) == fl + 32);
+      const uint8_t *fp = pa2va(t.pa, fl); t.frame.assign(fp, fp + fl); chip.txf.push_back(t);
+      d->ctrl |= MT_DMA_CTL_DMA_DONE; dma = (dma + 1) % n; chip.bar[base + 12] = dma;
+      if (chip.tx_free_auto) post_txfree(t.txd[1] & 0xfff, t.msdu & 0x7fff);
+      continue; }
     if (ring == 16) { assert(chip.dl_got + len <= chip.dl_len && "scatter beyond the announced length");
       chip.regions.back().second.insert(chip.regions.back().second.end(), p, p + len); chip.dl_got += len;
       raise(MT7927_INT_TX_DONE_FWDL); }
@@ -671,6 +756,101 @@ int main() {
     rm(r);
   }
 
+  /* 16: phase 4b join on 5 GHz: band reconfig, BSS_INFO, STA_REC, ROC, data TX, TX free, leave */
+  {
+    r = mk(); svc_max = 0; op_taken = 0;
+    assert(mt7927_engine_start(&r->b, patch.data(), patch.size(), ram.data(), ram.size(), &abort_flag) == 0);
+    struct mt7927_vif v = {}; v.idx = 0; v.omac_idx = 0; v.band_idx = 0; v.wmm_idx = 0; v.wcid = MT7927_WTBL_RESERVED;
+    memcpy(v.addr, mt7927_engine_mac(&r->b), 6);
+    assert(mt7927_dev_add(&r->b, &v, true) == 0 && chip.dev_band == 0);
+    chip.uni_order.clear();
+    assert(mt7927_band_reconfig(&r->b, &v, 1) == 0 && v.band_idx == 1 && chip.dev_band == 1 && chip.dev_active == 1);
+    assert(chip.uni_order.size() == 4 && chip.uni_order[0] == "bss" && chip.uni_order[1] == "dev" &&
+           chip.uni_order[2] == "dev" && chip.uni_order[3] == "bss");
+    assert(mt7927_band_reconfig(&r->b, &v, 1) == 0 && chip.uni_order.size() == 4);      /* same band: nothing */
+
+    struct mt7927_bss bss = {};
+    const uint8_t ap[6] = {0x40, 0x00, 0x00, 0x00, 0x03, 0x4b};
+    memcpy(bss.bssid, ap, 6); bss.chan = 36; bss.band = 2; bss.bcn_int = 100; bss.dtim = 1; bss.qos = 1;
+    bss.peer_wcid = 1; bss.phymode = 0x01; bss.phy_type = 1 << 3; bss.basic_rates = 0x15; bss.ra_legacy = 0xff << 6;
+    mt7927_wtbl_clear(&r->b, 1);
+    assert(mt7927_bss_info(&r->b, &v, &bss, true) == 0);
+    const uint16_t want_bss[] = {0, 16, 11, 15, 26, 23, 2, 6};
+    assert(chip.bss_tags.size() == 8 && memcmp(chip.bss_tags.data(), want_bss, sizeof want_bss) == 0);
+    assert(chip.bss_conn_state == 0 && memcmp(chip.bss_bssid, ap, 6) == 0 && chip.bss_wcid == 1 && chip.bss_band == 1);
+    assert(chip.bss_rate_idx == MT7927_BASIC_RATES_TBL + 4 && chip.bss_basic_rate == 0x540);
+    assert(chip.bss_rlm_ch == 36 && chip.bss_rlm_band == 2 && chip.bss_phymode == 0x01);
+
+    assert(mt7927_sta_rec(&r->b, &v, &bss, true, true, 0, true) == 0);
+    const Chip::StaRec &s1 = chip.sta_recs.back();
+    const uint16_t want_sta[] = {0, 0x15, 1, 7, 0x2b};
+    assert(s1.wcid == 1 && s1.muar == 0 && s1.tags.size() == 5 && memcmp(s1.tags.data(), want_sta, sizeof want_sta) == 0);
+    assert(s1.conn_type == 0x10002 && s1.conn_state == 2 && s1.extra == 3 && s1.state == 0 && memcmp(s1.peer, ap, 6) == 0);
+    assert(s1.ra_legacy == 0x3fc0 && s1.basic_rate == 0x15 && s1.phy_type == 8);
+
+    /* ROC: acquire, grant event (unsolicited), wait returns */
+    assert(mt7927_roc(&r->b, &v, 36, 2, 3000) == 0 && chip.roc_acquired == 1 && chip.roc_ch == 36 && chip.roc_band == 2);
+    assert(chip.roc_type == 0 && chip.roc_maxint == 3000 && r->b.roc_granted && r->b.roc_active && r->b.roc_grant_ms == 3000);
+    assert(mt7927_roc(&r->b, &v, 36, 2, 3000) == EBUSY);
+
+    /* auth frame: management, fixed rate on ALTX0, TGID band 1 */
+    uint8_t auth[30] = {0xb0, 0x00, 0, 0}; memcpy(auth + 4, ap, 6); memcpy(auth + 10, v.addr, 6); memcpy(auth + 16, ap, 6);
+    auth[24] = 0; auth[26] = 1;                                       /* open system, seq 1 */
+    struct mt7927_txinfo ti = {}; ti.wcid = 1; ti.omac_idx = 0; ti.band_idx = 1; ti.q_idx = 0x10; ti.hdrlen = 24;
+    ti.rate_idx = MT7927_BASIC_RATES_TBL + 4; ti.fixed_rate = true;
+    assert(mt7927_tx_frame(&r->b, &ti, auth, sizeof auth) == 0);
+    assert(chip.txf.size() == 1);
+    {
+      const Chip::TxFrame &t = chip.txf.back();
+      assert((t.txd[0] >> 25) == 0x10 && ((t.txd[0] >> 23) & 3) == 0 && (t.txd[0] & 0xffff) == 30 + 32);
+      assert((t.txd[1] & 0xfff) == 1 && ((t.txd[1] >> 12) & 3) == 1 && ((t.txd[1] >> 14) & 3) == 2);
+      assert(((t.txd[1] >> 16) & 0x1f) == 12 && (t.txd[1] >> 31) == 1 && ((t.txd[1] >> 25) & 0x3f) == 0);
+      assert(((t.txd[2] >> 4) & 3) == 0 && (t.txd[2] & 0xf) == 0xb);
+      assert(((t.txd[3] >> 11) & 0x1f) == 15 && (t.txd[3] & (1u << 28)) && !(t.txd[3] & 1));
+      assert(((t.txd[6] >> 16) & 0x3f) == MT7927_BASIC_RATES_TBL + 4 && (t.txd[6] & 0xc) == 0xc && ((t.txd[6] >> 4) & 0x3f) == 1);
+      assert(t.frame.size() == 30 && memcmp(t.frame.data(), auth, 30) == 0);
+    }
+    assert(r->b.tx_done == 1 && r->b.tx_free_events == 1 && r->b.tok_busy[chip.txf.back().msdu & 0x7fff] == 0);
+    /* a QoS data frame: rate control (no fixed rate), BE queue */
+    uint8_t data[26 + 8 + 20] = {0x88, 0x01}; memcpy(data + 4, ap, 6); memcpy(data + 10, v.addr, 6); memcpy(data + 16, ap, 6);
+    ti.q_idx = 1; ti.hdrlen = 26; ti.fixed_rate = false; ti.tid = 0;
+    assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0);
+    assert(!(chip.txf.back().txd[1] >> 31) && (chip.txf.back().txd[0] >> 25) == 1 && ((chip.txf.back().txd[6] >> 16) & 0x3f) == 0);
+    assert(((chip.txf.back().txd[2] >> 4) & 3) == 2 && (chip.txf.back().txd[2] & 0xf) == 8);
+    /* no TX free events: the oldest token is reused once enough newer frames went out */
+    chip.tx_free_auto = false;
+    for (int k = 0; k < MT7927_TX_TOKENS + 6; k++) assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0);
+    assert(r->b.tx_reclaimed == 6 && r->b.tx_queued == 2 + MT7927_TX_TOKENS + 6);
+    chip.tx_free_auto = true;
+    assert(mt7927_tx_frame(&r->b, &ti, auth, 4) == EINVAL);
+    assert(svc_depth == 0 && op_depth == 0);
+
+    /* associated: BSS_INFO again, STA_REC ASSOC for the AP and the broadcast entry */
+    bss.aid = 5;
+    assert(mt7927_sta_rec(&r->b, &v, &bss, true, true, 2, false) == 0 && chip.sta_recs.back().state == 2 &&
+           chip.sta_recs.back().extra == 1 && chip.sta_recs.back().aid == 5);
+    assert(mt7927_sta_rec(&r->b, &v, &bss, false, true, 2, false) == 0);
+    {
+      const Chip::StaRec &bc = chip.sta_recs.back();
+      assert(bc.wcid == MT7927_WTBL_RESERVED && bc.muar == 0xe && bc.conn_type == 0x10020 && bc.tags.size() == 2 &&
+             bc.tags[0] == 0 && bc.tags[1] == 0x2b && bc.aid == 5);
+    }
+    /* leave: ROC abort, STA_REC remove, BSS_INFO without RLM */
+    assert(mt7927_roc_abort(&r->b, &v) == 0 && chip.roc_aborted == 1 && !r->b.roc_active);
+    assert(mt7927_roc_abort(&r->b, &v) == 0 && chip.roc_aborted == 1);
+    assert(mt7927_sta_rec(&r->b, &v, &bss, true, false, 0, false) == 0);
+    assert(chip.sta_recs.back().tags.size() == 2 && chip.sta_recs.back().tags[0] == 0x25 && chip.sta_recs.back().tags[1] == 0x23);
+    assert(mt7927_bss_info(&r->b, &v, &bss, false) == 0 && chip.bss_conn_state == 1 && chip.bss_tags.size() == 6);
+    /* no grant: the wait times out and the ROC is aborted */
+    chip.roc_grant = false;
+    assert(mt7927_roc(&r->b, &v, 36, 2, 3000) == ETIMEDOUT && chip.roc_aborted == 2 && !r->b.roc_active);
+    chip.roc_grant = true;
+    assert(r->b.mcu_timeouts == 0 && svc_depth == 0 && op_depth == 0);
+    mt7927_engine_stop(&r->b);
+    assert(!mt7927_engine_running(&r->b) && live_allocs == 0 && r->b.tok_mem.va == nullptr);
+    rm(r);
+  }
+
   /* 15: engine start failure (firmware never answers) tears down */
   r = mk(); chip.mute_uni = 0x15;
   assert(mt7927_engine_start(&r->b, patch.data(), patch.size(), ram.data(), ram.size(), &abort_flag) == EIO);
@@ -684,7 +864,7 @@ int main() {
        "order (eFuse, fw log, set_eeprom, mac init registers, DBDC, thermal, KeepFullPwr, channel domain, RTS, "
        "temperature), unsolicited firmware log events, DBDC/domain timeouts, country code, CLC scan; phase 4 "
        "connac3 RX parser, engine kept running, ISR delivery of frames/events/MCU replies, interface add/remove, "
-       "RX filter, TX power limits, scan request/cancel layout, ring/MIB diagnostics. Simulated chip, not hardware.");
+       "RX filter, TX power limits, scan request/cancel layout, ring/MIB diagnostics; phase 4b band reconfig, BSS_INFO/STA_REC TLVs, ROC grant/timeout/abort, connac3 TXD+TXP data TX, TX free tokens and reclaim. Simulated chip, not hardware.");
   return 0;
 }
 '''
