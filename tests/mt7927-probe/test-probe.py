@@ -867,7 +867,12 @@ int main() {
     { uint32_t nt = r->b.tx_no_token;
       assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == ENOBUFS && r->b.tx_no_token == nt + 1 &&
              r->b.tx_reclaimed == 6 && r->b.tx_blocked); }
+    /* phase 4c.4: the room check says so before a frame is taken off the queue */
+    r->b.tx_blocked = false;
+    { uint32_t inflight, pend; mt7927_engine_tx_depth(&r->b, &inflight, &pend);
+      assert(!mt7927_engine_tx_room(&r->b) && r->b.tx_blocked && inflight == MT7927_TX_TOKENS && pend < 256); }
     for (uint32_t k = 0; k < MT7927_TX_TOKENS; k++) r->b.tok_busy[k] = 0;      /* the chip catches up */
+    assert(mt7927_engine_tx_room(&r->b));
     r->b.tx_blocked = false;
     chip.tx_free_auto = true;
     assert(mt7927_tx_frame(&r->b, &ti, auth, 4) == EINVAL);
@@ -920,14 +925,14 @@ int main() {
            !(chip.txf.back().txd[3] & (1u << 28)) && chip.txf.back().txd[5] == 0);
     ti.txs = true;
     assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0 && !(chip.txf.back().txd[3] & (1u << 5)) &&
-           (chip.txf.back().txd[3] & (1u << 28)) && chip.txf.back().txd[5] == ((1u << 10) | 0x80));
+           (chip.txf.back().txd[3] & (1u << 28)) && chip.txf.back().txd[5] == ((1u << 10) | 0x40));
     ti.amsdu = ti.txs = false;
     /* TX status: VHT (mode 4) MCS 9 NSS 2, 80 MHz; another PID is not ours */
-    post_txs((2u << 29) | (4u << 6) | (1u << 10) | 9u, 0x80);
+    post_txs((2u << 29) | (4u << 6) | (1u << 10) | 9u, 0x40);
     post_txs((1u << 16) | 1u, 0x20); deliver_irq();
     { uint32_t n, e, t0, t1; mt7927_engine_txs(&r->b, &n, &e, &t0, &t1);
       assert(n == 1 && e == 0 && (t0 & 0x3fff) == ((4u << 6) | (1u << 10) | 9u) && (t0 >> 29) == 2 && (int8_t)(t1 & 0xff) == -10); }
-    post_txs((1u << 16) | (1u << 6) | 4u, 0x80); deliver_irq();                   /* OFDM, ACK timeout */
+    post_txs((1u << 16) | (1u << 6) | 4u, 0x40); deliver_irq();                   /* OFDM, ACK timeout */
     { uint32_t n, e, t0, t1; mt7927_engine_txs(&r->b, &n, &e, &t0, &t1); assert(n == 2 && e == 1); }
     bss.cipher = 0;
     /* leave: ROC abort, STA_REC remove, BSS_INFO without RLM */

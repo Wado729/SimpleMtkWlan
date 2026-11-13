@@ -621,6 +621,9 @@ struct mwx_softc {
 	uint32_t		sc_7927_mib_seen;
 	uint32_t		sc_7927_recoveries;
 	uint32_t		sc_7927_last_recovery;	/* poll tick */
+	uint32_t		sc_7927_tx_held;	/* frames held back: no token */
+	uint32_t		sc_7927_depth_tok;	/* max tokens out, last 5 s */
+	uint32_t		sc_7927_depth_ring;	/* max undone descriptors */
 	uint32_t		sc_7927_tx_encfail;
 	uint32_t		sc_7927_rx_bcn;		/* beacons from our BSS */
 	uint32_t		sc_7927_rx_mcast;	/* group-addressed data */
@@ -4448,7 +4451,7 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 #define	MT7927_TXD3_HW_AMSDU		(1U << 5)
 #define	MT7927_TXD5_PID(x)		((uint32_t)(x) & 0xff)
 #define	MT7927_TXD5_TX_STATUS_HOST	(1U << 10)
-#define	MT7927_TXS_PID			0x80	/* sampled TX status */
+#define	MT7927_TXS_PID			0x40	/* sampled TX status (< 0x7f) */
 #define	MT7927_PKT_TYPE_TXS		0
 #define	MT7927_TXD3_REM_TX_COUNT(x)	(((uint32_t)(x) & 0x1f) << 11)
 #define	MT7927_TXD3_BA_DISABLE		(1U << 28)
@@ -7867,6 +7870,54 @@ mt7927_engine_link(struct mt7927_bringup *b, uint8_t band, uint32_t *bcn_loss,
 	*windows = b->mib_windows;
 }
 
+/*
+ * Is there a token for one more frame? Checked before a frame is taken off
+ * the send queue, so a full chip holds frames back instead of dropping
+ * them. If not, TX is marked blocked: the next TX free events with room
+ * call cb_txroom.
+ */
+bool
+mt7927_engine_tx_room(struct mt7927_bringup *b)
+{
+	uint32_t i, tok;
+	bool room = false;
+
+	mt7927_svc_lock(b);
+	for (i = 0; i < MT7927_TX_TOKENS; i++) {
+		tok = (b->tok_next + i) % MT7927_TX_TOKENS;
+		if (!b->tok_busy[tok]) {
+			room = true;
+			break;
+		}
+	}
+	/* while free events have stopped, mt7927_tx_frame() may reclaim */
+	if (!room && b->tok_seq - b->tok_free_seq >= MT7927_TX_TOKENS)
+		room = true;
+	if (!room)
+		b->tx_blocked = true;
+	mt7927_svc_unlock(b);
+	return room;
+}
+
+/* Frames in the chip (tokens out) and descriptors the DMA has not fetched. */
+void
+mt7927_engine_tx_depth(struct mt7927_bringup *b, uint32_t *inflight,
+    uint32_t *ring_pending)
+{
+	struct mt7927_ring *r = &b->tx[MT7927_TX_BAND0];
+	uint32_t i, n = 0, cpu, dma;
+
+	for (i = 0; i < MT7927_TX_TOKENS; i++)
+		n += b->tok_busy[i] != 0;
+	*inflight = n;
+	*ring_pending = 0;
+	if (r->count != 0 && b->sc->sc_memh) {
+		cpu = mt7927_raw_rd(b->sc, r->regbase + MT_DMA_CPU_IDX);
+		dma = mt7927_raw_rd(b->sc, r->regbase + MT_DMA_DMA_IDX);
+		*ring_pending = (cpu + r->count - dma) % r->count;
+	}
+}
+
 void
 mt7927_engine_txs(struct mt7927_bringup *b, uint32_t *count, uint32_t *errs,
     uint32_t *txs0, uint32_t *txs1)
@@ -9553,6 +9604,12 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 	int rv;
 
 	for (;;) {
+		if (!mt7927_engine_tx_room(sc->sc_7927)) {
+			/* the chip is full: leave the frames queued */
+			sc->sc_7927_tx_held++;
+			ifq_set_oactive(&ifp->if_snd);
+			break;
+		}
 		m = mq_dequeue(&ic->ic_mgtq);
 		if (m != NULL) {
 			ni = (struct ieee80211_node *)mbuf_pkthdr_rcvif(m);
@@ -9973,6 +10030,15 @@ mt7927_hal_poll(struct mwx_softc *sc)
 			mwx_start(ifp);
 		}
 	}
+	{
+		uint32_t tok, ring;
+
+		mt7927_engine_tx_depth(sc->sc_7927, &tok, &ring);
+		if (tok > sc->sc_7927_depth_tok)
+			sc->sc_7927_depth_tok = tok;
+		if (ring > sc->sc_7927_depth_ring)
+			sc->sc_7927_depth_ring = ring;
+	}
 	if (sc->sc_7927_poll % 30 == 1 ||
 	    (sc->sc_7927_joined && sc->sc_7927_poll % 5 == 1)) {
 		uint32_t q, d, fe, nt, rc, rf;
@@ -9999,11 +10065,16 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		rate = t0 & 0x3fff;			/* MT_TXS0_TX_RATE */
 		MWX_DEV_LOG(sc, "MT7927 tx rate: %u samples (%u not acked), last "
 		    "mode %u mcs %u nss %u bw %u%s, %d dBm; hw a-msdu %u (peer "
-		    "max mpdu %u)\n", n, errs, (rate >> 6) & 0xf, rate & 0x3f,
+		    "max mpdu %u); last 5 s max: %u frames in the chip, %u "
+		    "descriptors not fetched; held back %u, recoveries %u\n", n,
+		    errs, (rate >> 6) & 0xf, rate & 0x3f,
 		    ((rate >> 10) & 0xf) + 1, t0 >> 29,
 		    (t0 & (7U << 16)) ? " not acked" : "", (int8_t)(t1 & 0xff),
 		    sc->sc_7927_tx_amsdu, sc->sc_7927_bss.amsdu ?
-		    sc->sc_7927_bss.amsdu - 1 : 0xff);
+		    sc->sc_7927_bss.amsdu - 1 : 0xff, sc->sc_7927_depth_tok,
+		    sc->sc_7927_depth_ring, sc->sc_7927_tx_held,
+		    sc->sc_7927_recoveries);
+		sc->sc_7927_depth_tok = sc->sc_7927_depth_ring = 0;
 	}
 	if (sc->sc_7927_poll % 30 == 1) {
 		mt7927_engine_counters(sc->sc_7927, &intr, &isr, &frames, &other,
