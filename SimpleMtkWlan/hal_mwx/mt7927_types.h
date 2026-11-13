@@ -32,6 +32,7 @@ struct mt7927_bss {
 	uint8_t		vht_opmode;	/* bandwidth | rx_nss << 4 */
 	uint8_t		bw;		/* CMD_CBW_*: 0 20, 1 40, 2 80 MHz */
 	uint8_t		center_chan;	/* center of the operating channel */
+	uint8_t		cipher;		/* CONNAC3_CIPHER_* in hardware, 0 none */
 };
 
 /* MT7927 phase 4b: per-frame TXD inputs. */
@@ -45,6 +46,7 @@ struct mt7927_txinfo {
 	uint8_t		rate_idx;	/* basic rate table entry if fixed */
 	bool		fixed_rate;
 	bool		multicast;
+	bool		protect;	/* hardware encrypts (key in WTBL) */
 };
 
 #endif /* MT7927_TYPES_H */

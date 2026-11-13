@@ -471,7 +471,12 @@ struct mwx_setkey_task_arg {
 struct mt7927_ba_op {
 	struct ieee80211_node	*ni;
 	uint8_t			tid;
-	uint8_t			kind;		/* MT7927_BA_* */
+	uint8_t			kind;		/* MT7927_BA_*, MT7927_KEY_SET */
+	/* MT7927_KEY_SET: a copy of the key, wiped after use */
+	bool			key_pairwise;
+	uint8_t			key_id;
+	uint8_t			key_len;
+	uint8_t			key[32];
 };
 
 struct mwx_softc {
@@ -599,10 +604,19 @@ struct mwx_softc {
 	bool			sc_7927_joined;		/* BSS_INFO + STA_REC set */
 	bool			sc_7927_assoc;
 	uint32_t		sc_7927_assoc_polls;
+	/* phase 4c.2: CCMP keys in the chip */
+	bool			sc_7927_hwcrypto;	/* off: -mtk7927swcrypto */
+	uint8_t			sc_7927_hwkeys;		/* MT7927_HWKEY_* installed */
+	volatile bool		sc_7927_ptk_pending;	/* hold data TX until set */
+	uint32_t		sc_7927_hwkey_fail;
+	uint32_t		sc_7927_tx_hwenc;
+	uint32_t		sc_7927_tx_swenc;
 	uint32_t		sc_7927_tx_encfail;
 	uint32_t		sc_7927_rx_bcn;		/* beacons from our BSS */
 	uint32_t		sc_7927_rx_mcast;	/* group-addressed data */
 	uint32_t		sc_7927_rx_ucast;	/* unicast data */
+	uint32_t		sc_7927_rx_hwdec;	/* decrypted by the chip */
+	uint32_t		sc_7927_rx_hwdec_nopn;
 	struct mt7927_bss	sc_7927_bss;
 	uint8_t			sc_7927_txbuf[2304];
 	/* phase 4c */
@@ -742,6 +756,8 @@ static int	mt7927_ampdu_tx_start(struct ieee80211com *,
 static void	mt7927_ampdu_tx_stop(struct ieee80211com *,
 		    struct ieee80211_node *, uint8_t);
 static void	mt7927_ba_task(void *);
+struct mt7927_ba_op;
+static void	mt7927_key_install(struct mwx_softc *, struct mt7927_ba_op *);
 static void	mt7927_hal_txroom(void *);
 static int	mt7927_mac_fill_rx(struct mwx_softc *, struct mbuf *,
 		    struct ieee80211_rxinfo *);
@@ -2639,9 +2655,13 @@ common:
 		 * Keys in software (net80211 CCMP): the hardware cannot build
 		 * A-MSDUs of frames it does not encrypt, so no TX A-MSDU.
 		 */
+		int sw = 0;
+
 		ic->ic_set_key = mt7927_set_key;
 		ic->ic_delete_key = mt7927_delete_key;
 		ic->ic_caps &= ~IEEE80211_C_TX_AMSDU_IN_AMPDU;
+		sc->sc_7927_hwcrypto = !PE_parse_boot_argn("-mtk7927swcrypto",
+		    &sw, sizeof(sw));
 		ic->ic_ampdu_rx_start = mt7927_ampdu_rx_start;
 		ic->ic_ampdu_rx_stop = mt7927_ampdu_rx_stop;
 		ic->ic_ampdu_tx_start = mt7927_ampdu_tx_start;
@@ -4371,6 +4391,11 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 #define	MT7927_STA_TAG_MLD_OFF		0x23
 #define	MT7927_STA_TAG_REMOVE		0x25
 #define	MT7927_STA_TAG_HDR_TRANS	0x2b
+#define	MT7927_STA_TAG_KEY_V3		0x27
+#define	MT7927_CIPHER_AES_CCMP		4
+#define	MT7927_BSS_MODE_WPA2_PSK	7
+#define	MT7927_HWKEY_PAIRWISE		0x01	/* sc_7927_hwkeys */
+#define	MT7927_HWKEY_GROUP		0x02
 #define	MT7927_CONNECTION_INFRA_AP	0x00010002	/* STA_TYPE_AP | NETWORK_INFRA */
 #define	MT7927_CONNECTION_INFRA_BC	0x00010020	/* STA_TYPE_BC | NETWORK_INFRA */
 #define	MT7927_CONN_STATE_PORT_SECURE	2
@@ -4396,6 +4421,7 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 #define	MT7927_TXD2_SUB_TYPE(x)		((x) & 0xf)
 #define	MT7927_TXD2_FRAME_TYPE(x)	(((uint32_t)(x) & 3) << 4)
 #define	MT7927_TXD3_NO_ACK		(1U << 0)
+#define	MT7927_TXD3_PROTECT_FRAME	(1U << 1)
 #define	MT7927_TXD3_BCM			(1U << 4)
 #define	MT7927_TXD3_REM_TX_COUNT(x)	(((uint32_t)(x) & 0x1f) << 11)
 #define	MT7927_TXD3_BA_DISABLE		(1U << 28)
@@ -4478,6 +4504,10 @@ struct mt7927_rxi {
 	bool		decrypted;
 	bool		unicast;
 	uint16_t	wlan_idx;
+	uint8_t		sec_mode;	/* CONNAC3_CIPHER_* the frame used */
+	uint8_t		key_id;
+	bool		has_pn;		/* group 1 present: pn[] valid */
+	uint8_t		pn[6];		/* PN0 (least significant) first */
 };
 
 struct mt7927_vif {
@@ -6910,10 +6940,18 @@ mt7927_rx_parse(const uint8_t *p, uint32_t len, uint8_t antenna_mask,
 	sec = (rxd2 >> 16) & 0x1f;
 	ri->decrypted = sec != 0 && !(rxd1 & ((1U << 23) | (1U << 24)));
 
+	ri->sec_mode = (uint8_t)sec;
+	ri->key_id = (rxd1 >> 21) & 0x3;
+
 	if (rxd1 & (1U << 19))			/* group 4 */
 		off += 16;
-	if (rxd1 & (1U << 16))			/* group 1 */
+	if (rxd1 & (1U << 16)) {		/* group 1: IV/PN */
+		if (off + 16 > len)
+			return MT7927_RX_SHORT;
+		memcpy(ri->pn, p + off, 6);
+		ri->has_pn = true;
 		off += 16;
+	}
 	if (rxd1 & (1U << 17))			/* group 2 */
 		off += 16;
 	if (rxd1 & (1U << 18)) {		/* group 3: P-RXV */
@@ -7316,10 +7354,15 @@ mt7927_bss_info(struct mt7927_bringup *b, const struct mt7927_vif *v,
 	t[30] = 0;						/* phymode_ext */
 	t[31] = v->idx;						/* link_idx */
 
-	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_SEC, 8);
-	t[4] = 0;						/* MODE_OPEN */
-	t[5] = 1;
-	t[6] = 0;						/* no hw cipher */
+	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_SEC, 8);	/* mt7925_mcu_bss_sec_tlv */
+	if (bss->cipher == MT7927_CIPHER_AES_CCMP) {
+		t[4] = MT7927_BSS_MODE_WPA2_PSK;
+		t[5] = 6;
+	} else {
+		t[4] = 0;					/* MODE_OPEN */
+		t[5] = 1;
+	}
+	t[6] = bss->cipher;					/* 0: no hw cipher */
 
 	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_RATE, 16);
 	mt7927_put16(t + 6, bss->band == 1 ? 0x000f :		/* HR_DSSS_ERP */
@@ -7477,6 +7520,58 @@ mt7927_sta_ba(struct mt7927_bringup *b, const struct mt7927_vif *v,
 	MWX_DEV_LOG(b->sc, "MT7927 %s BA tid %u %s ssn %u win %u%s -> %d (fw status "
 	    "0x%x)\n", tx ? "TX" : "RX", tid, enable ? "on" : "off", ssn, winsize,
 	    amsdu ? " amsdu" : "", rv, status);
+	return rv;
+}
+
+/*
+ * mt7925_mcu_sta_key_tlv(): install (or remove) a key in the firmware. The
+ * pairwise key goes on the AP's WCID, a group key on the BSS's broadcast
+ * entry, as mac80211 passes sta == NULL for it.
+ */
+int
+mt7927_sta_key(struct mt7927_bringup *b, const struct mt7927_vif *v,
+    const struct mt7927_bss *bss, bool pairwise, bool add, uint8_t cipher,
+    uint8_t key_id, const uint8_t *key, uint8_t key_len)
+{
+	struct mt7927_msg m;
+	uint16_t wcid = pairwise ? bss->peer_wcid : v->wcid;
+	uint8_t hdr[8];
+	uint8_t *t;
+	uint32_t status;
+	int rv;
+
+	if (key_len > 32)
+		return EINVAL;
+	hdr[0] = v->idx;
+	hdr[1] = wcid & 0xff;
+	hdr[2] = hdr[3] = 0;
+	hdr[4] = 1;						/* is_tlv_append */
+	hdr[5] = pairwise ? v->omac_idx : 0xe;			/* muar_idx */
+	hdr[6] = wcid >> 8;
+	hdr[7] = 0;
+	mt7927_msg_init(&m, hdr, sizeof(hdr));
+	t = mt7927_msg_tlv(&m, MT7927_STA_TAG_KEY_V3, 68);	/* sta_rec_sec_uni */
+	t[4] = add;
+	t[5] = pairwise;					/* tx_key */
+	t[6] = pairwise;					/* key_type */
+	t[7] = 0;						/* is_authenticator */
+	memcpy(t + 8, bss->bssid, 6);				/* peer_addr */
+	t[14] = v->idx;						/* bss_idx */
+	if (add) {
+		t[15] = cipher;
+		t[16] = key_id;
+		t[17] = key_len;
+		memcpy(t + 20, key, key_len);
+	}
+	t[18] = wcid & 0xff;					/* wlan_idx */
+	t[19] = 1;						/* mgmt_prot */
+	rv = mt7927_uni_send_status(b, MCU_UNI_CMD_STA_REC_UPDATE, &m, &status);
+	explicit_bzero(m.buf, sizeof(m.buf));
+	if (rv == 0 && status != 0)
+		rv = EIO;		/* not in the chip: stay in software */
+	MWX_DEV_LOG(b->sc, "MT7927 %s key id %u cipher %u %s on wcid %u -> %d (fw "
+	    "status 0x%x)\n", pairwise ? "pairwise" : "group", key_id, cipher,
+	    add ? "installed" : "removed", wcid, rv, status);
 	return rv;
 }
 
@@ -7734,6 +7829,7 @@ mt7927_tx_frame(struct mt7927_bringup *b, const struct mt7927_txinfo *ti,
 	w[2] = MT7927_TXD2_FRAME_TYPE((fc0 >> 2) & 3) |
 	    MT7927_TXD2_SUB_TYPE(fc0 >> 4);
 	w[3] = MT7927_TXD3_REM_TX_COUNT(15) |
+	    (ti->protect ? MT7927_TXD3_PROTECT_FRAME : 0) |
 	    (ti->multicast ? MT7927_TXD3_BCM | MT7927_TXD3_NO_ACK : 0) |
 	    (ti->fixed_rate ? MT7927_TXD3_BA_DISABLE : 0);
 	w[4] = 0;
@@ -8635,6 +8731,8 @@ mt7927_hal_stop(struct mwx_softc *sc)
 	}
 	mt7927_dev_add(sc->sc_7927, &v, false);
 	sc->sc_vif.band_idx = 0;
+	sc->sc_7927_hwkeys = 0;
+	sc->sc_7927_ptk_pending = false;
 }
 
 /* Passive scan of every channel in the net80211 table. */
@@ -8808,9 +8906,12 @@ mt7927_join_teardown(struct mwx_softc *sc, const char *why)
 	mt7927_vif_fill(sc, &v);
 	mt7927_roc_abort(sc->sc_7927, &v);
 	mt7927_sta_rec(sc->sc_7927, &v, &sc->sc_7927_bss, true, false, 0, false);
+	sc->sc_7927_bss.cipher = 0;
 	mt7927_bss_info(sc->sc_7927, &v, &sc->sc_7927_bss, false);
 	sc->sc_7927_joined = false;
 	sc->sc_7927_assoc = false;
+	sc->sc_7927_hwkeys = 0;
+	sc->sc_7927_ptk_pending = false;
 	MWX_DEV_LOG(sc, "MT7927 left %s (%s)\n",
 	    ether_sprintf(sc->sc_7927_bss.bssid), why);
 }
@@ -8836,6 +8937,16 @@ mt7927_join_prepare(struct mwx_softc *sc)
 	if (sc->sc_7927_joined) {
 		/* AUTH again on the same AP: keep the records, new ROC. */
 		mt7927_vif_fill(sc, &v);
+		/* the old keys go: the new association negotiates new ones */
+		if (sc->sc_7927_hwkeys & MT7927_HWKEY_PAIRWISE)
+			mt7927_sta_key(sc->sc_7927, &v, &sc->sc_7927_bss, true,
+			    false, 0, 0, NULL, 0);
+		if (sc->sc_7927_hwkeys & MT7927_HWKEY_GROUP)
+			mt7927_sta_key(sc->sc_7927, &v, &sc->sc_7927_bss, false,
+			    false, 0, 0, NULL, 0);
+		sc->sc_7927_hwkeys = 0;
+		sc->sc_7927_ptk_pending = false;
+		sc->sc_7927_bss.cipher = 0;
 		mt7927_roc_abort(sc->sc_7927, &v);
 		return mt7927_roc(sc->sc_7927, &v, bss.chan, bss.band,
 		    MT7927_ROC_JOIN_MS);
@@ -8966,6 +9077,7 @@ mt7927_join_poll(struct mwx_softc *sc)
 #define	MT7927_BA_RX_STOP	1
 #define	MT7927_BA_TX_START	2
 #define	MT7927_BA_TX_STOP	3
+#define	MT7927_KEY_SET		4
 
 static int
 mt7927_ba_queue(struct ieee80211com *ic, struct ieee80211_node *ni,
@@ -9071,9 +9183,15 @@ mt7927_ba_task(void *arg)
 		}
 		op = sc->sc_7927_baq[sc->sc_7927_baq_tail %
 		    nitems(sc->sc_7927_baq)];
+		explicit_bzero(sc->sc_7927_baq[sc->sc_7927_baq_tail %
+		    nitems(sc->sc_7927_baq)].key, sizeof(op.key));
 		sc->sc_7927_baq_tail++;
 		IOLockUnlock(sc->sc_7927_lock);
 
+		if (op.kind == MT7927_KEY_SET) {
+			mt7927_key_install(sc, &op);
+			continue;
+		}
 		/* the node may be gone already: only the current AP counts */
 		if (op.ni != ic->ic_bss || !sc->sc_7927_assoc ||
 		    !mt7927_engine_running(sc->sc_7927))
@@ -9130,17 +9248,115 @@ mt7927_hal_txroom(void *arg)
 #endif
 }
 
-/* Keys stay in software: net80211 encrypts TX and decrypts RX. */
+/* Data TX again after the pairwise key went to the chip (work loop). */
+static IOReturn
+mt7927_key_kick_action(OSObject *, void *arg0, void *, void *, void *)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg0;
+	struct ifnet *ifp = &sc->sc_ic.ic_if;
+
+	ifq_clr_oactive(&ifp->if_snd);
+	mwx_start(ifp);
+#ifdef __PRIVATE_SPI__
+	if (ifp->iface != NULL)
+		ifp->iface->signalOutputThread();
+#endif
+	return kIOReturnSuccess;
+}
+
+/*
+ * The task side of mt7927_set_key(): BSS_INFO with the cipher on the first
+ * key (as mt7925_set_link_key() does), then STA_REC_KEY_V3.
+ */
+static void
+mt7927_key_install(struct mwx_softc *sc, struct mt7927_ba_op *op)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	IOCommandGate *gate = gMwxHal != NULL ? gMwxHal->mwxGate() : NULL;
+	struct mt7927_vif v;
+	int rv = ENXIO;
+
+	if (op->ni == ic->ic_bss && sc->sc_7927_assoc &&
+	    mt7927_engine_running(sc->sc_7927)) {
+		mt7927_vif_fill(sc, &v);
+		rv = 0;
+		if (sc->sc_7927_bss.cipher != MT7927_CIPHER_AES_CCMP) {
+			sc->sc_7927_bss.cipher = MT7927_CIPHER_AES_CCMP;
+			rv = mt7927_bss_info(sc->sc_7927, &v, &sc->sc_7927_bss,
+			    true);
+		}
+		if (rv == 0)
+			rv = mt7927_sta_key(sc->sc_7927, &v, &sc->sc_7927_bss,
+			    op->key_pairwise, true, MT7927_CIPHER_AES_CCMP,
+			    op->key_id, op->key, op->key_len);
+	}
+	explicit_bzero(op->key, sizeof(op->key));
+	if (rv == 0) {
+		sc->sc_7927_hwkeys |= op->key_pairwise ?
+		    MT7927_HWKEY_PAIRWISE : MT7927_HWKEY_GROUP;
+	} else {
+		/* software keys stay set up: TX and RX fall back to them */
+		sc->sc_7927_hwkey_fail++;
+		if (op->key_pairwise)
+			sc->sc_7927_hwkeys &= ~MT7927_HWKEY_PAIRWISE;
+		MWX_DEV_LOG(sc, "MT7927 %s key id %u stays in software (%d)\n",
+		    op->key_pairwise ? "pairwise" : "group", op->key_id, rv);
+	}
+	if (op->key_pairwise) {
+		sc->sc_7927_ptk_pending = false;
+		if (gate != NULL)
+			gate->runAction(mt7927_key_kick_action, sc);
+	}
+}
+
+/*
+ * CCMP keys go to the chip (hardware encrypts TX, decrypts RX). net80211
+ * keeps its software context too: frames the chip did not decrypt are
+ * decrypted in software, and TX is encrypted in software until the chip
+ * has the pairwise key or if installing it fails. Data TX is held while
+ * the pairwise key is on its way, so no software PN gets ahead of the
+ * chip's.
+ */
 static int
 mt7927_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
     struct ieee80211_key *k)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+	bool pairwise = !(k->k_flags & IEEE80211_KEY_GROUP);
+	struct mt7927_ba_op *op;
+	bool queued = false;
 	int err = ieee80211_set_key(ic, ni, k);
 
-	MWX_DEV_LOG(sc, "MT7927 %s key id %d cipher %d (software) -> %d\n",
-	    (k->k_flags & IEEE80211_KEY_GROUP) ? "group" : "pairwise",
-	    k->k_id, k->k_cipher, err);
+	if (err == 0 && sc->sc_7927_hwcrypto &&
+	    k->k_cipher == IEEE80211_CIPHER_CCMP && k->k_len <= 32 &&
+	    ni == ic->ic_bss) {
+		IOLockLock(sc->sc_7927_lock);
+		if (sc->sc_7927_baq_head - sc->sc_7927_baq_tail <
+		    nitems(sc->sc_7927_baq)) {
+			op = &sc->sc_7927_baq[sc->sc_7927_baq_head %
+			    nitems(sc->sc_7927_baq)];
+			op->ni = ni;
+			op->tid = 0;
+			op->kind = MT7927_KEY_SET;
+			op->key_pairwise = pairwise;
+			op->key_id = (uint8_t)k->k_id;
+			op->key_len = (uint8_t)k->k_len;
+			memcpy(op->key, k->k_key, k->k_len);
+			if (pairwise) {
+				/* a new PTK: TX in software until the chip has it */
+				sc->sc_7927_hwkeys &= ~MT7927_HWKEY_PAIRWISE;
+				sc->sc_7927_ptk_pending = true;
+			}
+			sc->sc_7927_baq_head++;
+			queued = true;
+		}
+		IOLockUnlock(sc->sc_7927_lock);
+		if (queued)
+			task_add(sc->sc_nswq, &sc->sc_7927_ba_task);
+	}
+	MWX_DEV_LOG(sc, "MT7927 %s key id %d cipher %d -> %d (%s)\n",
+	    pairwise ? "pairwise" : "group", k->k_id, k->k_cipher, err,
+	    queued ? "to the chip" : "software");
 	return err;
 }
 
@@ -9172,6 +9388,7 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 	struct mbuf *m;
 	uint32_t len;
 	uint8_t type;
+	bool hwenc;
 	int rv;
 
 	for (;;) {
@@ -9180,7 +9397,8 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 			ni = (struct ieee80211_node *)mbuf_pkthdr_rcvif(m);
 		} else {
 			if (ic->ic_state != IEEE80211_S_RUN ||
-			    (ic->ic_xflags & IEEE80211_F_TX_MGMT_ONLY))
+			    (ic->ic_xflags & IEEE80211_F_TX_MGMT_ONLY) ||
+			    sc->sc_7927_ptk_pending)
 				break;
 			m = ifq_dequeue(&ifp->if_snd);
 			if (m == NULL)
@@ -9207,16 +9425,25 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 			continue;
 		}
 		wh = mtod(m, struct ieee80211_frame *);
+		hwenc = false;
 		if (wh->i_fc[1] & IEEE80211_FC1_PROTECTED) {
 			struct ieee80211_key *k = ieee80211_get_txkey(ic, wh, ni);
 
-			if ((m = ieee80211_encrypt(ic, m, k)) == NULL) {
+			if (k != NULL && ni != NULL && k == &ni->ni_pairwise_key &&
+			    k->k_cipher == IEEE80211_CIPHER_CCMP &&
+			    (sc->sc_7927_hwkeys & MT7927_HWKEY_PAIRWISE)) {
+				/* the chip adds the CCMP header and MIC */
+				hwenc = true;
+				sc->sc_7927_tx_hwenc++;
+			} else if ((m = ieee80211_encrypt(ic, m, k)) == NULL) {
 				if (ni != NULL)
 					ieee80211_release_node(ic, ni);
 				ifp->if_oerrors++;
 				sc->sc_7927_tx_encfail++;
 				continue;
 			}
+			if (!hwenc)
+				sc->sc_7927_tx_swenc++;
 			wh = mtod(m, struct ieee80211_frame *);
 		}
 #if NBPFILTER > 0
@@ -9237,6 +9464,7 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 		type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
 
 		memset(&ti, 0, sizeof(ti));
+		ti.protect = hwenc;
 		ti.hdrlen = (uint8_t)ieee80211_get_hdrlen(wh);
 		ti.multicast = IEEE80211_IS_MULTICAST(wh->i_addr1);
 		ti.omac_idx = sc->sc_vif.omac_idx;
@@ -9354,14 +9582,49 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		sc->sc_7927_rx_drop[0]++;
 		return -1;
 	}
-	m_adj(m, (int)ri.hdr_off);
 	rxi->rxi_chan = ri.chan;
 	rxi->rxi_rssi = ri.rssi;
+	if (ri.decrypted && ri.sec_mode == MT7927_CIPHER_AES_CCMP && ri.has_pn &&
+	    ri.hdr_off >= IEEE80211_CCMP_HDRLEN) {
+		/*
+		 * The hardware strips the CCMP header and MIC. Put the header
+		 * back (PN from RXD group 1, as mt76_insert_ccmp_hdr() does) so
+		 * net80211 picks the right group key by its ID, checks the PN
+		 * for replays and strips it again.
+		 */
+		uint8_t *wh0 = mtod(m, uint8_t *) + ri.hdr_off;
+		uint32_t hl = (uint32_t)ieee80211_get_hdrlen(
+		    (struct ieee80211_frame *)wh0);
+
+		if (hl <= ri.frame_len) {
+			uint8_t *nh = wh0 - IEEE80211_CCMP_HDRLEN, *iv;
+
+			memmove(nh, wh0, hl);
+			iv = nh + hl;
+			iv[0] = ri.pn[0];
+			iv[1] = ri.pn[1];
+			iv[2] = 0;
+			iv[3] = (uint8_t)(0x20 | (ri.key_id << 6));	/* ExtIV */
+			iv[4] = ri.pn[2];
+			iv[5] = ri.pn[3];
+			iv[6] = ri.pn[4];
+			iv[7] = ri.pn[5];
+			m_adj(m, (int)(ri.hdr_off - IEEE80211_CCMP_HDRLEN));
+			((struct ieee80211_frame *)nh)->i_fc[1] |=
+			    IEEE80211_FC1_PROTECTED;
+			rxi->rxi_flags |= IEEE80211_RXI_HWDEC;
+			sc->sc_7927_rx_hwdec++;
+			return 0;
+		}
+	}
+	m_adj(m, (int)ri.hdr_off);
 	if (ri.decrypted) {
 		struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
 
+		/* no PN to rebuild the header from: trust hardware replay checks */
 		rxi->rxi_flags |= IEEE80211_RXI_HWDEC;
 		wh->i_fc[1] &= ~IEEE80211_FC1_PROTECTED;
+		sc->sc_7927_rx_hwdec_nopn++;
 	}
 	return 0;
 }
@@ -9488,12 +9751,16 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		MWX_DEV_LOG(sc, "MT7927 tx: queued %u done %u free events %u "
 		    "no token %u reclaimed %u ring full %u encfail %u, oerrors %u; "
 		    "rx from bss: beacons %u mcast %u ucast %u, decrypt fail %u, "
-		    "ierrors %u\n",
+		    "ierrors %u; chip keys 0x%x: rx decrypted %u (no PN %u), "
+		    "tx hw %u sw %u, key failures %u\n",
 		    q, d, fe, nt, rc, rf, sc->sc_7927_tx_encfail,
 		    sc->sc_ic.ic_if.if_oerrors, sc->sc_7927_rx_bcn,
 		    sc->sc_7927_rx_mcast, sc->sc_7927_rx_ucast,
 		    (unsigned)sc->sc_ic.ic_stats.is_rx_wepfail,
-		    sc->sc_ic.ic_if.if_ierrors);
+		    sc->sc_ic.ic_if.if_ierrors, sc->sc_7927_hwkeys,
+		    sc->sc_7927_rx_hwdec, sc->sc_7927_rx_hwdec_nopn,
+		    sc->sc_7927_tx_hwenc, sc->sc_7927_tx_swenc,
+		    sc->sc_7927_hwkey_fail);
 	}
 	if (sc->sc_7927_poll % 30 == 1) {
 		mt7927_engine_counters(sc->sc_7927, &intr, &isr, &frames, &other,

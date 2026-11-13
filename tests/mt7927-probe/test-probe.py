@@ -92,10 +92,13 @@ struct Chip {
   std::vector<uint16_t> bss_tags; uint16_t bss_ntlv = 0; uint8_t bss_bssid[6] = {0}; int bss_conn_state = -1;
   uint8_t bss_phymode = 0, bss_rate_idx = 0, bss_rlm_ch = 0, bss_rlm_band = 0, bss_band = 0xff; uint16_t bss_basic_rate = 0;
   uint8_t bss_rlm_center = 0, bss_rlm_bw = 0xff, bss_rlm_sco = 0xff, bss_rlm_htop = 0xff;
+  uint8_t bss_sec_mode = 0xff, bss_sec_status = 0xff, bss_sec_cipher = 0xff;
   struct StaRec { uint16_t wcid; uint8_t muar; uint16_t ntlv; std::vector<uint16_t> tags; uint32_t conn_type; int conn_state;
                   uint16_t aid; uint8_t peer[6]; uint16_t extra; int state; uint16_t ra_legacy, basic_rate; uint8_t phy_type;
                   uint8_t ampdu, max_ampdu_len, vht_opmode; uint16_t ht_cap; uint32_t vht_cap; uint16_t vht_rx, vht_tx; uint8_t ht_mcs0;
-                  int ba_tid = -1, ba_type = -1, ba_en = -1, ba_amsdu = -1; uint16_t ba_ssn = 0, ba_win = 0; };
+                  int ba_tid = -1, ba_type = -1, ba_en = -1, ba_amsdu = -1; uint16_t ba_ssn = 0, ba_win = 0;
+                  int key_add = -1, key_tx = -1, key_type = -1; uint8_t key_peer[6] = {0}, key_bss = 0, key_cipher = 0,
+                  key_id = 0, key_len = 0, key_wlan = 0, key_mgmt = 0, key[32] = {0}; };
   std::vector<StaRec> sta_recs;
   int roc_acquired = 0, roc_aborted = 0; uint8_t roc_ch = 0, roc_band = 0, roc_token = 0, roc_type = 0xff; uint32_t roc_maxint = 0;
   bool roc_grant = true;
@@ -290,7 +293,8 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
           if (tg == 2) { assert(ln == 16); chip.bss_rlm_ch = pl[off + 4]; chip.bss_rlm_band = pl[off + 12];
                          chip.bss_rlm_center = pl[off + 5]; chip.bss_rlm_bw = pl[off + 7]; chip.bss_rlm_htop = pl[off + 10];
                          chip.bss_rlm_sco = pl[off + 11]; assert(pl[off + 8] == 2 && pl[off + 9] == 2); }
-          if (tg == 16) assert(ln == 8);
+          if (tg == 16) { assert(ln == 8); chip.bss_sec_mode = pl[off + 4]; chip.bss_sec_status = pl[off + 5];
+                          chip.bss_sec_cipher = pl[off + 6]; }
           if (tg == 15) assert(ln == 8);
           if (tg == 26) assert(ln == 20 && pl[off + 13] == 0xff);
           if (tg == 23) assert(ln == 20 && pl[off + 4] == 1);
@@ -316,6 +320,11 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
         if (tg == 6) { assert(ln == 16); sr.ba_tid = pl[off + 4]; sr.ba_type = pl[off + 5]; sr.ba_amsdu = pl[off + 6];
                        sr.ba_en = pl[off + 7]; memcpy(&sr.ba_ssn, pl + off + 8, 2); memcpy(&sr.ba_win, pl + off + 10, 2); }
         if (tg == 0x2b) { assert(ln == 8 && pl[off + 4] == 0 && pl[off + 5] == 1 && pl[off + 6] == 1); }
+        if (tg == 0x27) { assert(ln == 68); sr.key_add = pl[off + 4]; sr.key_tx = pl[off + 5]; sr.key_type = pl[off + 6];
+                          assert(pl[off + 7] == 0); memcpy(sr.key_peer, pl + off + 8, 6); sr.key_bss = pl[off + 14];
+                          sr.key_cipher = pl[off + 15]; sr.key_id = pl[off + 16]; sr.key_len = pl[off + 17];
+                          sr.key_wlan = pl[off + 18]; sr.key_mgmt = pl[off + 19]; memcpy(sr.key, pl + off + 20, 32);
+                          for (int k = 52; k < 68; k++) assert(pl[off + k] == 0); }
         if (tg == 0x25) assert(ln == 8);
         if (tg == 0x23) assert(ln == 4);
         off += ln; }
@@ -694,6 +703,11 @@ int main() {
     w32(12, 6u << 8); w32(8, 0x0004u << 16); w32(4, 0);                                    /* sec mode set, not CM/CLM */
     assert(mt7927_rx_parse(f.data(), f.size(), 3, &ri) == 0 && ri.band == 2 && ri.chan == 6 && ri.decrypted);
     w32(4, 1u << 23); assert(mt7927_rx_parse(f.data(), f.size(), 3, &ri) == 0 && !ri.decrypted);
+    /* phase 4c.2: group 1 carries the PN (PN0 first), RXD1 bits 21-22 the key ID */
+    w32(4, (1u << 16) | (2u << 21)); for (int k = 0; k < 6; k++) f[32 + k] = (uint8_t)(0x10 + k);
+    assert(mt7927_rx_parse(f.data(), f.size(), 3, &ri) == 0 && ri.decrypted && ri.has_pn && ri.key_id == 2 &&
+           ri.sec_mode == 4 && ri.pn[0] == 0x10 && ri.pn[5] == 0x15 && ri.hdr_off == 48);
+    w32(4, 0); assert(mt7927_rx_parse(f.data(), f.size(), 3, &ri) == 0 && !ri.has_pn && ri.hdr_off == 32);
     std::vector<uint8_t> ev = {0,0,0,0, 2,0,8,0, 0,0,0,0, 0,0,8,0, 0,0,0,0};
     assert(mt7927_scan_event_done(ev.data(), ev.size()));
     ev[12] = 3; assert(!mt7927_scan_event_done(ev.data(), ev.size()));
@@ -846,6 +860,38 @@ int main() {
       assert(bc.wcid == MT7927_WTBL_RESERVED && bc.muar == 0xe && bc.conn_type == 0x10020 && bc.tags.size() == 2 &&
              bc.tags[0] == 0 && bc.tags[1] == 0x2b && bc.aid == 5);
     }
+    /* phase 4c.2: CCMP keys in the chip */
+    assert(chip.bss_sec_mode == 0 && chip.bss_sec_status == 1 && chip.bss_sec_cipher == 0);     /* open until a key */
+    bss.cipher = 4;
+    assert(mt7927_bss_info(&r->b, &v, &bss, true) == 0 && chip.bss_sec_mode == 7 && chip.bss_sec_status == 6 &&
+           chip.bss_sec_cipher == 4);
+    {
+      uint8_t ptk[16], gtk[16];
+      for (int k = 0; k < 16; k++) { ptk[k] = (uint8_t)(0xa0 + k); gtk[k] = (uint8_t)(0x30 + k); }
+      assert(mt7927_sta_key(&r->b, &v, &bss, true, true, 4, 0, ptk, 16) == 0);
+      const Chip::StaRec &pk = chip.sta_recs.back();
+      assert(pk.wcid == 1 && pk.muar == v.omac_idx && pk.tags.size() == 1 && pk.tags[0] == 0x27 && pk.key_add == 1 &&
+             pk.key_tx == 1 && pk.key_type == 1 && pk.key_cipher == 4 && pk.key_id == 0 && pk.key_len == 16 &&
+             pk.key_wlan == 1 && pk.key_mgmt == 1 && pk.key_bss == v.idx && memcmp(pk.key_peer, ap, 6) == 0 &&
+             memcmp(pk.key, ptk, 16) == 0 && pk.key[16] == 0);
+      assert(mt7927_sta_key(&r->b, &v, &bss, false, true, 4, 1, gtk, 16) == 0);
+      const Chip::StaRec &gk = chip.sta_recs.back();
+      assert(gk.wcid == MT7927_WTBL_RESERVED && gk.muar == 0xe && gk.key_add == 1 && gk.key_tx == 0 && gk.key_type == 0 &&
+             gk.key_id == 1 && gk.key_wlan == (MT7927_WTBL_RESERVED & 0xff) && memcmp(gk.key, gtk, 16) == 0 &&
+             memcmp(gk.key_peer, ap, 6) == 0);
+      assert(mt7927_sta_key(&r->b, &v, &bss, true, false, 0, 0, NULL, 0) == 0);
+      const Chip::StaRec &rk = chip.sta_recs.back();
+      assert(rk.key_add == 0 && rk.key_cipher == 0 && rk.key_len == 0 && rk.key[0] == 0 && rk.wcid == 1);
+      assert(mt7927_sta_key(&r->b, &v, &bss, true, true, 4, 0, ptk, 33) == EINVAL);
+    }
+    /* hardware encryption: TXD3 PROTECT_FRAME, the frame goes out as given (protected bit set) */
+    data[1] |= 0x40; ti.protect = true;
+    assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0);
+    assert((chip.txf.back().txd[3] & 2) && chip.txf.back().frame.size() == sizeof data &&
+           chip.txf.back().frame[1] == data[1]);
+    ti.protect = false; data[1] &= ~0x40;
+    assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0 && !(chip.txf.back().txd[3] & 2));
+    bss.cipher = 0;
     /* leave: ROC abort, STA_REC remove, BSS_INFO without RLM */
     assert(mt7927_roc_abort(&r->b, &v) == 0 && chip.roc_aborted == 1 && !r->b.roc_active);
     assert(mt7927_roc_abort(&r->b, &v) == 0 && chip.roc_aborted == 1);
