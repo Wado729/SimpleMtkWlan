@@ -253,6 +253,11 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
             if (ic->ic_channels[channel].ic_flags &&
                 AirportWCL::scanChannelSelected(scan.channels, true, channel))
                 usable = true;
+        // 6 GHz channels: the driver scans them apart from net80211's table
+        if (ic->ic_6ghz_channels)
+            for (unsigned i = 0; i < sizeof(scan.channels6g); ++i)
+                if (scan.channels6g[i])
+                    usable = true;
         if (!usable)
             return kIOReturnUnsupported;
     }
@@ -267,6 +272,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     memcpy(ic->ic_wcl_scan_ssid, scan.ssid, sizeof(scan.ssid));
     ic->ic_wcl_scan_restricted = scan.channelCount != 0;
     memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
+    memcpy(ic->ic_wcl_scan_channels6g, scan.channels6g, sizeof(scan.channels6g));
     scanSource->setTimeoutMS(20000);
     if (ic->ic_state == IEEE80211_S_RUN) {
         ieee80211_begin_cache_bgscan(&ic->ic_if);
@@ -1104,6 +1110,16 @@ IOReturn AirportItlwmSkywalkInterface::getWCL_CHANNELS_INFO(apple80211ChannelInf
             entry.flags |= 2;
         if (channel->ic_flags & IEEE80211_CHAN_PASSIVE)
             entry.flags |= 4;
+    }
+    /* Phase 4e.3: the 6 GHz channels the driver scans (passive: NO_IR) */
+    if (ic->ic_6ghz_channels) {
+        for (unsigned c6 = 1; c6 <= 233 && info->count < 400; c6 += 4) {
+            auto &entry = info->channels[info->count++];
+            entry.channel = uint8_t(c6);
+            entry.channelSpec = uint16_t(c6 | 0x5000);
+            entry.flags |= 4;
+        }
+        info->supports6GHz = 1;
     }
     apple80211_country_code_data country = {};
     if (instance->getCOUNTRY_CODE(static_cast<OSObject *>(this), &country) == kIOReturnSuccess)

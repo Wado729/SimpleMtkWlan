@@ -227,7 +227,15 @@ struct NativeChannelInfo {
     uint8_t reserved1[2];
     uint32_t firmwareChannelSpec[400];
     uint32_t channelBitmap[400];
-    uint8_t reserved2[0x2720 - 0x1910];
+    uint8_t reserved2[400];
+    /*
+     * Phase 4e.3: IO80211 works out each channel's band itself and only
+     * reads this byte to override it: zero gives 5 GHz for any channel above
+     * 14, non-zero gives 6 GHz.  Without it every 6 GHz channel we publish
+     * is taken for 5 GHz.  (Found in Ersiter's Eric-AirportItlwm, GPL-2.)
+     */
+    uint8_t sixGHz[400];
+    uint8_t reserved3[0x2720 - 0x1c30];
 };
 static_assert(sizeof(NativeChannelInfo) == 0x2720, "CHANNELS_INFO native size");
 static_assert(offsetof(NativeChannelInfo, country) == 8, "CHANNELS_INFO country");
@@ -241,6 +249,7 @@ static_assert(offsetof(NativeChannelInfo, supports40MHz) == 0x96e, "CHANNELS_INF
 static_assert(offsetof(NativeChannelInfo, supports80MHz) == 0xafe, "CHANNELS_INFO 80 MHz");
 static_assert(offsetof(NativeChannelInfo, firmwareChannelSpec) == 0xc90, "CHANNELS_INFO firmware chanspec");
 static_assert(offsetof(NativeChannelInfo, channelBitmap) == 0x12d0, "CHANNELS_INFO bitmap");
+static_assert(offsetof(NativeChannelInfo, sixGHz) == 0x1aa0, "CHANNELS_INFO 6 GHz flag");
 
 inline bool appendChannel(NativeChannelInfo &info, unsigned channel, bool fiveGHz,
                           bool dfs, bool passive, bool supports40MHz, bool supports80MHz)
@@ -277,7 +286,9 @@ inline bool append6GHzChannel(NativeChannelInfo &info, unsigned channel)
     info.passive[index] = 1;
     info.supports40MHz[index] = 1;
     info.supports80MHz[index] = 1;
-    info.channelBitmap[index] = 3U | 32U;
+    info.sixGHz[index] = 1;
+    /* valid HW|SW, passive, WL_CHAN_BAND_6G (0x200, Broadcom wlioctl_defs.h) */
+    info.channelBitmap[index] = 3U | 32U | 0x200U;
     return true;
 }
 
@@ -474,6 +485,7 @@ struct ScanRequest {
     uint8_t bssid[6];
     uint32_t channelCount;
     uint8_t channels[32];
+    uint8_t channels6g[30];     // 6 GHz channels (flag 0x2000), 1-233
 };
 
 inline bool scanChannelSelected(const uint8_t *channels, bool restricted, unsigned channel) {
@@ -500,8 +512,13 @@ inline bool decodeScan(const void *buffer, size_t length, ScanRequest &out) {
     for (uint32_t i = 0; i < count; ++i) {
         const uint8_t *entry = p + 0x58 + size_t(i) * 12;
         uint32_t channel = read32(entry + 4), flags = read32(entry + 8);
-        // Do not confuse 6 GHz channel numbers with overlapping 2.4 GHz ones.
-        if (!channel || channel > 196 || (flags & 0x2000))
+        // 6 GHz channel numbers overlap 2.4/5 GHz ones: kept apart.
+        if (flags & 0x2000) {
+            if (channel && channel <= 233)
+                out.channels6g[channel / 8] |= 1U << (channel % 8);
+            continue;
+        }
+        if (!channel || channel > 196)
             continue;
         if (((flags & 0x8) && channel > 14) || ((flags & 0x10) && channel <= 14))
             continue;

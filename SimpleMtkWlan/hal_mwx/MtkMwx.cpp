@@ -602,9 +602,11 @@ struct mwx_softc {
 	uint32_t		sc_7927_rx_drop[8];
 	/* phase 4e.1: 6 GHz scanning (heard, not yet given to net80211) */
 	bool			sc_7927_scan6g;		/* off: -mtk7927no6g */
+	bool			sc_7927_nobgscan;	/* -mtk7927nobgscan */
 	uint32_t		sc_7927_rx_6g;		/* 6 GHz frames received */
 	uint8_t			sc_7927_6g_bssid[32][6];
 	uint32_t		sc_7927_6g_n;
+	uint32_t		sc_7927_bgscans, sc_7927_bgscan_busy;	/* phase 4e.3 */
 	/* phase 4b: join */
 	bool			sc_7927_joined;		/* BSS_INFO + STA_REC set */
 	bool			sc_7927_assoc;
@@ -1758,8 +1760,51 @@ mwx_bgscan(struct ieee80211com *ic)
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
 	int err;
 
-	if (sc->sc_hwtype == MWX_HW_MT7927)
-		return EBUSY;	/* phase 4b: no scans while associated */
+	if (sc->sc_hwtype == MWX_HW_MT7927) {
+		/*
+		 * Phase 4e.3: scans while associated, as Linux mt7925 does
+		 * them (split scan: the firmware returns to the home channel).
+		 * macOS's channel subsets go straight through; a full sweep
+		 * (no channel list) at most every 2 minutes.
+		 */
+		static uint64_t last_full_ns, last_ns;
+		uint64_t now_ns, min_ns = 120ULL * 1000000000ULL;
+
+		if (sc->sc_7927_nobgscan)
+			return EBUSY;	/* as before phase 4e.3 */
+		if (sc->sc_flags & MWX_FLAG_SCANNING) {
+			sc->sc_7927_bgscan_busy++;
+			return EBUSY;
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+#ifdef AIRPORT_WCL
+		/* macOS's few-channel subsets: at most one per 10 s (as MT7922) */
+		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted) {
+			if (last_ns != 0 &&
+			    now_ns - last_ns < 10ULL * 1000000000ULL) {
+				sc->sc_7927_bgscan_busy++;
+				return EBUSY;
+			}
+			min_ns = 0;
+		}
+#endif
+		if (min_ns != 0) {
+			if (last_full_ns != 0 && now_ns - last_full_ns < min_ns) {
+				sc->sc_7927_bgscan_busy++;
+				return EBUSY;
+			}
+			last_full_ns = now_ns;
+		}
+		err = mt7927_hal_scan(sc);
+		if (err != 0) {
+			sc->sc_7927_bgscan_busy++;
+			return err;
+		}
+		last_ns = now_ns;
+		sc->sc_flags |= MWX_FLAG_BGSCAN;
+		sc->sc_7927_bgscans++;
+		return 0;
+	}
 	if (sc->sc_flags & MWX_FLAG_SCANNING)
 		return 0;
 
@@ -9330,6 +9375,12 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 		sc->sc_7927_scan6g = !PE_parse_boot_argn("-mtk7927no6g",
 		    &off, sizeof(off));
 		sc->sc_ic.ic_6ghz_channels = sc->sc_7927_scan6g;
+		{
+			char nb[8];
+
+			sc->sc_7927_nobgscan = PE_parse_boot_argn(
+			    "-mtk7927nobgscan", nb, sizeof(nb));
+		}
 	}
 	mt7927_engine_set_rx_decap(sc->sc_7927, sc->sc_7927_rx_decap);
 	timeout_set(&sc->sc_7927_reorder_to, mt7927_reorder_timeo, sc);
@@ -9568,13 +9619,34 @@ mt7927_hal_scan(struct mwx_softc *sc)
 	struct mt7927_scan_chan ch[64];
 	struct mt7927_vif v;
 	int n = 0, rv;
+	bool restricted;
 
 	if (!mt7927_engine_running(sc->sc_7927))
 		return ENXIO;
+	/*
+	 * Phase 4e.3: associated, macOS scans a few channels at a time (its
+	 * channel subsets): only those, so the radio is off the home channel
+	 * briefly (the firmware's split scan goes back in between).
+	 */
+#ifdef AIRPORT_WCL
+	restricted = ic->ic_state == IEEE80211_S_RUN &&
+	    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted;
+#else
+	restricted = false;
+#endif
 	for (c = &ic->ic_channels[1];
 	    c <= &ic->ic_channels[IEEE80211_CHAN_MAX] && n < 64; c++) {
+		unsigned num = (unsigned)(c - ic->ic_channels);
+
 		if (c->ic_flags == 0)
 			continue;
+#ifdef AIRPORT_WCL
+		if (restricted && !(ic->ic_wcl_scan_channels[num / 8] &
+		    (1U << (num % 8))))
+			continue;
+#else
+		(void)num;
+#endif
 		ch[n].band = IEEE80211_IS_CHAN_2GHZ(c) ? 1 : 2;
 		ch[n].chan = (uint8_t)ieee80211_mhz2ieee(c->ic_freq, 0);
 		n++;
@@ -9584,7 +9656,7 @@ mt7927_hal_scan(struct mwx_softc *sc)
 	 * which cfg80211 scans when nothing points elsewhere; passive, as the
 	 * channel domain marks 6 GHz NO_IR. -mtk7927no6g leaves them out.
 	 */
-	if (sc->sc_7927_scan6g) {
+	if (sc->sc_7927_scan6g && !restricted) {
 		int psc;
 
 		for (psc = 5; psc <= 229 && n < 64; psc += 16) {
@@ -9593,6 +9665,20 @@ mt7927_hal_scan(struct mwx_softc *sc)
 			n++;
 		}
 	}
+#ifdef AIRPORT_WCL
+	else if (sc->sc_7927_scan6g) {
+		int c6;
+
+		for (c6 = 1; c6 <= 233 && n < 64; c6++)
+			if (ic->ic_wcl_scan_channels6g[c6 / 8] & (1U << (c6 % 8))) {
+				ch[n].band = 3;
+				ch[n].chan = (uint8_t)c6;
+				n++;
+			}
+	}
+#endif
+	if (n == 0)
+		return EINVAL;
 	mt7927_vif_fill(sc, &v);
 	{
 		/* probe-request IEs as net80211 builds them (rates, HT, VHT) */
@@ -11519,14 +11605,15 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		MWX_DEV_LOG(sc, "MT7927 poll: intr %u isr %u rx frames %u "
 		    "(net80211 %u, dropped ch %u short %u fcs %u icv %u trans %u) "
 		    "other %u events %u timeouts %u scans %u state %d; 6 GHz "
-		    "frames %u, networks %u\n", intr,
+		    "frames %u, networks %u; associated scans %u (refused %u)\n", intr,
 		    isr, frames, sc->sc_rx_delivered, sc->sc_7927_rx_drop[0],
 		    sc->sc_7927_rx_drop[MT7927_RX_SHORT],
 		    sc->sc_7927_rx_drop[MT7927_RX_FCS_ERR],
 		    sc->sc_7927_rx_drop[MT7927_RX_ICV_ERR],
 		    sc->sc_7927_rx_drop[MT7927_RX_HDR_TRANS], other, events,
 		    timeouts, sc->sc_scan_done_count, sc->sc_ic.ic_state,
-		    sc->sc_7927_rx_6g, sc->sc_7927_6g_n);
+		    sc->sc_7927_rx_6g, sc->sc_7927_6g_n, sc->sc_7927_bgscans,
+		    sc->sc_7927_bgscan_busy);
 		mt7927_publish(sc->sc_tag, "MT7927RxFrames", frames);
 		mt7927_publish(sc->sc_tag, "MT7927MCUTimeouts", timeouts);
 		mt7927_engine_log_diag(sc->sc_7927);
@@ -14868,7 +14955,13 @@ const char *
 MtkMwx::getFirmwareCountryCode()
 {
 	static char alpha2[3] = "00";
-	if (com != NULL) {
+	if (com != NULL && com->sc_hwtype == MWX_HW_MT7927 &&
+	    com->sc_7927 != NULL) {
+		/* the country the MT7927 firmware runs (mtk7927cc), not "00" */
+		alpha2[0] = com->sc_7927->alpha2[0] ? com->sc_7927->alpha2[0] : '0';
+		alpha2[1] = com->sc_7927->alpha2[1] ? com->sc_7927->alpha2[1] : '0';
+		alpha2[2] = '\0';
+	} else if (com != NULL) {
 		alpha2[0] = com->sc_alpha2[0];
 		alpha2[1] = com->sc_alpha2[1];
 		alpha2[2] = '\0';
