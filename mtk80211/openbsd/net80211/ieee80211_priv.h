@@ -153,4 +153,28 @@ struct ieee80211_rsnparams {
 	(p)[1] = (v) >>  8; (p)[0] = (v);	\
 } while (0)
 
+/* SAE (WPA3-Personal): net80211/ieee80211_sae.c */
+int ieee80211_sae_derive_password_elem(uint8_t *, const uint8_t *,
+	const uint8_t *, const uint8_t *);
+#ifdef IEEE80211_SAE_HNP_COMPAT
+int ieee80211_sae_derive_password_elem_hnp(uint8_t *, const uint8_t *,
+	size_t, const uint8_t *, const uint8_t *);
+#endif
+int ieee80211_sae_password_to_pt(uint8_t *, const uint8_t *, size_t,
+	const uint8_t *, size_t);
+int ieee80211_sae_derive_commit_elem(uint8_t *, uint8_t *, uint8_t *,
+	uint8_t *, const uint8_t *);
+uint16_t ieee80211_sae_verify_commit_elem(const uint8_t **,
+	const uint8_t **, const uint8_t **, const uint8_t *, size_t,
+	const unsigned char *, const unsigned char *, const unsigned char *);
+uint16_t ieee80211_sae_derive_shared_secret(uint8_t *, const uint8_t *,
+	const uint8_t *, const uint8_t *, const uint8_t *, const uint8_t *);
+int ieee80211_sae_derive_secret_keys(uint8_t *, uint8_t *, uint8_t *,
+	const uint8_t *, const uint8_t *, const uint8_t *);
+int ieee80211_sae_verify_confirm(const uint8_t *, size_t, const uint8_t *,
+	const uint8_t *, const uint8_t *, const uint8_t *, const uint8_t *,
+	const uint8_t *, const uint8_t *);
+void ieee80211_kdf(const u_int8_t *, size_t, const u_int8_t *, size_t,
+	const u_int8_t *, size_t, u_int8_t *, size_t);
+
 #endif /* _NET80211_IEEE80211_PRIV_H_ */

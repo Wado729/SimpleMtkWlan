@@ -1242,6 +1242,18 @@ struct ieee80211_ptk {
 } __packed;
 
 #define IEEE80211_PMKID_LEN	16
+
+/* SAE (WPA3-Personal), group 19 (P-256) only: Eric-AirportItlwm / OpenBSD */
+#define IEEE80211_SAE_CURVE_ID_P256	19
+#define IEEE80211_SAE_MAX_ECC_PRIME_LEN 32
+#define IEEE80211_SAE_COMMIT_MIN_LEN	(2 + (3 * IEEE80211_SAE_MAX_ECC_PRIME_LEN))
+#define IEEE80211_SAE_CONFIRM_MIN_LEN	(2 + 32)
+#define IEEE80211_SAE_TOKEN_MAX_LEN	255
+#define IEEE80211_SAE_H2E_TOKEN_MAX_LEN 254
+#ifndef IEEE80211_STATUS_BAD_FC_GROUP
+#define IEEE80211_STATUS_BAD_FC_GROUP	77	/* finite cyclic group not supported */
+#endif
+#define IEEE80211_SAE_HNP_COMPAT	1	/* hunting-and-pecking for non-H2E APs */
 #define IEEE80211_SMKID_LEN	16
 
 /*

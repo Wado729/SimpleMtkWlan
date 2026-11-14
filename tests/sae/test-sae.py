@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""SAE (WPA3-Personal) crypto against IEEE Std 802.11-2020 Annex J.10.
+
+Compiles the driver's own net80211/ieee80211_sae.c, crypto/i31.c,
+crypto/ec_p256_m31.c, sha2/hmac/md5/sha1 and ieee80211_kdf (extracted from
+ieee80211_crypto.c) with clang++ + ASan/UBSan and checks: H2E PT -> PWE,
+hunting-and-pecking commit (scalar and element, with the vector's rand and
+mask fed through arc4random_buf), peer commit, shared secret, KCK, PMK,
+PMKID, and that a reflected commit is refused. Vectors as in hostap
+src/common/common_module_tests.c sae_tests().
+"""
+import os, re, subprocess, sys, tempfile, pathlib
+root = pathlib.Path(__file__).resolve().parents[2]
+ob = root / "mtk80211" / "openbsd"
+d = pathlib.Path(tempfile.mkdtemp(prefix="mtk-sae-"))
+inc = d / "inc"
+for sub in ("sys", "net", "net80211", "crypto"):
+    (inc / sub).mkdir(parents=True)
+FILES = {
+ "sys/types.h": '#pragma once\n#include_next <sys/types.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n#include <stdio.h>\n#include <stdlib.h>\ntypedef uint8_t u_int8_t; typedef uint16_t u_int16_t; typedef uint32_t u_int32_t; typedef uint64_t u_int64_t;\nstatic inline void explicit_bzero_shim(void *p, size_t n){ volatile unsigned char *q=(volatile unsigned char*)p; while(n--) *q++=0; }\n#define explicit_bzero explicit_bzero_shim\nstatic inline int timingsafe_bcmp(const void *a, const void *b, size_t n){ const unsigned char *x=(const unsigned char*)a,*y=(const unsigned char*)b; unsigned r=0; while(n--) r|=*x++^*y++; return r!=0; }\nextern void arc4random_buf_shim(void *, size_t);\n#define arc4random_buf arc4random_buf_shim\n',
+ "sys/_endian.h": '#pragma once\n#include <sys/types.h>\n#include <endian.h>\n#define htobe32_x htobe32\n#define _OSSwapInt64(x) __builtin_bswap64(x)\n#define _OSSwapInt32(x) __builtin_bswap32(x)\n',
+ "net80211/ieee80211_var.h": '#pragma once\n#include <sys/types.h>\n#define IEEE80211_SAE_CURVE_ID_P256\t19\n#define IEEE80211_SAE_MAX_ECC_PRIME_LEN 32\n#define IEEE80211_SAE_COMMIT_MIN_LEN\t(2 + (3 * IEEE80211_SAE_MAX_ECC_PRIME_LEN))\n#define IEEE80211_SAE_CONFIRM_MIN_LEN\t(2 + 32)\n#define IEEE80211_SAE_HNP_COMPAT 1\n#define DPRINTF(x)\n#define IEEE80211_STATUS_SUCCESS 0\n#define IEEE80211_STATUS_UNSPECIFIED 1\n#define IEEE80211_STATUS_UNSUPP_GROUP 77\n#define IEEE80211_STATUS_UNSPECIFIED_FAILURE 1\n#define IEEE80211_STATUS_BAD_FC_GROUP 77\n#define _KASSERT(x)\n#define IEEE80211_ADDR_LEN 6\n#define IEEE80211_PMK_LEN 32\n#define IEEE80211_PMKID_LEN 16\n#define LE_READ_2(p) ((uint16_t)((const uint8_t *)(p))[0] | ((uint16_t)((const uint8_t *)(p))[1] << 8))\n#include <crypto/md5.h>\n#include <crypto/sha1.h>\n#include <crypto/sha2.h>\n#include <crypto/hmac.h>\nvoid ieee80211_kdf(const u_int8_t *, size_t, const u_int8_t *, size_t, const u_int8_t *, size_t, u_int8_t *, size_t);\n',
+ "net80211/ieee80211_crypto.h": "#pragma once\n",
+ "net/if.h": "#pragma once\n",
+ "crypto/types.h": "#pragma once\n#include <sys/types.h>\ntypedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;\n",
+}
+for h in ("param", "systm", "mbuf", "endian", "time"):
+    FILES["sys/%s.h" % h] = "#pragma once\n#include <sys/types.h>\n"
+for k, v in FILES.items():
+    (inc / k).write_text(v)
+# the driver's SAE prototypes, from its own ieee80211_priv.h
+priv = (ob / "net80211" / "ieee80211_priv.h").read_text()
+m = re.search(r"/\* SAE \(WPA3-Personal\).*?\n\n", priv, re.S)
+(inc / "net80211" / "ieee80211_priv.h").write_text("#pragma once\n#include <sys/types.h>\n#define IEEE80211_SAE_HNP_COMPAT 1\n" + m.group(0))
+for h in ("sha2.h", "hmac.h", "md5.h", "sha1.h", "i31.h", "ec_p256_m31.h"):
+    (inc / "crypto" / h).write_text((ob / "crypto" / h).read_text())
+crypto = (ob / "net80211" / "ieee80211_crypto.c").read_text()
+k = re.search(r"\nvoid\nieee80211_kdf\(.*?\n\}\n", crypto, re.S)
+(d / "kdf.cpp").write_text("#include <net80211/ieee80211_var.h>\n#define NBBY 8\n" + k.group(0))
+(d / "vectors.h").write_text('static const uint8_t v_addr1[6] = {0x4d,0x3f,0x2f,0xff,0xe3,0x87};\nstatic const uint8_t v_addr2[6] = {0xa5,0xd8,0xaa,0x95,0x8e,0x3c};\nstatic const uint8_t v_local_rand[32] = {0x99,0x24,0x65,0xfd,0x3d,0xaa,0x3c,0x60,0xaa,0x65,0x65,0xb7,0xf6,0x2a,0x2a,0x7f,0x2e,0x12,0xdd,0x12,0xf1,0x98,0xfa,0xf4,0xfb,0xed,0x89,0xd7,0xff,0x1a,0xce,0x94};\nstatic const uint8_t v_local_mask[32] = {0x95,0x07,0xa9,0x0f,0x77,0x7a,0x04,0x4d,0x6a,0x08,0x30,0xb9,0x1e,0xa3,0xd5,0xdd,0x70,0xbe,0xce,0x44,0xe1,0xac,0xff,0xb8,0x69,0x83,0xb5,0xe1,0xbf,0x9f,0xb3,0x22};\nstatic const uint8_t v_local_commit[98] = {0x13,0x00,0x2e,0x2c,0x0f,0x0d,0xb5,0x24,0x40,0xad,0x14,0x6d,0x96,0x71,0x14,0xce,0x00,0x5c,0xe1,0xea,0xb0,0xaa,0x2c,0x2e,0x5c,0x28,0x71,0xb7,0x74,0xf6,0xc2,0x57,0x5c,0x65,0xd5,0xad,0x9e,0x00,0x82,0x97,0x07,0xaa,0x36,0xba,0x8b,0x85,0x97,0x38,0xfc,0x96,0x1d,0x08,0x24,0x35,0x05,0xf4,0x7c,0x03,0x53,0x76,0xd7,0xac,0x4b,0xc8,0xd7,0xb9,0x50,0x83,0xbf,0x43,0x82,0x7d,0x0f,0xc3,0x1e,0xd7,0x78,0xdd,0x36,0x71,0xfd,0x21,0xa4,0x6d,0x10,0x91,0xd6,0x4b,0x6f,0x9a,0x1e,0x12,0x72,0x62,0x13,0x25,0xdb,0xe1};\nstatic const uint8_t v_peer_commit[98] = {0x13,0x00,0x59,0x1b,0x96,0xf3,0x39,0x7f,0xb9,0x45,0x10,0x08,0x48,0xe7,0xb5,0x50,0x54,0x3b,0x67,0x20,0xd8,0x83,0x37,0xee,0x93,0xfc,0x49,0xfd,0x6d,0xf7,0xe0,0x8b,0x52,0x23,0xe7,0x1b,0x9b,0xb0,0x48,0xd3,0x87,0x3f,0x20,0x55,0x69,0x53,0xa9,0x6c,0x91,0x53,0x6f,0xd8,0xee,0x6c,0xa9,0xb4,0xa6,0x8a,0x14,0x8b,0x05,0x6a,0x90,0x9b,0xe0,0x3e,0x83,0xae,0x20,0x8f,0x60,0xf8,0xef,0x55,0x37,0x85,0x80,0x74,0xdb,0x06,0x68,0x70,0x32,0x39,0x98,0x62,0x99,0x9b,0x51,0x1e,0x0a,0x15,0x52,0xa5,0xfe,0xa3,0x17,0xc2};\nstatic const uint8_t v_kck[32] = {0x1e,0x73,0x3f,0x6d,0x9b,0xd5,0x32,0x56,0x28,0x73,0x04,0x33,0x88,0x31,0xb0,0x9a,0x39,0x40,0x6d,0x12,0x10,0x17,0x07,0x3a,0x5c,0x30,0xdb,0x36,0xf3,0x6c,0xb8,0x1a};\nstatic const uint8_t v_pmk[32] = {0x4e,0x4d,0xfa,0xb1,0xa2,0xdd,0x8a,0xc1,0xa9,0x17,0x90,0xf9,0x53,0xfa,0xaa,0x45,0x2a,0xe5,0xc6,0x87,0x3a,0xb7,0x5b,0x63,0x60,0x5b,0xa6,0x63,0xf8,0xa7,0xfe,0x59};\nstatic const uint8_t v_pmkid[16] = {0x87,0x47,0xa6,0x00,0xee,0xa3,0xf9,0xf2,0x24,0x75,0xdf,0x58,0xca,0x1e,0x54,0x98};\nstatic const uint8_t v_pwe_19_x[32] = {0xc9,0x30,0x49,0xb9,0xe6,0x40,0x00,0xf8,0x48,0x20,0x16,0x49,0xe9,0x99,0xf2,0xb5,0xc2,0x2d,0xea,0x69,0xb5,0x63,0x2c,0x9d,0xf4,0xd6,0x33,0xb8,0xaa,0x1f,0x6c,0x1e};\nstatic const uint8_t v_pwe_19_y[32] = {0x73,0x63,0x4e,0x94,0xb5,0x3d,0x82,0xe7,0x38,0x3a,0x8d,0x25,0x81,0x99,0xd9,0xdc,0x1a,0x5e,0xe8,0x26,0x9d,0x06,0x03,0x82,0xcc,0xbf,0x33,0xe6,0x14,0xff,0x59,0xa0};\nstatic const uint8_t v_addr1b[6] = {0x00,0x09,0x5b,0x66,0xec,0x1e};\nstatic const uint8_t v_addr2b[6] = {0x00,0x0b,0x6b,0xd9,0x02,0x46};\n')
+(d / "test.cpp").write_text('#include <sys/types.h>\n#include <net80211/ieee80211_var.h>\n#include <net80211/ieee80211_priv.h>\n#include "vectors.h"\nstatic const uint8_t *rq[4]; static int rqn, rqi;\nvoid arc4random_buf_shim(void *p, size_t n){ if (rqi<rqn && n==32){ memcpy(p,rq[rqi++],32);} else { for(size_t i=0;i<n;i++) ((uint8_t*)p)[i]=rand(); } }\nstatic int fails=0;\nstatic void chk(const char *n, const uint8_t *a, const uint8_t *b, size_t l){ int ok=!memcmp(a,b,l); printf("%-34s %s\\n",n,ok?"PASS":"FAIL"); if(!ok){fails++; for(size_t i=0;i<l;i++)printf("%02x",a[i]); printf("\\n");} }\nint main(){\n  uint8_t pt[64], pwe[64], exp[64];\n  /* H2E: PT from password||identifier (hostap sae_derive_pt), then PWE */\n  const char *pw="mekmitasdigoat", *ssid="byteme";\n  char pwid[64]; snprintf(pwid,sizeof pwid,"%s%s",pw,"psk4internet");\n  if (ieee80211_sae_password_to_pt(pt,(const uint8_t*)pwid,strlen(pwid),(const uint8_t*)ssid,strlen(ssid))) { printf("pt failed\\n"); return 1; }\n  if (ieee80211_sae_derive_password_elem(pwe,pt,v_addr1b,v_addr2b)) { printf("pwe failed\\n"); return 1; }\n  memcpy(exp,v_pwe_19_x,32); memcpy(exp+32,v_pwe_19_y,32);\n  chk("H2E PT->PWE (Annex J.10)", pwe, exp, 64);\n  /* argument order swapped: MAC max/min must give the same PWE */\n  ieee80211_sae_derive_password_elem(pwe,pt,v_addr2b,v_addr1b);\n  chk("H2E PWE, MAC order swapped", pwe, exp, 64);\n  /* hunting-and-pecking: commit with the vector\'s rand/mask */\n  uint8_t hpwe[64], scalar[32], ex[32], ey[32], srand[32];\n  if (ieee80211_sae_derive_password_elem_hnp(hpwe,(const uint8_t*)pw,strlen(pw),v_addr1,v_addr2)) { printf("hnp failed\\n"); return 1; }\n  rq[0]=v_local_rand; rq[1]=v_local_mask; rqn=2; rqi=0;\n  if (ieee80211_sae_derive_commit_elem(scalar,ex,ey,srand,hpwe)) { printf("commit failed\\n"); return 1; }\n  chk("HnP commit scalar", scalar, v_local_commit+2, 32);\n  chk("HnP commit element x", ex, v_local_commit+34, 32);\n  chk("HnP commit element y", ey, v_local_commit+66, 32);\n  /* peer commit: verify, shared secret, keys */\n  const uint8_t *ps,*px,*py;\n  uint16_t st=ieee80211_sae_verify_commit_elem(&ps,&px,&py,v_peer_commit,sizeof v_peer_commit,scalar,ex,ey);\n  printf("%-34s %s (status %u)\\n","peer commit accepted", st==0?"PASS":"FAIL", st); if(st)fails++;\n  uint8_t k[32], kck[32], pmk[32], pmkid[16];\n  st=ieee80211_sae_derive_shared_secret(k,ps,px,py,hpwe,srand);\n  printf("%-34s %s\\n","shared secret", st==0?"PASS":"FAIL"); if(st)fails++;\n  ieee80211_sae_derive_secret_keys(kck,pmk,pmkid,k,scalar,ps);\n  chk("KCK", kck, v_kck, 32); chk("PMK", pmk, v_pmk, 32); chk("PMKID", pmkid, v_pmkid, 16);\n  /* reflection: our own commit sent back must be refused */\n  st=ieee80211_sae_verify_commit_elem(&ps,&px,&py,v_local_commit,sizeof v_local_commit,scalar,ex,ey);\n  printf("%-34s %s (status %u)\\n","reflected commit refused", st!=0?"PASS":"FAIL", st); if(!st)fails++;\n  printf("%s: %d failure(s)\\n", fails?"FAILED":"ALL PASS", fails); return fails!=0;\n}\n')
+srcs = [ob / "net80211" / "ieee80211_sae.c"] + [ob / "crypto" / f for f in ("i31.c", "ec_p256_m31.c", "sha2.c", "hmac.c", "md5.c", "sha1.c")] + [d / "kdf.cpp", d / "test.cpp"]
+flags = ["-std=c++14", "-O1", "-g", "-w", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-I", str(inc), "-I", str(d)]
+objs = []
+for s in srcs:
+    o = d / (s.name + ".o")
+    subprocess.run(["clang++", "-x", "c++", "-c", *flags, str(s), "-o", str(o)], check=True)
+    objs.append(str(o))
+exe = d / "t"
+subprocess.run(["clang++", "-fsanitize=address,undefined", *objs, "-o", str(exe)], check=True)
+r = subprocess.run([str(exe)])
+sys.exit(r.returncode)
