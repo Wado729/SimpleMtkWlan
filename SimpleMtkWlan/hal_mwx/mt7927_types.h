@@ -35,6 +35,16 @@ struct mt7927_bss {
 	uint8_t		cipher;		/* CONNAC3_CIPHER_* in hardware, 0 none */
 	uint8_t		amsdu;		/* HW A-MSDU: max_mpdu_size + 1, 0 off */
 	uint8_t		rx_hdr_trans;	/* peer: RX header translation on */
+	/* phase 4d: 802.11ax, all zero when HE was not negotiated */
+	uint8_t		he;		/* HE negotiated: HE_BASIC/BSS_COLOR, STA_REC_HE_V2 */
+	uint8_t		he_mac[6];	/* the peer's HE MAC capabilities */
+	uint8_t		he_phy[11];	/* the peer's HE PHY capabilities */
+	uint16_t	he_mcs[3];	/* MCS maps the peer receives: 80, 160, 80+80 MHz */
+	uint16_t	he_own_tx[3];	/* our TX MCS maps, same order (BSS_INFO HE_BASIC) */
+	uint8_t		he_color;	/* BSS color from the HE operation */
+	uint8_t		he_color_en;	/* color not disabled by the AP */
+	uint8_t		he_pe;		/* default PE duration (HE operation) */
+	uint16_t	he_rts;		/* TXOP duration RTS threshold (HE operation) */
 };
 
 /* MT7927 phase 4b: per-frame TXD inputs. */

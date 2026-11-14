@@ -92,6 +92,7 @@ struct Chip {
   std::vector<uint16_t> bss_tags; uint16_t bss_ntlv = 0; uint8_t bss_bssid[6] = {0}; int bss_conn_state = -1;
   uint8_t bss_phymode = 0, bss_rate_idx = 0, bss_rlm_ch = 0, bss_rlm_band = 0, bss_band = 0xff; uint16_t bss_basic_rate = 0;
   uint8_t bss_rlm_center = 0, bss_rlm_bw = 0xff, bss_rlm_sco = 0xff, bss_rlm_htop = 0xff;
+  uint16_t bss_he_rts = 0, bss_he_mcs[3] = {0}; uint8_t bss_he_pe = 0, bss_color_en = 0xff, bss_color = 0xff;
   uint8_t bss_sec_mode = 0xff, bss_sec_status = 0xff, bss_sec_cipher = 0xff;
   uint8_t ps_bss = 0xff, ps_state = 0xff; int ps_n = 0;
   uint8_t scan_probes = 0; std::vector<std::pair<int, int>> scan_ies;
@@ -102,7 +103,8 @@ struct Chip {
                   int ba_tid = -1, ba_type = -1, ba_en = -1, ba_amsdu = -1; uint16_t ba_ssn = 0, ba_win = 0; int dis_hdr_trans = -1;
                   int key_add = -1, key_tx = -1, key_type = -1; uint8_t key_peer[6] = {0}, key_bss = 0, key_cipher = 0,
                   key_id = 0, key_len = 0, key_wlan = 0, key_mgmt = 0, key[32] = {0};
-                  int amsdu_num = -1, amsdu_size = -1, amsdu_en = -1; };
+                  int amsdu_num = -1, amsdu_size = -1, amsdu_en = -1;
+                  uint8_t he_mac[6] = {0}, he_phy[11] = {0}; int he_pkt_ext = -1; uint16_t he_mcs[3] = {0}; };
   std::vector<StaRec> sta_recs;
   int roc_acquired = 0, roc_aborted = 0; uint8_t roc_ch = 0, roc_band = 0, roc_token = 0, roc_type = 0xff; uint32_t roc_maxint = 0;
   bool roc_grant = true;
@@ -316,6 +318,11 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
           if (tg == 16) { assert(ln == 8); chip.bss_sec_mode = pl[off + 4]; chip.bss_sec_status = pl[off + 5];
                           chip.bss_sec_cipher = pl[off + 6]; }
           if (tg == 15) assert(ln == 8);
+          if (tg == 5) { assert(ln == 16 && pl[off + 7] == 0 && pl[off + 14] == 0 && pl[off + 15] == 0);  /* HE_BASIC */
+                         memcpy(&chip.bss_he_rts, pl + off + 4, 2); chip.bss_he_pe = pl[off + 6];
+                         memcpy(chip.bss_he_mcs, pl + off + 8, 6); }
+          if (tg == 4) { assert(ln == 8 && pl[off + 6] == 0 && pl[off + 7] == 0);                          /* BSS_COLOR */
+                         chip.bss_color_en = pl[off + 4]; chip.bss_color = pl[off + 5]; }
           if (tg == 26) assert(ln == 20 && pl[off + 13] == 0xff);
           if (tg == 23) assert(ln == 20 && pl[off + 4] == 1);
           off += ln; }
@@ -346,6 +353,8 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
                           sr.key_wlan = pl[off + 18]; sr.key_mgmt = pl[off + 19]; memcpy(sr.key, pl + off + 20, 32);
                           for (int k = 52; k < 68; k++) assert(pl[off + k] == 0); }
         if (tg == 0x0f) { assert(ln == 8); sr.amsdu_num = pl[off + 4]; sr.amsdu_size = pl[off + 5]; sr.amsdu_en = pl[off + 6]; }
+        if (tg == 0x19) { assert(ln == 28); memcpy(sr.he_mac, pl + off + 4, 6); memcpy(sr.he_phy, pl + off + 10, 11);  /* HE_V2 */
+                          sr.he_pkt_ext = pl[off + 21]; memcpy(sr.he_mcs, pl + off + 22, 6); }
         if (tg == 0x25) assert(ln == 8);
         if (tg == 0x23) assert(ln == 4);
         off += ln; }
@@ -1106,6 +1115,36 @@ int main() {
         assert(sr.amsdu_num == 8 && sr.amsdu_size == 2 && sr.amsdu_en == 1); }
       assert(mt7927_sta_rec(&r->b, &v, &bss, false, true, 2, false) == 0 && chip.sta_recs.back().amsdu_en == -1);
       bss.amsdu = 0;
+      /* phase 4d: HE (802.11ax) at 160 MHz: BSS_INFO HE_BASIC + BSS_COLOR after IFS, STA_REC_HE_V2 after A-MSDU */
+      {
+        struct mt7927_bss he = bss;
+        const uint8_t mac[6] = {0x09, 0x08, 0x10, 0x1a, 0x40, 0x00};
+        const uint8_t phy[11] = {0x4c, 0x20, 0x02, 0xc0, 0x6f, 0x5b, 0x83, 0x18, 0x00, 0x0c, 0x00};
+        he.he = 1; memcpy(he.he_mac, mac, 6); memcpy(he.he_phy, phy, 11);
+        he.he_mcs[0] = 0xfffa; he.he_mcs[1] = 0xfffa; he.he_own_tx[0] = 0xfffa; he.he_own_tx[1] = 0xfffa;
+        he.he_color = 37; he.he_color_en = 1; he.he_pe = 0; he.he_rts = 0;   /* AP gives 0: Linux defaults */
+        he.phymode |= 0x80; he.phy_type |= 0x40; he.bw = 3; he.center_chan = 50; he.amsdu = 3;
+        assert(mt7927_bss_info(&r->b, &v, &he, true) == 0);
+        const uint16_t bwant[] = {16, 11, 15, 26, 23, 5, 4, 2, 6};      /* basic first, not listed */
+        assert(chip.bss_tags.size() == 10 && memcmp(chip.bss_tags.data() + 1, bwant, sizeof bwant) == 0);
+        assert(chip.bss_phymode == 0xb1 && chip.bss_he_rts == 1023 && chip.bss_he_pe == 4 &&
+               chip.bss_he_mcs[0] == 0xfffa && chip.bss_he_mcs[1] == 0xfffa && chip.bss_he_mcs[2] == 0 &&
+               chip.bss_color_en == 1 && chip.bss_color == 37 && chip.bss_rlm_bw == 3 && chip.bss_rlm_center == 50);
+        he.he_rts = 600; he.he_pe = 2; he.he_color_en = 0;
+        assert(mt7927_bss_info(&r->b, &v, &he, true) == 0);
+        assert(chip.bss_he_rts == 600 && chip.bss_he_pe == 2 && chip.bss_color_en == 0 && chip.bss_color == 37);
+        assert(mt7927_bss_info(&r->b, &v, &he, false) == 0);          /* leave: color off, no RLM */
+        assert(chip.bss_color_en == 0 && chip.bss_color == 0 && chip.bss_tags.size() == 8);
+        assert(mt7927_sta_rec(&r->b, &v, &he, true, true, 2, false) == 0);
+        const Chip::StaRec &sr = chip.sta_recs.back();
+        const uint16_t want[] = {0, 0x15, 9, 10, 0x0f, 0x19, 1, 7, 0x2b};
+        assert(sr.tags.size() == 9 && memcmp(sr.tags.data(), want, sizeof want) == 0);
+        assert(memcmp(sr.he_mac, mac, 6) == 0 && memcmp(sr.he_phy, phy, 11) == 0 && sr.he_pkt_ext == 2 &&
+               sr.he_mcs[0] == 0xfffa && sr.he_mcs[1] == 0xfffa && sr.he_mcs[2] == 0 && sr.phy_type == 0x78);
+        assert(mt7927_sta_rec(&r->b, &v, &he, false, true, 2, false) == 0 && chip.sta_recs.back().he_pkt_ext == -1);
+        /* without HE nothing changes */
+        assert(mt7927_bss_info(&r->b, &v, &bss, true) == 0 && chip.bss_tags.size() == 8 && chip.bss_phymode == 0x31);
+      }
       /* 150 frames land on the MCU ring before one interrupt: delivered in stage-sized batches, none dropped */
       got.frames.clear(); chip.beacon_ring = 6; irq_registered = false;
       for (int k = 0; k < 150; k++) post_beacon(36, k & 1);
