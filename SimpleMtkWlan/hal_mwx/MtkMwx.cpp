@@ -608,6 +608,7 @@ struct mwx_softc {
 	uint32_t		sc_7927_6g_n;
 	uint8_t			sc_7927_6g_heard[30];	/* 6 GHz channels with networks */
 	uint32_t		sc_7927_scan_logged;
+	uint64_t		sc_7927_6g_heard_ns;	/* last scan with them */
 	uint32_t		sc_7927_bgscans, sc_7927_bgscan_busy;	/* phase 4e.3 */
 	/* phase 4b: join */
 	bool			sc_7927_joined;		/* BSS_INFO + STA_REC set */
@@ -1780,10 +1781,16 @@ mwx_bgscan(struct ieee80211com *ic)
 		}
 		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
 #ifdef AIRPORT_WCL
-		/* macOS's few-channel subsets: at most one per 10 s (as MT7922) */
+		/*
+		 * macOS's few-channel subsets. Phase 4e.5: it sends a scan as
+		 * 6 subsets 3 s apart (channelSubsetDelay=3.00s), 2.4 GHz
+		 * first; a 10 s limit let only that first one through, so its
+		 * 5 and 6 GHz subsets never ran. 2.5 s lets the series pass and
+		 * still stops back-to-back retries.
+		 */
 		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted) {
 			if (last_ns != 0 &&
-			    now_ns - last_ns < 10ULL * 1000000000ULL) {
+			    now_ns - last_ns < 2500ULL * 1000000ULL) {
 				sc->sc_7927_bgscan_busy++;
 				return EBUSY;
 			}
@@ -9678,9 +9685,19 @@ mt7927_hal_scan(struct mwx_softc *sc)
 		 * Apple's own scans revisit known networks' channels the same
 		 * way (BSSChannelsOnly). 1-3 passive channels, ~110 ms each.
 		 */
+		uint64_t now6;
+		bool heard;
+
+		/* the heard ones at most every 8 s, not in each of 6 subsets */
+		absolutetime_to_nanoseconds(mach_absolute_time(), &now6);
+		heard = sc->sc_7927_6g_heard_ns == 0 ||
+		    now6 - sc->sc_7927_6g_heard_ns >= 8ULL * 1000000000ULL;
+		if (heard)
+			sc->sc_7927_6g_heard_ns = now6;
 		for (c6 = 1; c6 <= 233 && n < 64; c6++)
 			if ((ic->ic_wcl_scan_channels6g[c6 / 8] |
-			    sc->sc_7927_6g_heard[c6 / 8]) & (1U << (c6 % 8))) {
+			    (heard ? sc->sc_7927_6g_heard[c6 / 8] : 0)) &
+			    (1U << (c6 % 8))) {
 				ch[n].band = 3;
 				ch[n].chan = (uint8_t)c6;
 				n++;
@@ -9689,7 +9706,7 @@ mt7927_hal_scan(struct mwx_softc *sc)
 #endif
 	if (n == 0)
 		return EINVAL;
-	if (restricted && sc->sc_7927_scan_logged < 12) {
+	if (restricted && sc->sc_7927_scan_logged < 30) {
 		int i, n2 = 0, n5 = 0, n6 = 0;
 
 		sc->sc_7927_scan_logged++;
