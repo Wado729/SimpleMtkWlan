@@ -10,6 +10,7 @@ pre=r'''
 #include <cstring>
 #include <cstdint>
 #include <vector>
+#include <string>
 #define IEEE80211_CHAN_MAX 255
 #define IEEE80211_FC1_PROTECTED 0x40
 #define IEEE80211_RXI_HWDEC 0x1
@@ -21,7 +22,12 @@ struct ieee80211com{chan ic_channels[256];};
 struct capa{uint8_t antenna_mask=3;};
 #define MT7927_RXD3_CSUM ((1U << 26) | (1U << 27))
 struct mt7927_bringup{uint32_t info;};
-struct mwx_softc{ieee80211com sc_ic;capa sc_capa;unsigned sc_7927_rx_drop[8]={0};unsigned sc_7927_rx_hwdec=0,sc_7927_rx_hwdec_nopn=0,sc_7927_rx_csum=0,sc_7927_rx_untrans_amsdu=0;mt7927_bringup*sc_7927;};
+struct mwx_softc{ieee80211com sc_ic;capa sc_capa;unsigned sc_7927_rx_drop[8]={0};unsigned sc_7927_rx_hwdec=0,sc_7927_rx_hwdec_nopn=0,sc_7927_rx_csum=0,sc_7927_rx_untrans_amsdu=0;mt7927_bringup*sc_7927;
+ unsigned sc_7927_rx_6g=0;uint8_t sc_7927_6g_bssid[32][6];unsigned sc_7927_6g_n=0;};
+#define nitems(a) (sizeof(a)/sizeof((a)[0]))
+static std::vector<std::string> logs; static char ebuf[18];
+static const char*ether_sprintf(const uint8_t*a){snprintf(ebuf,sizeof ebuf,"%02x:%02x:%02x:%02x:%02x:%02x",a[0],a[1],a[2],a[3],a[4],a[5]);return ebuf;}
+#define MWX_DEV_LOG(sc,...) do{char l[256];snprintf(l,sizeof l,__VA_ARGS__);logs.push_back(l);}while(0)
 struct ieee80211_qosframe{uint8_t b[26];};
 #define IEEE80211_FC0_TYPE_MASK 0x0c
 #define IEEE80211_FC0_TYPE_DATA 0x08
@@ -64,6 +70,16 @@ int main(){
   assert(memcmp(m.data+hl,iv,8)==0);
   assert(memcmp(m.data+hl+8,orig.data()+off+hl,40)==0);                  /* payload untouched */
   assert(sc.sc_7927_rx_hwdec==(unsigned)(qos+1));
+ }
+ { /* phase 4e.1: 6 GHz beacons are logged once per BSSID, then dropped */
+  std::vector<uint8_t> buf(32+36+2+9+2+4,0); uint8_t*f=buf.data()+32; f[0]=0x80;
+  const uint8_t bss[6]={0x40,0x00,0x00,0x00,0x03,0x4c}; memcpy(f+16,bss,6); f[36]=0; f[37]=9; memcpy(f+38,"Home_6GHz",9);
+  f[47]=1; f[48]=4; for(int r=0;r<2;r++){
+   mbuf m{buf.data(),buf.size()}; ieee80211_rxinfo rxi{}; unsigned d0=sc.sc_7927_rx_drop[0];
+   next={}; next.hdr_off=32; next.frame_len=(uint32_t)buf.size()-32; next.chan=69; next.band=6; next.rssi=-79;
+   assert(mt7927_mac_fill_rx(&sc,&m,&rxi)==-1 && sc.sc_7927_rx_drop[0]==d0+1);}
+  assert(sc.sc_7927_rx_6g==2 && sc.sc_7927_6g_n==1 && logs.size()==1);
+  assert(logs[0].find("6 GHz: beacon \"Home_6GHz\" 40:00:00:00:03:4c ch 69 rssi -79")!=std::string::npos);
  }
  { /* no PN: header stays, protected bit cleared */
   std::vector<uint8_t> buf; frame(buf,32,true); buf[33]|=0x40; mbuf m{buf.data(),buf.size()}; ieee80211_rxinfo rxi{};

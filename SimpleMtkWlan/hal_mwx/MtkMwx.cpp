@@ -600,6 +600,11 @@ struct mwx_softc {
 	uint32_t		sc_7927_join_refused;
 	uint32_t		sc_7927_poll;
 	uint32_t		sc_7927_rx_drop[8];
+	/* phase 4e.1: 6 GHz scanning (heard, not yet given to net80211) */
+	bool			sc_7927_scan6g;		/* off: -mtk7927no6g */
+	uint32_t		sc_7927_rx_6g;		/* 6 GHz frames received */
+	uint8_t			sc_7927_6g_bssid[32][6];
+	uint32_t		sc_7927_6g_n;
 	/* phase 4b: join */
 	bool			sc_7927_joined;		/* BSS_INFO + STA_REC set */
 	bool			sc_7927_assoc;
@@ -9322,6 +9327,8 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 
 		sc->sc_7927_rx_decap = !PE_parse_boot_argn("-mtk7927nodecap",
 		    &off, sizeof(off));
+		sc->sc_7927_scan6g = !PE_parse_boot_argn("-mtk7927no6g",
+		    &off, sizeof(off));
 	}
 	mt7927_engine_set_rx_decap(sc->sc_7927, sc->sc_7927_rx_decap);
 	timeout_set(&sc->sc_7927_reorder_to, mt7927_reorder_timeo, sc);
@@ -9570,6 +9577,20 @@ mt7927_hal_scan(struct mwx_softc *sc)
 		ch[n].band = IEEE80211_IS_CHAN_2GHZ(c) ? 1 : 2;
 		ch[n].chan = (uint8_t)ieee80211_mhz2ieee(c->ic_freq, 0);
 		n++;
+	}
+	/*
+	 * Phase 4e.1: the 6 GHz preferred scanning channels (5, 21, ... 229),
+	 * which cfg80211 scans when nothing points elsewhere; passive, as the
+	 * channel domain marks 6 GHz NO_IR. -mtk7927no6g leaves them out.
+	 */
+	if (sc->sc_7927_scan6g) {
+		int psc;
+
+		for (psc = 5; psc <= 229 && n < 64; psc += 16) {
+			ch[n].band = 3;
+			ch[n].chan = (uint8_t)psc;
+			n++;
+		}
 	}
 	mt7927_vif_fill(sc, &v);
 	{
@@ -11119,7 +11140,46 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		}
 		sc->sc_7927_rx_untrans_amsdu++;
 	}
-	if (ri.band == 6 || ri.chan == 0 || ri.chan > IEEE80211_CHAN_MAX ||
+	if (ri.band == 6) {
+		/*
+		 * 6 GHz: net80211's channel table has no 6 GHz entries yet
+		 * (its numbers clash with 2.4/5 GHz), so the frame is dropped;
+		 * log each network heard once, to see what the radio gets.
+		 */
+		const uint8_t *f = mtod(m, const uint8_t *) + ri.hdr_off;
+
+		sc->sc_7927_rx_6g++;
+		if (ri.frame_len >= 36 && (f[0] == 0x80 || f[0] == 0x50)) {
+			uint32_t i, seen = 0;
+
+			for (i = 0; i < sc->sc_7927_6g_n; i++)
+				if (memcmp(sc->sc_7927_6g_bssid[i], f + 16, 6) == 0)
+					seen = 1;
+			if (!seen && sc->sc_7927_6g_n < nitems(sc->sc_7927_6g_bssid)) {
+				const uint8_t *ie = f + 36, *end = f + ri.frame_len;
+				char ssid[33] = "";
+
+				memcpy(sc->sc_7927_6g_bssid[sc->sc_7927_6g_n++], f + 16, 6);
+				while (ie + 2 <= end && ie + 2 + ie[1] <= end) {
+					if (ie[0] == 0) {
+						uint8_t l = ie[1] > 32 ? 32 : ie[1];
+
+						memcpy(ssid, ie + 2, l);
+						ssid[l] = 0;
+						break;
+					}
+					ie += 2 + ie[1];
+				}
+				MWX_DEV_LOG(sc, "MT7927 6 GHz: %s \"%s\" %s ch %u rssi %d\n",
+				    f[0] == 0x80 ? "beacon" : "probe response",
+				    ssid[0] ? ssid : "(hidden)", ether_sprintf(f + 16),
+				    ri.chan, ri.rssi);
+			}
+		}
+		sc->sc_7927_rx_drop[0]++;
+		return -1;
+	}
+	if (ri.chan == 0 || ri.chan > IEEE80211_CHAN_MAX ||
 	    ic->ic_channels[ri.chan].ic_flags == 0) {
 		sc->sc_7927_rx_drop[0]++;
 		return -1;
@@ -11434,13 +11494,15 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		    sc->sc_7927_rx_nog4, sc->sc_7927_rx_untrans_amsdu);
 		MWX_DEV_LOG(sc, "MT7927 poll: intr %u isr %u rx frames %u "
 		    "(net80211 %u, dropped ch %u short %u fcs %u icv %u trans %u) "
-		    "other %u events %u timeouts %u scans %u state %d\n", intr,
+		    "other %u events %u timeouts %u scans %u state %d; 6 GHz "
+		    "frames %u, networks %u\n", intr,
 		    isr, frames, sc->sc_rx_delivered, sc->sc_7927_rx_drop[0],
 		    sc->sc_7927_rx_drop[MT7927_RX_SHORT],
 		    sc->sc_7927_rx_drop[MT7927_RX_FCS_ERR],
 		    sc->sc_7927_rx_drop[MT7927_RX_ICV_ERR],
 		    sc->sc_7927_rx_drop[MT7927_RX_HDR_TRANS], other, events,
-		    timeouts, sc->sc_scan_done_count, sc->sc_ic.ic_state);
+		    timeouts, sc->sc_scan_done_count, sc->sc_ic.ic_state,
+		    sc->sc_7927_rx_6g, sc->sc_7927_6g_n);
 		mt7927_publish(sc->sc_tag, "MT7927RxFrames", frames);
 		mt7927_publish(sc->sc_tag, "MT7927MCUTimeouts", timeouts);
 		mt7927_engine_log_diag(sc->sc_7927);
