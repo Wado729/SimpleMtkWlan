@@ -1770,7 +1770,8 @@ mwx_bgscan(struct ieee80211com *ic)
 		 * macOS's channel subsets go straight through; a full sweep
 		 * (no channel list) at most every 2 minutes.
 		 */
-		static uint64_t last_full_ns, last_ns;
+		static uint64_t last_full_ns, window_ns;
+		static uint32_t window_n;
 		uint64_t now_ns, min_ns = 120ULL * 1000000000ULL;
 
 		if (sc->sc_7927_nobgscan)
@@ -1783,17 +1784,23 @@ mwx_bgscan(struct ieee80211com *ic)
 #ifdef AIRPORT_WCL
 		/*
 		 * macOS's few-channel subsets. Phase 4e.5: it sends a scan as
-		 * 6 subsets 3 s apart (channelSubsetDelay=3.00s), 2.4 GHz
-		 * first; a 10 s limit let only that first one through, so its
-		 * 5 and 6 GHz subsets never ran. 2.5 s lets the series pass and
-		 * still stops back-to-back retries.
+		 * channel subsets, 2.4 GHz first, the next ones within a few
+		 * ms of each completion. A time gap between scans let only the
+		 * first through, so its 5 and 6 GHz subsets never ran. Phase
+		 * 4e.6: a budget instead, 8 subsets per 10 s window: a whole
+		 * series passes, a runaway stream does not.
 		 */
 		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted) {
-			if (last_ns != 0 &&
-			    now_ns - last_ns < 2500ULL * 1000000ULL) {
+			if (window_ns == 0 ||
+			    now_ns - window_ns >= 10ULL * 1000000000ULL) {
+				window_ns = now_ns;
+				window_n = 0;
+			}
+			if (window_n >= 8) {
 				sc->sc_7927_bgscan_busy++;
 				return EBUSY;
 			}
+			window_n++;
 			min_ns = 0;
 		}
 #endif
@@ -1809,7 +1816,6 @@ mwx_bgscan(struct ieee80211com *ic)
 			sc->sc_7927_bgscan_busy++;
 			return err;
 		}
-		last_ns = now_ns;
 		sc->sc_flags |= MWX_FLAG_BGSCAN;
 		sc->sc_7927_bgscans++;
 		return 0;
