@@ -606,6 +606,8 @@ struct mwx_softc {
 	uint32_t		sc_7927_rx_6g;		/* 6 GHz frames received */
 	uint8_t			sc_7927_6g_bssid[32][6];
 	uint32_t		sc_7927_6g_n;
+	uint8_t			sc_7927_6g_heard[30];	/* 6 GHz channels with networks */
+	uint32_t		sc_7927_scan_logged;
 	uint32_t		sc_7927_bgscans, sc_7927_bgscan_busy;	/* phase 4e.3 */
 	/* phase 4b: join */
 	bool			sc_7927_joined;		/* BSS_INFO + STA_REC set */
@@ -9669,8 +9671,16 @@ mt7927_hal_scan(struct mwx_softc *sc)
 	else if (sc->sc_7927_scan6g) {
 		int c6;
 
+		/*
+		 * The 6 GHz channels macOS asked for, and (phase 4e.4) those
+		 * where networks were heard: macOS's subsets while associated
+		 * leave 6 GHz out, and it drops a network not seen for ~30 s.
+		 * Apple's own scans revisit known networks' channels the same
+		 * way (BSSChannelsOnly). 1-3 passive channels, ~110 ms each.
+		 */
 		for (c6 = 1; c6 <= 233 && n < 64; c6++)
-			if (ic->ic_wcl_scan_channels6g[c6 / 8] & (1U << (c6 % 8))) {
+			if ((ic->ic_wcl_scan_channels6g[c6 / 8] |
+			    sc->sc_7927_6g_heard[c6 / 8]) & (1U << (c6 % 8))) {
 				ch[n].band = 3;
 				ch[n].chan = (uint8_t)c6;
 				n++;
@@ -9679,6 +9689,21 @@ mt7927_hal_scan(struct mwx_softc *sc)
 #endif
 	if (n == 0)
 		return EINVAL;
+	if (restricted && sc->sc_7927_scan_logged < 12) {
+		int i, n2 = 0, n5 = 0, n6 = 0;
+
+		sc->sc_7927_scan_logged++;
+		for (i = 0; i < n; i++) {
+			if (ch[i].band == 1)
+				n2++;
+			else if (ch[i].band == 2)
+				n5++;
+			else
+				n6++;
+		}
+		MWX_DEV_LOG(sc, "MT7927 associated scan: 2.4 GHz %d, 5 GHz %d, "
+		    "6 GHz %d channels\n", n2, n5, n6);
+	}
 	mt7927_vif_fill(sc, &v);
 	{
 		/* probe-request IEs as net80211 builds them (rates, HT, VHT) */
@@ -11238,6 +11263,12 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		sc->sc_7927_rx_6g++;
 		if (ri.frame_len >= 36 && (f[0] == 0x80 || f[0] == 0x50)) {
 			uint32_t i, seen = 0;
+
+			/* phase 4e.4: rescanned while associated (macOS drops
+			 * a network not seen for ~30 s) */
+			if (ri.chan >= 1 && ri.chan <= 233)
+				sc->sc_7927_6g_heard[ri.chan / 8] |=
+				    (uint8_t)(1U << (ri.chan % 8));
 
 			for (i = 0; i < sc->sc_7927_6g_n; i++)
 				if (memcmp(sc->sc_7927_6g_bssid[i], f + 16, 6) == 0)

@@ -26,7 +26,7 @@ struct capa{uint8_t antenna_mask=3;};
 #define MT7927_RXD3_CSUM ((1U << 26) | (1U << 27))
 struct mt7927_bringup{uint32_t info;};
 struct mwx_softc{ieee80211com sc_ic;capa sc_capa;unsigned sc_7927_rx_drop[8]={0};unsigned sc_7927_rx_hwdec=0,sc_7927_rx_hwdec_nopn=0,sc_7927_rx_csum=0,sc_7927_rx_untrans_amsdu=0;mt7927_bringup*sc_7927;
- unsigned sc_7927_rx_6g=0;uint8_t sc_7927_6g_bssid[32][6];unsigned sc_7927_6g_n=0;};
+ unsigned sc_7927_rx_6g=0;uint8_t sc_7927_6g_bssid[32][6];unsigned sc_7927_6g_n=0;uint8_t sc_7927_6g_heard[30];};
 #define nitems(a) (sizeof(a)/sizeof((a)[0]))
 static std::vector<std::string> logs; static char ebuf[18];
 static const char*ether_sprintf(const uint8_t*a){snprintf(ebuf,sizeof ebuf,"%02x:%02x:%02x:%02x:%02x:%02x",a[0],a[1],a[2],a[3],a[4],a[5]);return ebuf;}
