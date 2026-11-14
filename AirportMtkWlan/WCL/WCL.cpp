@@ -282,6 +282,10 @@ IOReturn AirportItlwmSkywalkInterface::startWCLScan(const AirportWCL::ScanReques
         return kIOReturnBusy;
     if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
         return kIOReturnBusy;
+    // A HAL that cannot restart a running scan (MT7922) keeps the old rule.
+    if (!ic->ic_wcl_scan_restart_supported &&
+        (scanPending || (ic->ic_flags & IEEE80211_F_BGSCAN)))
+        return kIOReturnBusy;
     if (scanPending)
         finishWCLScan(kIOReturnAborted);    // the newer request supersedes it
     if (scan.channelCount) {
@@ -335,6 +339,11 @@ IOReturn AirportItlwmSkywalkInterface::startWCLScan(const AirportWCL::ScanReques
         ic->ic_wcl_scan_idle = false;
         scanSkipCompletion = false;
         ieee80211_next_scan(&ic->ic_if);
+    } else if (ic->ic_wcl_scan_restart_supported) {
+        // A scan is running in SCAN state: the HAL starts this one when it
+        // ends, instead of completing this request with that scan's tail.
+        ic->ic_wcl_scan_restart = true;
+        scanSkipCompletion = false;
     }
     return kIOReturnSuccess;
 }
@@ -440,10 +449,14 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
  */
 void AirportItlwmSkywalkInterface::publishWCLBeacon6G(const ieee80211_beacon6g_event *ev)
 {
-    if (!ev || !ev->bssid || ev->ssid_len > 32 || !ev->chan || ev->chan > 233 ||
-        !AirportWCL::validIEs(ev->ies, ev->length))
+    if (!ev || !ev->bssid || ev->ssid_len > 32 || !ev->chan || ev->chan > 233)
         return;
-    size_t size = sizeof(AirportWCL::BeaconMetadata) + ev->length;
+    // Phase 4e.8: keep the valid elements, as Ersiter does; a nameless
+    // result (hidden network, or no SSID element survived) is not listed.
+    size_t ieLength = AirportWCL::validIEPrefix(ev->ies, ev->length);
+    if (!ieLength || !ev->ssid_len)
+        return;
+    size_t size = sizeof(AirportWCL::BeaconMetadata) + ieLength;
     auto metadata = static_cast<AirportWCL::BeaconMetadata *>(IOMalloc(size));
     if (!metadata)
         return;
@@ -458,8 +471,8 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon6G(const ieee80211_beacon6g_e
     metadata->interval = ev->intval;
     metadata->capability = ev->capinfo;
     metadata->flags = (ev->ssid_len ? AirportWCL::SSIDPresent : 0) | AirportWCL::RSSIValid;
-    memcpy(metadata + 1, ev->ies, ev->length);
-    metadata->ieLength = uint32_t(ev->length);
+    memcpy(metadata + 1, ev->ies, ieLength);
+    metadata->ieLength = uint32_t(ieLength);
     size_t messageSize = sizeof(*metadata) + metadata->ieLength;
     instance->postMessage(this, AirportWCL::ScanResult, metadata, messageSize, true);
     IOFree(metadata, size);
@@ -599,6 +612,11 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         joinTimer->setTimeoutMS(30000);
         return kIOReturnSuccess;
     }
+    // Phase 4e.8: a join retires a pending scan (Ersiter does the same);
+    // scans now run back to back, so refusing made joins wait or fail.
+    if (supported && (ic->ic_if.if_flags & IFF_RUNNING) && !joinPending &&
+        scanPending && ic->ic_wcl_scan_restart_supported)
+        finishWCLScan(kIOReturnAborted);
     if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending || scanPending) {
         explicit_bzero(&join, sizeof(join));
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
@@ -989,6 +1007,9 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             break;
         }
         case IEEE80211_EVT_SCAN_DONE:
+            // not the scan this request is waiting for (Ersiter does the same)
+            if (scanPending && (scanDeferred || ic->ic_wcl_scan_restart))
+                break;
             if (scanPending) {
                 if (scanSkipCompletion)
                     scanSkipCompletion = false;

@@ -463,6 +463,7 @@ struct ieee80211com {
     uint64_t ic_wcl_rx_packets[4];
     bool ic_wcl_scan_idle;   /* scan finished, nothing asked for: wait for macOS */
     bool ic_wcl_scan_restart;   /* a newer request: the HAL starts it when the current scan ends */
+    bool ic_wcl_scan_restart_supported;   /* the HAL consumes ic_wcl_scan_restart (MT7927) */
 #endif
     /* The channel width has changed (20<->2040) */
     void            (*ic_update_chw)(struct ieee80211com *);

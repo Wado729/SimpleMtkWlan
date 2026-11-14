@@ -609,6 +609,9 @@ struct mwx_softc {
 	uint8_t			sc_7927_6g_heard[30];	/* 6 GHz channels with networks */
 	uint32_t		sc_7927_scan_logged;
 	uint64_t		sc_7927_6g_heard_ns;	/* last scan with them */
+	uint64_t		sc_7927_6g_heard_age_ns; /* phase 4e.8: forget after 5 min */
+	uint8_t			sc_7927_pend6[64][2];	/* 6 GHz half (band, chan), sent next */
+	int			sc_7927_pend6_n;
 	uint32_t		sc_7927_bgscans, sc_7927_bgscan_busy;	/* phase 4e.3 */
 	/* phase 4b: join */
 	bool			sc_7927_joined;		/* BSS_INFO + STA_REC set */
@@ -9389,6 +9392,9 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 		sc->sc_7927_scan6g = !PE_parse_boot_argn("-mtk7927no6g",
 		    &off, sizeof(off));
 		sc->sc_ic.ic_6ghz_channels = sc->sc_7927_scan6g;
+#ifdef AIRPORT_WCL
+		sc->sc_ic.ic_wcl_scan_restart_supported = true;
+#endif
 		{
 			char nb[8];
 
@@ -9612,10 +9618,10 @@ mt7927_hal_stop(struct mwx_softc *sc)
 		return;
 	mt7927_join_teardown(sc, "interface down");
 	mt7927_vif_fill(sc, &v);
-	if (sc->sc_flags & MWX_FLAG_SCANNING) {
+	if (sc->sc_flags & MWX_FLAG_SCANNING)
 		mt7927_scan_cancel(sc->sc_7927, &v);
-		sc->sc_flags &= ~MWX_FLAG_SCANNING;
-	}
+	sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+	sc->sc_7927_pend6_n = 0;
 	mt7927_dev_add(sc->sc_7927, &v, false);
 	sc->sc_vif.band_idx = 0;
 	sc->sc_7927_hwkeys = 0;
@@ -9623,6 +9629,9 @@ mt7927_hal_stop(struct mwx_softc *sc)
 	ml_purge(&sc->sc_7927_rxml);
 	sc->sc_7927_rxml_frames = 0;
 }
+
+static int	mt7927_hal_scan_send(struct mwx_softc *,
+		    const struct mt7927_scan_chan *, int);
 
 /* Active (wildcard) scan of every channel in the net80211 table, as Linux. */
 static int
@@ -9643,8 +9652,8 @@ mt7927_hal_scan(struct mwx_softc *sc)
 	 * briefly (the firmware's split scan goes back in between).
 	 */
 #ifdef AIRPORT_WCL
-	restricted = ic->ic_state == IEEE80211_S_RUN &&
-	    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted;
+	/* phase 4e.8: macOS's channel list in any state, not only in RUN */
+	restricted = ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted;
 #else
 	restricted = false;
 #endif
@@ -9695,22 +9704,67 @@ mt7927_hal_scan(struct mwx_softc *sc)
 
 		/* the heard ones at most every 8 s, not in each of 6 subsets */
 		absolutetime_to_nanoseconds(mach_absolute_time(), &now6);
+		int extra = 0;
+
 		heard = sc->sc_7927_6g_heard_ns == 0 ||
 		    now6 - sc->sc_7927_6g_heard_ns >= 8ULL * 1000000000ULL;
 		if (heard)
 			sc->sc_7927_6g_heard_ns = now6;
-		for (c6 = 1; c6 <= 233 && n < 64; c6++)
-			if ((ic->ic_wcl_scan_channels6g[c6 / 8] |
-			    (heard ? sc->sc_7927_6g_heard[c6 / 8] : 0)) &
-			    (1U << (c6 % 8))) {
-				ch[n].band = 3;
-				ch[n].chan = (uint8_t)c6;
-				n++;
-			}
+		/* phase 4e.8: forget channels after 5 minutes (heard again
+		 * in macOS's own 6 GHz subsets) */
+		if (sc->sc_7927_6g_heard_age_ns == 0)
+			sc->sc_7927_6g_heard_age_ns = now6;
+		else if (now6 - sc->sc_7927_6g_heard_age_ns >=
+		    300ULL * 1000000000ULL) {
+			memset(sc->sc_7927_6g_heard, 0,
+			    sizeof(sc->sc_7927_6g_heard));
+			sc->sc_7927_6g_heard_age_ns = now6;
+		}
+		for (c6 = 1; c6 <= 233 && n < 64; c6++) {
+			uint8_t bit = (uint8_t)(1U << (c6 % 8));
+			bool asked = ic->ic_wcl_scan_channels6g[c6 / 8] & bit;
+
+			/* ride-along: at most 4 channels macOS did not ask for */
+			if (!asked && !(heard && extra < 4 &&
+			    (sc->sc_7927_6g_heard[c6 / 8] & bit)))
+				continue;
+			if (!asked)
+				extra++;
+			ch[n].band = 3;
+			ch[n].chan = (uint8_t)c6;
+			n++;
+		}
 	}
 #endif
 	if (n == 0)
 		return EINVAL;
+	/*
+	 * Phase 4e.8: the 120 ms dwell 6 GHz needs is per request, not per
+	 * channel: a mixed request keeps the 2.4/5 GHz channels off the home
+	 * channel 3x longer too. The 6 GHz part goes next, as its own request
+	 * (mt7927_end_scan_action sends it when the first one completes).
+	 */
+	sc->sc_7927_pend6_n = 0;
+	{
+		int i, k = 0, n6 = 0;
+
+		for (i = 0; i < n; i++)
+			if (ch[i].band == 3)
+				n6++;
+		if (n6 != 0 && n6 != n) {
+			for (i = 0; i < n; i++) {
+				if (ch[i].band == 3) {
+					sc->sc_7927_pend6[sc->sc_7927_pend6_n][0] =
+					    ch[i].band;
+					sc->sc_7927_pend6[sc->sc_7927_pend6_n++][1] =
+					    ch[i].chan;
+				}
+				else
+					ch[k++] = ch[i];
+			}
+			n = k;
+		}
+	}
 	if (restricted && sc->sc_7927_scan_logged < 30) {
 		int i, n2 = 0, n5 = 0, n6 = 0;
 
@@ -9723,9 +9777,23 @@ mt7927_hal_scan(struct mwx_softc *sc)
 			else
 				n6++;
 		}
-		MWX_DEV_LOG(sc, "MT7927 associated scan: 2.4 GHz %d, 5 GHz %d, "
-		    "6 GHz %d channels\n", n2, n5, n6);
+		MWX_DEV_LOG(sc, "MT7927 %s scan: 2.4 GHz %d, 5 GHz %d, "
+		    "6 GHz %d channels\n", ic->ic_state == IEEE80211_S_RUN ?
+		    "associated" : "unassociated", n2, n5,
+		    n6 + sc->sc_7927_pend6_n);
 	}
+	return mt7927_hal_scan_send(sc, ch, n);
+}
+
+/* Send one scan request (channels of one or several bands) to the firmware. */
+static int
+mt7927_hal_scan_send(struct mwx_softc *sc, const struct mt7927_scan_chan *ch,
+    int n)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct mt7927_vif v;
+	int rv;
+
 	mt7927_vif_fill(sc, &v);
 	{
 		/* probe-request IEs as net80211 builds them (rates, HT, VHT) */
@@ -10005,10 +10073,10 @@ mt7927_join_prepare(struct mwx_softc *sc)
 		    MT7927_ROC_JOIN_MS);
 	}
 	mt7927_vif_fill(sc, &v);
-	if (sc->sc_flags & MWX_FLAG_SCANNING) {
+	if (sc->sc_flags & MWX_FLAG_SCANNING)
 		mt7927_scan_cancel(sc->sc_7927, &v);
-		sc->sc_flags &= ~MWX_FLAG_SCANNING;
-	}
+	sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+	sc->sc_7927_pend6_n = 0;
 	band_idx = bss.band == 1 ? 0 : 1;	/* mt7927_band_idx() */
 	if ((rv = mt7927_band_reconfig(sc->sc_7927, &v, band_idx)) != 0)
 		return rv;
@@ -11405,7 +11473,67 @@ mt7927_end_scan_action(OSObject *, void *arg0, void *, void *, void *)
 	struct ieee80211_node *ni;
 	/* Only the first scans: later listings evict the join/stall history. */
 	bool list = sc->sc_scan_done_count <= 3;
+	bool bg = ic->ic_state == IEEE80211_S_RUN &&
+	    (ic->ic_flags & IEEE80211_F_BGSCAN);
 	int n = 0;
+
+	/*
+	 * Phase 4e.8 (review): on the gate, so nothing here races
+	 * startWCLScan or the RX path. The background flag ends with each
+	 * scan (it stayed set forever, so later foreground scans skipped the
+	 * link-down and the stall limit stayed at 10).
+	 */
+	sc->sc_flags &= ~MWX_FLAG_BGSCAN;
+	if (ic->ic_state == IEEE80211_S_AUTH ||
+	    ic->ic_state == IEEE80211_S_ASSOC) {
+		/* a late completion while joining: ending it re-selects the
+		 * BSS and restarts authentication */
+		MWX_DEV_LOG(sc, "MT7927 scan completion while joining, "
+		    "ignored\n");
+		sc->sc_7927_pend6_n = 0;
+#ifdef AIRPORT_WCL
+		ic->ic_wcl_scan_restart = false;
+#endif
+		return kIOReturnSuccess;
+	}
+	if (bg || ic->ic_state == IEEE80211_S_SCAN) {
+#ifdef AIRPORT_WCL
+		/* macOS asked for another scan meanwhile: that one now */
+		if (ic->ic_wcl_scan_restart) {
+			ic->ic_wcl_scan_restart = false;
+			sc->sc_7927_pend6_n = 0;
+			if (mt7927_hal_scan(sc) == 0) {
+				if (bg) {
+					sc->sc_flags |= MWX_FLAG_BGSCAN;
+					sc->sc_7927_bgscans++;
+				}
+				return kIOReturnSuccess;
+			}
+		}
+#endif
+		/* the 6 GHz half of this request */
+		if (sc->sc_7927_pend6_n > 0) {
+			int pn = sc->sc_7927_pend6_n;
+
+			sc->sc_7927_pend6_n = 0;
+			struct mt7927_scan_chan pc[64];
+			int i;
+
+			for (i = 0; i < pn; i++) {
+				pc[i].band = sc->sc_7927_pend6[i][0];
+				pc[i].chan = sc->sc_7927_pend6[i][1];
+			}
+			if (mt7927_hal_scan_send(sc, pc, pn) == 0) {
+				if (bg)
+					sc->sc_flags |= MWX_FLAG_BGSCAN;
+				return kIOReturnSuccess;
+			}
+		}
+	}
+	sc->sc_7927_pend6_n = 0;
+#ifdef AIRPORT_WCL
+	ic->ic_wcl_scan_restart = false;
+#endif
 
 	RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
 		if (list && n < 32) {
@@ -12628,24 +12756,7 @@ mwx_end_scan_task(void *arg)
 		return;
 	}
 	if (sc->sc_hwtype == MWX_HW_MT7927) {
-#ifdef AIRPORT_WCL
-		/*
-		 * Phase 4e.7: macOS asked for another scan while this one ran
-		 * (it supersedes it, as in Ersiter's ic_wcl_scan_restart):
-		 * start that one now instead of reporting this one done.
-		 */
-		if (ic->ic_wcl_scan_restart && ic->ic_state == IEEE80211_S_RUN &&
-		    (ic->ic_flags & IEEE80211_F_BGSCAN)) {
-			ic->ic_wcl_scan_restart = false;
-			if (mt7927_hal_scan(sc) == 0) {
-				sc->sc_flags |= MWX_FLAG_BGSCAN;
-				sc->sc_7927_bgscans++;
-				splx(s);
-				return;
-			}
-		}
-		ic->ic_wcl_scan_restart = false;
-#endif
+		/* restart / 6 GHz half / flags: on the gate (phase 4e.8) */
 		mt7927_hal_end_scan(sc);
 		splx(s);
 		return;

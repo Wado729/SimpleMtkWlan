@@ -358,6 +358,17 @@ inline bool validIEs(const uint8_t *data, size_t length) {
     return true;
 }
 
+// Length of the run of complete elements at the start (a truncated or
+// malformed trailing element is dropped instead of the whole frame).
+inline size_t validIEPrefix(const uint8_t *data, size_t length) {
+    size_t used = 0;
+    if (!data || length > 2048)
+        return 0;
+    while (length - used >= 2 && size_t(data[used + 1]) + 2 <= length - used)
+        used += size_t(data[used + 1]) + 2;
+    return used;
+}
+
 // What a network's RSN element asks for, for logging WPA3 networks: AKM and
 // pairwise suite types (00-0f-ac only, one bit each), group cipher, RSN caps,
 // and whether a Multi-Link element (Wi-Fi 7 MLO) is present.
