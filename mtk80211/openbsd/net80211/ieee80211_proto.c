@@ -1102,7 +1102,9 @@ ieee80211_addba_request(struct ieee80211com *ic, struct ieee80211_node *ni,
 	ba->ba_token = ic->ic_dialog_token++;
 	ba->ba_timeout_val = 0;
 	timeout_set(&ba->ba_to, ieee80211_tx_ba_timeout, ba);
-	ba->ba_winsize = IEEE80211_BA_MAX_WINSZ;
+	/* the driver may ask for more (HE: 256, mac80211's max_tx_aggregation_subframes) */
+	ba->ba_winsize = ic->ic_tx_ba_max_winsz ? ic->ic_tx_ba_max_winsz :
+	    IEEE80211_BA_MAX_WINSZ;
 	ba->ba_winstart = ssn;
 	ba->ba_winend = (ba->ba_winstart + ba->ba_winsize - 1) & 0xfff;
 	ba->ba_params =
@@ -1172,7 +1174,7 @@ ieee80211_delba_request(struct ieee80211com *ic, struct ieee80211_node *ni,
 
 		if (ba->ba_buf != NULL) {
 			/* free all MSDUs stored in reordering buffer */
-			for (i = 0; i < IEEE80211_BA_MAX_WINSZ; i++)
+			for (i = 0; i < IEEE80211_BA_RX_BUFSZ; i++)
 				mbuf_freem(ba->ba_buf[i].m);
 			/* free reordering buffer */
 			free(ba->ba_buf);

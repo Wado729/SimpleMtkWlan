@@ -336,7 +336,17 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     metadata->capability = node->ni_capinfo;
     metadata->flags = AirportWCL::SSIDPresent | AirportWCL::RSSIValid;
     memcpy(metadata + 1, ies, length);
-    metadata->ieLength = uint32_t(AirportWCL::selectWPA2TransitionMode(
+    /*
+     * -mtkwcltransition: show PSK/SAE transition networks as they are, so
+     * macOS tries WPA3 on them (to see what its SAE join request carries).
+     */
+    static int showTransition = -1;
+    if (showTransition < 0) {
+        int v = 0;
+        showTransition = PE_parse_boot_argn("-mtkwcltransition", &v, sizeof(v)) ? 1 : 0;
+    }
+    metadata->ieLength = showTransition ? uint32_t(length) :
+        uint32_t(AirportWCL::selectWPA2TransitionMode(
         reinterpret_cast<uint8_t *>(metadata + 1), length));
     size_t messageSize = sizeof(*metadata) + metadata->ieLength;
     if (assocNotified && IEEE80211_ADDR_EQ(node->ni_bssid, joinBSSID)) {
@@ -421,6 +431,16 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *r
 {
     AirportWCL::JoinRequest join;
     if (!AirportWCL::decodeJoin(request, 0x2cc, join)) {
+        // What a request we cannot take carries (lengths and types only,
+        // never key bytes): how macOS hands over e.g. a WPA3 password.
+        const uint8_t *p = reinterpret_cast<const uint8_t *>(request);
+        if (p)
+            XYLog("WCL join rejected: auth lower=%u upper=0x%x ssid_len=%u key len=%u type=%u index=%u flags=0x%x rsn_ie len=%u candidates=%u\n",
+                  AirportWCL::read32(p + 0x10), AirportWCL::read32(p + 0x14),
+                  AirportWCL::read32(p + 0x1c), AirportWCL::read32(p + 0x44),
+                  AirportWCL::read32(p + 0x48), AirportWCL::read16(p + 0x4e),
+                  AirportWCL::read16(p + 0x4c), AirportWCL::read16(p + 0xd4),
+                  AirportWCL::read32(p + 0x214));
         return kIOReturnBadArgument;
     }
     return startWCLJoin(join);

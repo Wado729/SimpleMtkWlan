@@ -278,6 +278,8 @@ struct ieee80211_tx_ba {
 	/* Number of A-MPDU subframes in reorder buffer. */
 	u_int16_t		ba_winsize;
 #define IEEE80211_BA_MAX_WINSZ	64	/* corresponds to maximum ADDBA BUFSZ */
+/* RX reordering ring slots, >= any RX window (ic_rx_ba_max_winsz) */
+#define IEEE80211_BA_RX_BUFSZ	256
 
 	u_int8_t		ba_token;
 

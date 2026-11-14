@@ -797,6 +797,19 @@ int main() {
     assert(rel.out.size() == 1 && rel.out[0].first == 4090 && ro.n == 1);
     mt7927_reorder_stop(&ro, fn, &rel);                                  /* DELBA: held frames go up in order */
     assert(rel.out.size() == 2 && rel.out[1].first == 2 && !ro.active && ro.n == 0);
+    /* phase 4d.2: HE windows of 256 (and 0 means the largest) */
+    rel.out.clear(); mt7927_reorder_start(&ro, 4000, 0);
+    assert(ro.size == 256 && MT7927_REORDER_WIN == 256);
+    for (int k = 255; k >= 1; k--) mt7927_reorder_add(&ro, (4000 + k) & 0xfff, (void *)(intptr_t)(k + 1), 0, fn, &rel);
+    assert(rel.out.empty() && ro.n == 255);                              /* all held behind the hole at 4000 */
+    mt7927_reorder_add(&ro, 4000, (void *)1, 0, fn, &rel);
+    assert(rel.out.size() == 256 && ro.n == 0 && ro.head == ((4000 + 256) & 0xfff));
+    for (int k = 0; k < 256; k++) assert(rel.out[k] == std::make_pair(k + 1, true));
+    rel.out.clear(); mt7927_reorder_start(&ro, 0, 1000);                 /* capped at the window */
+    assert(ro.size == 256);
+    mt7927_reorder_add(&ro, 300, (void *)300, 0, fn, &rel);              /* beyond 256: head jumps to 45 */
+    assert(ro.head == 300 - 256 + 1 && ro.n == 1);
+    mt7927_reorder_stop(&ro, fn, &rel);
   }
 
   /* 14: phase 4 engine: start keeps the hardware, ISR delivers frames and events, scan */

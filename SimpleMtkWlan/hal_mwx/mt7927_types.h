@@ -86,7 +86,7 @@ struct mt7927_rxunit {
  * bypass net80211's (mt76_rx_aggr_reorder() in mt76 agg-rx.c). A unit is
  * one MPDU: an mbuf, or the chain of an A-MSDU's subframes.
  */
-#define	MT7927_REORDER_WIN	64
+#define	MT7927_REORDER_WIN	256	/* mac80211 IEEE80211_MAX_AMPDU_BUF_HE */
 struct mt7927_reorder {
 	bool		active;
 	bool		started;

@@ -642,7 +642,7 @@ struct mwx_softc {
 	volatile bool		sc_7927_pn_reset_mc;
 	CTimeout		*sc_7927_reorder_to;
 	bool			sc_7927_reorder_armed;
-	struct mt7927_rxu	sc_7927_rxu[8 * MT7927_REORDER_WIN];
+	struct mt7927_rxu	sc_7927_rxu[4 * MT7927_REORDER_WIN];
 	struct mt7927_rxu	*sc_7927_rxu_free;
 	bool			sc_7927_rxu_init;
 	uint32_t		sc_7927_rx8023, sc_7927_rx8023_drop;
@@ -2763,6 +2763,14 @@ common:
 		 */
 		if (sc->sc_7927_he)
 			ic->ic_caps |= IEEE80211_C_HE;
+		/*
+		 * RX Block Ack windows up to 256 MPDUs, as mt792x sets
+		 * max_rx_aggregation_subframes (IEEE80211_MAX_AMPDU_BUF_HE):
+		 * longer A-MPDUs between Block Acks, both ways (TX: the AP's ADDBA
+		 * response may give less).
+		 */
+		ic->ic_rx_ba_max_winsz = MT7927_REORDER_WIN;
+		ic->ic_tx_ba_max_winsz = MT7927_REORDER_WIN;
 	}
 
 #if NOTYET
@@ -10150,8 +10158,8 @@ mt7927_ba_task(void *arg)
 
 			ssn = ba->ba_winstart;
 			win = ba->ba_winsize;
-			if (win == 0 || win > 64)
-				win = 64;
+			if (win == 0 || win > MT7927_REORDER_WIN)
+				win = MT7927_REORDER_WIN;
 			/* A-MSDU in A-MPDU when the AP allows it (its ADDBA
 			 * response) and the chip encrypts */
 			amsdu = sc->sc_7927_amsdu_ok &&
