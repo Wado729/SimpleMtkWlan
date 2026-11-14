@@ -336,6 +336,32 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     metadata->capability = node->ni_capinfo;
     metadata->flags = AirportWCL::SSIDPresent | AirportWCL::RSSIValid;
     memcpy(metadata + 1, ies, length);
+    {
+        /*
+         * WPA3 networks (SAE 8, FT-SAE 9, SAE-EXT-KEY 24/25): log what
+         * they ask for once per SSID and band, to plan SAE/PMF/MLO.
+         */
+        AirportWCL::RSNSummary rsn = AirportWCL::summarizeRSN(ies, length);
+        const uint32_t saeAkms = (1u << 8) | (1u << 9) | (1u << 24) | (1u << 25);
+        static uint32_t seen[32];
+        static unsigned nseen;
+        if (rsn.rsn && (rsn.akms & saeAkms)) {
+            uint32_t h = 2166136261u;
+            for (unsigned i = 0; i < node->ni_esslen; ++i)
+                h = (h ^ node->ni_essid[i]) * 16777619u;
+            h = (h ^ (channel > 14 ? 5u : 2u)) * 16777619u;
+            bool logged = false;
+            for (unsigned i = 0; i < nseen; ++i)
+                logged |= seen[i] == h;
+            if (!logged && nseen < 32) {
+                seen[nseen++] = h;
+                XYLog("WCL SAE network \"%.*s\" ch %u: akms 0x%x pairwise 0x%x group %u rsn caps 0x%04x (mfp %s)%s\n",
+                      node->ni_esslen, node->ni_essid, channel, rsn.akms, rsn.pairwise,
+                      rsn.group, rsn.caps, (rsn.caps & 0x40) ? "required" :
+                      (rsn.caps & 0x80) ? "capable" : "off", rsn.mlo ? ", multi-link (MLO)" : "");
+            }
+        }
+    }
     /*
      * -mtkwcltransition: show PSK/SAE transition networks as they are, so
      * macOS tries WPA3 on them (to see what its SAE join request carries).
@@ -510,8 +536,15 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
             return kIOReturnBadArgument;
         }
         if (personal) {
-            if (AirportWCL::isPassphrase(join)) {
-                char passphrase[33] = {};
+            if (AirportWCL::isHexPSK(join)) {
+                for (unsigned i = 0; i < sizeof(ic->ic_psk); ++i) {
+                    auto nib = [](uint8_t c) -> uint8_t {
+                        return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10;
+                    };
+                    ic->ic_psk[i] = uint8_t(nib(join.key[2 * i]) << 4 | nib(join.key[2 * i + 1]));
+                }
+            } else if (AirportWCL::isPassphrase(join)) {
+                char passphrase[64] = {};
                 memcpy(passphrase, join.key, join.keyLength);
                 pbkdf2_sha1(passphrase, join.ssid, join.ssidLength, 4096,
                             ic->ic_psk, sizeof(ic->ic_psk));

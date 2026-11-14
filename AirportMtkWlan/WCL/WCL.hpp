@@ -327,6 +327,50 @@ inline bool validIEs(const uint8_t *data, size_t length) {
     return true;
 }
 
+// What a network's RSN element asks for, for logging WPA3 networks: AKM and
+// pairwise suite types (00-0f-ac only, one bit each), group cipher, RSN caps,
+// and whether a Multi-Link element (Wi-Fi 7 MLO) is present.
+struct RSNSummary {
+    bool rsn;
+    uint32_t akms;
+    uint32_t pairwise;
+    uint8_t group;
+    uint16_t caps;
+    bool mlo;
+};
+
+inline RSNSummary summarizeRSN(const uint8_t *ies, size_t length) {
+    RSNSummary out = {};
+    if (!validIEs(ies, length))
+        return out;
+    for (size_t offset = 0; offset < length; offset += size_t(ies[offset + 1]) + 2) {
+        const uint8_t *ie = ies + offset;
+        size_t size = size_t(ie[1]) + 2;
+        if (ie[0] == 255 && size >= 3 && ie[2] == 107)
+            out.mlo = true;
+        if (ie[0] != 48 || size < 8 || read16(ie + 2) != 1)
+            continue;
+        out.rsn = true;
+        if (ie[4] == 0 && ie[5] == 0x0f && ie[6] == 0xac)
+            out.group = ie[7];
+        size_t at = 8;
+        for (int list = 0; list < 2; ++list) {
+            if (size < at + 2)
+                break;
+            size_t n = read16(ie + at);
+            at += 2;
+            for (size_t i = 0; i < n && size >= at + 4; ++i, at += 4) {
+                const uint8_t *s = ie + at;
+                if (s[0] == 0 && s[1] == 0x0f && s[2] == 0xac && s[3] < 32)
+                    (list ? out.akms : out.pairwise) |= 1u << s[3];
+            }
+        }
+        if (size >= at + 2)
+            out.caps = read16(ie + at);
+    }
+    return out;
+}
+
 inline bool scanUsesProbes(bool requested, bool activeRequest) {
     return requested ? activeRequest : true;
 }
@@ -454,7 +498,7 @@ struct JoinRequest {
     uint32_t keyLength;
     uint32_t keyCipher;
     uint16_t keyIndex;
-    uint8_t key[32];
+    uint8_t key[64];    // 63-character passphrases with the WPA3 capability
     uint8_t bssid[6];
     uint16_t channelSpec;
     uint16_t rsnLength;
@@ -478,10 +522,12 @@ inline bool validRSNOverride(const uint8_t *ie, size_t length) {
         ie[4] == 0xf2 && ie[5] == 1 && ie[6] == 1 && ie[7] == 0;
 }
 
-// A WPA passphrase (8-63 printable characters, at most 32 fit the request)
-// instead of the 32-byte PMK that macOS normally derives itself.
+// A WPA passphrase (8-63 printable characters) instead of the 32-byte PMK
+// that macOS normally derives itself. macOS sends it so (key type 10, up to
+// 64 bytes from the key field into its padding) to a card that says it does
+// SAE, for WPA2 joins too (AirPort_RTW89, AirPort-RTW).
 inline bool isPassphrase(const JoinRequest &j) {
-    if (j.keyLength < 8 || j.keyLength > 32 ||
+    if (j.keyLength < 8 || j.keyLength > 63 ||
         (j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7)))
         return false;
     for (uint32_t i = 0; i < j.keyLength; ++i)
@@ -501,6 +547,18 @@ inline const char *legacyAuthName(LegacyAuth auth) {
     }
 }
 
+// A raw PSK given as 64 hex digits instead of a passphrase.
+inline bool isHexPSK(const JoinRequest &j) {
+    if (j.keyLength != 64)
+        return false;
+    for (uint32_t i = 0; i < 64; ++i) {
+        uint8_t c = j.key[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return false;
+    }
+    return true;
+}
+
 inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
     // Values from apple80211_authtype/cipher_type, used by the WCL association request.
     if (!validRSNOverride(j.rsn, j.rsnLength)) return LegacyAuth::Invalid;
@@ -517,8 +575,8 @@ inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
     if (j.upperAuth & ~(personal | enterprise)) return LegacyAuth::Invalid;
     if ((j.upperAuth & personal) && (j.upperAuth & enterprise)) return LegacyAuth::Invalid;
     if (j.upperAuth & personal)
-        return (j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7)) || isPassphrase(j) ?
-            LegacyAuth::Personal : LegacyAuth::Invalid;
+        return (j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7)) || isPassphrase(j) ||
+            isHexPSK(j) ? LegacyAuth::Personal : LegacyAuth::Invalid;
     if (j.upperAuth & enterprise)
         return (!j.keyLength || (j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7))) ?
             LegacyAuth::Enterprise : LegacyAuth::Invalid;
@@ -533,7 +591,7 @@ inline bool decodeJoin(const void *buffer, size_t length, JoinRequest &out) {
     uint32_t keyLength = read32(p + 0x44);
     uint16_t rsnLength = read16(p + 0xd4);
     if (!count || count > 10 || !ssidLength || ssidLength > 32 ||
-        keyLength > 32 || rsnLength > 257 || length < 0x218 + size_t(count) * 18)
+        keyLength > 64 || rsnLength > 257 || length < 0x218 + size_t(count) * 18)
         return false;
     if (p[0x21c] & 1)
         return false;

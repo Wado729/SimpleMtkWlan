@@ -1126,6 +1126,23 @@ getCARD_CAPABILITIES(OSObject *object,
     // WCL uses this capability together with the BSS HE IE for PHY reporting.
     if (caps & IEEE80211_C_HE)
         cd->capabilities[17] |= 0x80;
+    // Experiment (-mtkwpa3caps): say the card does protected management
+    // frames (byte 6 bit 0x01, __getMFPCaps) and SAE (byte 9 bits 0x08 SAE,
+    // 0x10 the SAE key management suite), as AirPort_RTW89 and AirPort-RTW
+    // traced in Sequoia's IO80211 (Apple80211Associate2). macOS then sends
+    // WPA3 joins, and WPA2 ones with the passphrase itself (key type 10).
+    // SAE itself is not done yet: this only shows the join requests.
+    {
+        static int wpa3 = -1;
+        if (wpa3 < 0) {
+            int v = 0;
+            wpa3 = PE_parse_boot_argn("-mtkwpa3caps", &v, sizeof(v)) ? 1 : 0;
+        }
+        if (wpa3) {
+            cd->capabilities[6] |= 0x01;
+            cd->capabilities[9] |= 0x08 | 0x10;
+        }
+    }
 #else
     cd->capabilities[2] = 0xFF; // BURST, WME, SHORT_GI_40MHZ, SHORT_GI_20MHZ, WOW, TSN, ?, ?
     cd->capabilities[3] = 0x2B;
