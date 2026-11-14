@@ -152,7 +152,12 @@ ieee80211_begin_cache_bgscan(struct _ifnet *ifp)
     
     //if last cache scan is 5 minutes ago, clear the nodes and rescan.
     microtime(&tv);
-    if (ic->ic_last_cache_scan_ts > 0 && tv.tv_sec - ic->ic_last_cache_scan_ts > 5 * 60) {
+    if (ic->ic_last_cache_scan_ts > 0 && tv.tv_sec - ic->ic_last_cache_scan_ts > 5 * 60
+#ifdef AIRPORT_WCL
+        /* phase 4e.7: a few-channel subset would refill only those channels */
+        && !ic->ic_wcl_scan_restricted
+#endif
+        ) {
         ieee80211_free_allnodes(ic, 0);
     }
     ic->ic_last_cache_scan_ts = tv.tv_sec;

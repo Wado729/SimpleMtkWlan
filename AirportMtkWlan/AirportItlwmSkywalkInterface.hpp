@@ -452,6 +452,10 @@ private:
     bool scanPending;
     bool scanCompleted;
     bool scanSkipCompletion;
+    bool scanDeferred;                  // held while the driver comes up
+    AirportWCL::ScanRequest deferredScan;
+    IOReturn startWCLScan(const AirportWCL::ScanRequest &);
+    void startDeferredWCLScan();
     bool wclBssValid;
     bool wclLinkIndicated;
     uint8_t wclBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];

@@ -99,6 +99,7 @@ void AirportItlwmSkywalkInterface::stopWCL()
     if (scanSource)
         scanSource->cancelTimeout();
     scanPending = joinPending = false;
+    scanDeferred = false;
     joinDeferred = false;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     if (fHalService) {
@@ -240,13 +241,49 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     AirportWCL::ScanRequest scan;
     if (!AirportWCL::decodeScan(request, 0x1550, scan))
         return kIOReturnBadArgument;
+    return startWCLScan(scan);
+}
+
+void AirportItlwmSkywalkInterface::startDeferredWCLScan()
+{
+    if (!scanDeferred)
+        return;
+    scanDeferred = scanPending = false;
+    scanSource->cancelTimeout();
+    if (startWCLScan(deferredScan) != kIOReturnSuccess) {
+        IOReturn status = kIOReturnAborted;
+        instance->postMessage(this, AirportWCL::ScanDone, &status, sizeof(status), true);
+    }
+}
+
+/*
+ * Phase 4e.7, following Ersiter's Eric-AirportItlwm startWCLScan: a scan is
+ * not refused because another one runs (the newer supersedes it) or because
+ * the driver is still coming up (it is held and issued when ready). Each
+ * refusal silently lost those channels: from outside, a Wi-Fi menu that
+ * never shows them.
+ */
+IOReturn AirportItlwmSkywalkInterface::startWCLScan(const AirportWCL::ScanRequest &scan)
+{
     ieee80211com *ic = fHalService->get80211Controller();
-    if (!(ic->ic_if.if_flags & IFF_RUNNING))
+    if (!(ic->ic_if.if_flags & IFF_RUNNING)) {
+        if (ic->ic_if.if_flags & IFF_UP) {
+            if (scanPending)
+                finishWCLScan(kIOReturnAborted);
+            deferredScan = scan;
+            scanDeferred = scanPending = true;
+            scanCompleted = false;
+            scanSource->setTimeoutMS(20000);
+            return kIOReturnSuccess;
+        }
         return kIOReturnNotReady;
-    if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
+    }
+    if (joinPending)
         return kIOReturnBusy;
     if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
         return kIOReturnBusy;
+    if (scanPending)
+        finishWCLScan(kIOReturnAborted);    // the newer request supersedes it
     if (scan.channelCount) {
         bool usable = false;
         for (unsigned channel = 1; channel <= IEEE80211_CHAN_MAX; ++channel)
@@ -274,7 +311,10 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
     memcpy(ic->ic_wcl_scan_channels6g, scan.channels6g, sizeof(scan.channels6g));
     scanSource->setTimeoutMS(20000);
-    if (ic->ic_state == IEEE80211_S_RUN) {
+    if (ic->ic_state == IEEE80211_S_RUN && (ic->ic_flags & IEEE80211_F_BGSCAN)) {
+        // a scan is running: the HAL starts this one when it ends
+        ic->ic_wcl_scan_restart = true;
+    } else if (ic->ic_state == IEEE80211_S_RUN) {
         ieee80211_begin_cache_bgscan(&ic->ic_if);
         if (!(ic->ic_flags & IEEE80211_F_BGSCAN)) {
             scanPending = false;
@@ -304,9 +344,11 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
     if (!scanPending)
         return;
     scanPending = false;
+    scanDeferred = false;
     scanCompleted = false;
     scanSource->cancelTimeout();
     fHalService->get80211Controller()->ic_wcl_scan_requested = false;
+    fHalService->get80211Controller()->ic_wcl_scan_restart = false;
     instance->postMessage(this, AirportWCL::ScanDone, &status, sizeof(status), true);
 }
 
@@ -870,8 +912,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             // adapter reset. Replaying firmware-load events here rotates the
             // scan MAC again and recursively restarts the card.
             if (AirportWCL::consumeMacReconfiguration(ic->ic_wcl_mac_reconfig, ready)) {
-                if (ready)
+                if (ready) {
+                    startDeferredWCLScan();
                     resumeWCLJoin();
+                }
                 break;
             }
             if (ready) {
@@ -883,8 +927,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             event.available = ready;
             event.reason = ready ? 0xe0821803 : 0xe0821804;
             instance->postMessage(this, AirportWCL::DriverAvailable, &event, sizeof(event), true);
-            if (ready)
+            if (ready) {
+                startDeferredWCLScan();     // before a join: a fresh list to pick from
                 resumeWCLJoin();
+            }
             break;
         }
         case IEEE80211_EVT_BEACON_6G:

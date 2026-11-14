@@ -1143,6 +1143,10 @@ getCARD_CAPABILITIES(OSObject *object,
             cd->capabilities[9] |= 0x08 | 0x10;
         }
     }
+    // Phase 4e.7: native WCL is6GSupported reads capability byte 11, bit 6
+    // (Ersiter's Eric-AirportItlwm AirportItlwmV2.cpp).
+    if (fHalService->get80211Controller()->ic_6ghz_channels)
+        cd->capabilities[11] |= 0x40;
 #else
     cd->capabilities[2] = 0xFF; // BURST, WME, SHORT_GI_40MHZ, SHORT_GI_20MHZ, WOW, TSN, ?, ?
     cd->capabilities[3] = 0x2B;

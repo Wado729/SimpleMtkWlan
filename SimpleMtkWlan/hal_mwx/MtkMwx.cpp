@@ -1770,8 +1770,7 @@ mwx_bgscan(struct ieee80211com *ic)
 		 * macOS's channel subsets go straight through; a full sweep
 		 * (no channel list) at most every 2 minutes.
 		 */
-		static uint64_t last_full_ns, window_ns;
-		static uint32_t window_n;
+		static uint64_t last_full_ns;
 		uint64_t now_ns, min_ns = 120ULL * 1000000000ULL;
 
 		if (sc->sc_7927_nobgscan)
@@ -1783,26 +1782,14 @@ mwx_bgscan(struct ieee80211com *ic)
 		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
 #ifdef AIRPORT_WCL
 		/*
-		 * macOS's few-channel subsets. Phase 4e.5: it sends a scan as
-		 * channel subsets, 2.4 GHz first, the next ones within a few
-		 * ms of each completion. A time gap between scans let only the
-		 * first through, so its 5 and 6 GHz subsets never ran. Phase
-		 * 4e.6: a budget instead, 8 subsets per 10 s window: a whole
-		 * series passes, a runaway stream does not.
+		 * Phase 4e.7: macOS's channel subsets all go through, back to
+		 * back (it sends the next within ms of each completion; any
+		 * refusal silently loses those channels). Ersiter's
+		 * Eric-AirportItlwm refuses none either. Only full sweeps nobody
+		 * asked for keep the 2 minute limit.
 		 */
-		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted) {
-			if (window_ns == 0 ||
-			    now_ns - window_ns >= 10ULL * 1000000000ULL) {
-				window_ns = now_ns;
-				window_n = 0;
-			}
-			if (window_n >= 8) {
-				sc->sc_7927_bgscan_busy++;
-				return EBUSY;
-			}
-			window_n++;
+		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted)
 			min_ns = 0;
-		}
 #endif
 		if (min_ns != 0) {
 			if (last_full_ns != 0 && now_ns - last_full_ns < min_ns) {
@@ -7728,6 +7715,18 @@ mt7927_scan_start_ex(struct mt7927_bringup *b, const struct mt7927_vif *v,
 	}
 	msg.chan.channels_num = (uint8_t)nch;
 	msg.chan.channel_type = nch ? 4 : 0;
+	/*
+	 * Phase 4e.7: 6 GHz networks are found from their beacons (NO_IR:
+	 * no probing first), every ~100 ms; the firmware's default dwell was
+	 * ~40 ms (results 40 ms apart in the logs), so most scans missed them.
+	 * 120 ms, as the MT7922 path and macOS's own passive dwell (110).
+	 */
+	for (i = 0; i < nch; i++)
+		if (ch[i].band == 3) {
+			msg.req.min_dwell = htole16(120);
+			msg.req.dwell = htole16(120);
+			break;
+		}
 
 	msg.misc.tag = htole16(MT7927_UNI_SCAN_MISC);
 	msg.misc.len = htole16(sizeof(msg.misc));
@@ -12629,6 +12628,24 @@ mwx_end_scan_task(void *arg)
 		return;
 	}
 	if (sc->sc_hwtype == MWX_HW_MT7927) {
+#ifdef AIRPORT_WCL
+		/*
+		 * Phase 4e.7: macOS asked for another scan while this one ran
+		 * (it supersedes it, as in Ersiter's ic_wcl_scan_restart):
+		 * start that one now instead of reporting this one done.
+		 */
+		if (ic->ic_wcl_scan_restart && ic->ic_state == IEEE80211_S_RUN &&
+		    (ic->ic_flags & IEEE80211_F_BGSCAN)) {
+			ic->ic_wcl_scan_restart = false;
+			if (mt7927_hal_scan(sc) == 0) {
+				sc->sc_flags |= MWX_FLAG_BGSCAN;
+				sc->sc_7927_bgscans++;
+				splx(s);
+				return;
+			}
+		}
+		ic->ic_wcl_scan_restart = false;
+#endif
 		mt7927_hal_end_scan(sc);
 		splx(s);
 		return;
