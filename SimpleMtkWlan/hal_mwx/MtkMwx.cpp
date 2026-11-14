@@ -4419,11 +4419,13 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 
 /* Phase 4 (mt7925/mcu.h, mt76_connac_mcu.h). */
 #define	MT7927_UNI_SCAN_REQ_CMD		MT7927_UNI_CMD(0x16)
+#define	MT7927_SCAN_IE_MAX		200	/* probe-request IEs per band */
 #define	MT7927_UNI_SCAN_REQ		1
 #define	MT7927_UNI_SCAN_CANCEL		2
 #define	MT7927_UNI_SCAN_SSID		10
 #define	MT7927_UNI_SCAN_BSSID		11
 #define	MT7927_UNI_SCAN_CHANNEL		12
+#define	MT7927_UNI_SCAN_IE		13
 #define	MT7927_UNI_SCAN_MISC		14
 #define	MT7927_SCAN_FUNC_SPLIT_SCAN	(1U << 5)
 #define	MT7927_UNI_EVENT_SCAN_DONE	0x0e
@@ -7464,9 +7466,10 @@ mt7927_set_rxfilter(struct mt7927_bringup *b, uint8_t band_idx, uint32_t fif)
  * given; wildcard BSSID; split scan; firmware default dwell times.
  */
 int
-mt7927_scan_start(struct mt7927_bringup *b, const struct mt7927_vif *v,
+mt7927_scan_start_ex(struct mt7927_bringup *b, const struct mt7927_vif *v,
     const struct mt7927_scan_chan *ch, int nch, const uint8_t *ssid,
-    int ssid_len)
+    int ssid_len, bool active, const uint8_t *const ie[2],
+    const uint16_t ie_len[2])
 {
 	struct {
 		uint8_t		seq_num, bss_idx, pad[2];
@@ -7501,10 +7504,15 @@ mt7927_scan_start(struct mt7927_bringup *b, const struct mt7927_vif *v,
 			uint8_t	random_mac[6], rsv[2];
 		} __packed misc;
 	} __packed msg;
+	/* the message, then a probe-request IE TLV per band (2.4, 5 GHz) */
+	uint8_t buf[sizeof(msg) + 2 * (8 + MT7927_SCAN_IE_MAX)];
+	uint32_t blen;
 	int i, rv;
 
 	if (nch > 64)
 		nch = 64;
+	if (ssid_len > 0)
+		active = true;
 	memset(&msg, 0, sizeof(msg));
 	b->scan_seq = (b->scan_seq + 1) & 0x7f;
 	msg.seq_num = b->scan_seq | (uint8_t)(v->band_idx << 7);
@@ -7512,8 +7520,14 @@ mt7927_scan_start(struct mt7927_bringup *b, const struct mt7927_vif *v,
 
 	msg.req.tag = htole16(MT7927_UNI_SCAN_REQ);
 	msg.req.len = htole16(sizeof(msg.req));
-	msg.req.scan_type = ssid_len > 0 ? 1 : 0;
-	msg.req.probe_req_num = ssid_len > 0 ? 2 : 0;
+	/*
+	 * mt7925_mcu_hw_scan() with cfg80211's usual wildcard SSID: an active
+	 * scan (2 probe requests per channel; the firmware stays passive where
+	 * the regulatory domain requires). A passive scan can miss an AP whose
+	 * beacon does not fall in the dwell.
+	 */
+	msg.req.scan_type = active ? 1 : 0;
+	msg.req.probe_req_num = active ? 2 : 0;
 	msg.req.scan_func = MT7927_SCAN_FUNC_SPLIT_SCAN;
 
 	msg.ssid.tag = htole16(MT7927_UNI_SCAN_SSID);
@@ -7543,13 +7557,43 @@ mt7927_scan_start(struct mt7927_bringup *b, const struct mt7927_vif *v,
 	msg.misc.tag = htole16(MT7927_UNI_SCAN_MISC);
 	msg.misc.len = htole16(sizeof(msg.misc));
 
+	memcpy(buf, &msg, sizeof(msg));
+	blen = sizeof(msg);
+	/* mt7925_mcu_build_scan_ie_tlv(): the IEs of our probe requests */
+	for (i = 0; active && ie != NULL && i < 2; i++) {
+		uint8_t *t = buf + blen;
+
+		if (ie[i] == NULL || ie_len[i] == 0 ||
+		    ie_len[i] > MT7927_SCAN_IE_MAX)
+			continue;
+		t[0] = MT7927_UNI_SCAN_IE;
+		t[1] = 0;
+		t[2] = (uint8_t)(8 + ie_len[i]);
+		t[3] = (uint8_t)((8 + ie_len[i]) >> 8);
+		t[4] = (uint8_t)ie_len[i];
+		t[5] = (uint8_t)(ie_len[i] >> 8);
+		t[6] = (uint8_t)(i + 1);		/* band: 1 2.4, 2 5 GHz */
+		t[7] = 0;
+		memcpy(t + 8, ie[i], ie_len[i]);
+		blen += 8 + ie_len[i];
+	}
+
 	mt7927_op_lock(b);
-	rv = mt7927_mcu_send(b, MT7927_UNI_SCAN_REQ_CMD, &msg, sizeof(msg), true);
+	rv = mt7927_mcu_send(b, MT7927_UNI_SCAN_REQ_CMD, buf, blen, true);
 	mt7927_op_unlock(b);
 	MWX_DEV_LOG(b->sc, "MT7927 scan request seq %u bss %u band %u: %d "
 	    "channels, %s -> %d\n", b->scan_seq, v->idx, v->band_idx, nch,
-	    ssid_len > 0 ? "active" : "passive", rv);
+	    active ? "active" : "passive", rv);
 	return rv;
+}
+
+int
+mt7927_scan_start(struct mt7927_bringup *b, const struct mt7927_vif *v,
+    const struct mt7927_scan_chan *ch, int nch, const uint8_t *ssid,
+    int ssid_len)
+{
+	return mt7927_scan_start_ex(b, v, ch, nch, ssid, ssid_len, false,
+	    NULL, NULL);
 }
 
 /* mt7925_mcu_cancel_hw_scan() */
@@ -9374,7 +9418,7 @@ mt7927_hal_stop(struct mwx_softc *sc)
 	sc->sc_7927_rxml_frames = 0;
 }
 
-/* Passive scan of every channel in the net80211 table. */
+/* Active (wildcard) scan of every channel in the net80211 table, as Linux. */
 static int
 mt7927_hal_scan(struct mwx_softc *sc)
 {
@@ -9395,7 +9439,26 @@ mt7927_hal_scan(struct mwx_softc *sc)
 		n++;
 	}
 	mt7927_vif_fill(sc, &v);
-	rv = mt7927_scan_start(sc->sc_7927, &v, ch, n, NULL, 0);
+	{
+		/* probe-request IEs as net80211 builds them (rates, HT, VHT) */
+		uint8_t ie2[MT7927_SCAN_IE_MAX], ie5[MT7927_SCAN_IE_MAX], *f;
+		const uint8_t *ies[2] = { ie2, ie5 };
+		uint16_t lens[2];
+
+		f = ieee80211_add_rates(ie2, &ic->ic_sup_rates[IEEE80211_MODE_11G]);
+		f = ieee80211_add_xrates(f, &ic->ic_sup_rates[IEEE80211_MODE_11G]);
+		if (ic->ic_flags & IEEE80211_F_HTON)
+			f = ieee80211_add_htcaps(f, ic);
+		lens[0] = (uint16_t)(f - ie2);
+		f = ieee80211_add_rates(ie5, &ic->ic_sup_rates[IEEE80211_MODE_11A]);
+		if (ic->ic_flags & IEEE80211_F_HTON)
+			f = ieee80211_add_htcaps(f, ic);
+		if (ic->ic_flags & IEEE80211_F_VHTON)
+			f = ieee80211_add_vhtcaps(f, ic);
+		lens[1] = (uint16_t)(f - ie5);
+		rv = mt7927_scan_start_ex(sc->sc_7927, &v, ch, n, NULL, 0, true,
+		    ies, lens);
+	}
 	if (rv == 0) {
 		sc->sc_flags |= MWX_FLAG_SCANNING;
 		sc->sc_7927_scan_ticks = 0;

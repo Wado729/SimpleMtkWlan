@@ -94,6 +94,7 @@ struct Chip {
   uint8_t bss_rlm_center = 0, bss_rlm_bw = 0xff, bss_rlm_sco = 0xff, bss_rlm_htop = 0xff;
   uint8_t bss_sec_mode = 0xff, bss_sec_status = 0xff, bss_sec_cipher = 0xff;
   uint8_t ps_bss = 0xff, ps_state = 0xff; int ps_n = 0;
+  uint8_t scan_probes = 0; std::vector<std::pair<int, int>> scan_ies;
   uint8_t edca_bss = 0xff, edca[4][3] = {{0}}; uint16_t edca_txop[4] = {0}; int edca_n = 0;
   struct StaRec { uint16_t wcid; uint8_t muar; uint16_t ntlv; std::vector<uint16_t> tags; uint32_t conn_type; int conn_state;
                   uint16_t aid; uint8_t peer[6]; uint16_t extra; int state; uint16_t ra_legacy, basic_rate; uint8_t phy_type;
@@ -375,12 +376,17 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
       uint32_t off = 4;
       for (int k = 0; k < 5; k++) { uint16_t tg, ln; memcpy(&tg, pl + off, 2); memcpy(&ln, pl + off + 2, 2);
         assert(tg == want_tag[k] && ln == want_len[k]);
-        if (tg == 1) { chip.scan_type = pl[off + 4]; assert(pl[off + 6] == (1 << 5)); }
+        if (tg == 1) { chip.scan_type = pl[off + 4]; chip.scan_probes = pl[off + 5]; assert(pl[off + 6] == (1 << 5)); }
         if (tg == 10) { assert(pl[off + 4] == 1 && pl[off + 5] == 0); }            /* wildcard, no SSIDs */
         if (tg == 11) { for (int q = 0; q < 6; q++) assert(pl[off + 4 + q] == 0xff); }
         if (tg == 12) { assert(pl[off + 4] == 4); chip.scan_ch.clear();
           for (int q = 0; q < pl[off + 5]; q++) chip.scan_ch.push_back({pl[off + 8 + 2 * q], pl[off + 9 + 2 * q]}); }
         off += ln; }
+      chip.scan_ies.clear();
+      while (off < plen) {                                /* phase 4c.12: UNI_SCAN_IE per band */
+        uint16_t tg, ln, il; memcpy(&tg, pl + off, 2); memcpy(&ln, pl + off + 2, 2); memcpy(&il, pl + off + 4, 2);
+        assert(tg == 13 && ln == 8 + il && off + ln <= plen && (pl[off + 6] == 1 || pl[off + 6] == 2));
+        chip.scan_ies.push_back({pl[off + 6], il}); off += ln; }
       assert(off == plen);
       break; }
     case 0x2c: {                                          /* SET_POWER_LIMIT */
@@ -845,6 +851,13 @@ int main() {
     assert(mt7927_dev_add(&r->b, &v, false) == 0);
     assert(chip.uni_order.size() == 4 && chip.uni_order[2] == "bss" && chip.uni_order[3] == "dev" && chip.dev_active == 0);
     assert(r->b.mcu_timeouts == 0 && svc_max == 1 && svc_depth == 0 && op_depth == 0 && op_taken == 8);
+    /* phase 4c.12: active wildcard scan with probe IEs per band (mt7925_mcu_hw_scan) */
+    { const uint8_t ie2[] = {1, 2, 0x82, 0x84}, ie5[] = {1, 1, 0x8c, 45, 1, 0};
+      const uint8_t *const ies[2] = {ie2, ie5}; const uint16_t lens[2] = {sizeof ie2, sizeof ie5};
+      assert(mt7927_scan_start_ex(&r->b, &v, ch, 3, nullptr, 0, true, ies, lens) == 0);
+      assert(chip.scan_type == 1 && chip.scan_probes == 2 && chip.scan_ies.size() == 2 &&
+             chip.scan_ies[0] == std::make_pair(1, 4) && chip.scan_ies[1] == std::make_pair(2, 6));
+      assert(mt7927_scan_start(&r->b, &v, ch, 3, nullptr, 0) == 0 && chip.scan_type == 0 && chip.scan_ies.empty()); }
     /* a data packet that is not an 802.11 frame is counted, not delivered */
     mt7927_engine_stop(&r->b);
     assert(!mt7927_engine_running(&r->b) && !irq_registered && !r->dev->busmaster && live_allocs == 0 && chip.wfsys_resets == 2);
