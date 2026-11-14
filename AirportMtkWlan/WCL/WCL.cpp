@@ -489,9 +489,12 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         AirportWCL::RSNSummary r = {};
         if (jn && jn->ni_rsnie && jn->ni_rsnie[1] >= 2)
             r = AirportWCL::summarizeRSN(jn->ni_rsnie, size_t(jn->ni_rsnie[1]) + 2);
-        bool psk = r.rsn && (r.akms & (1u << 2)) && !(r.caps & 0x40);
-        XYLog("WCL join asks for WPA3 (upper 0x%x) on %s: network akms 0x%x rsn caps 0x%04x -> %s\n",
-              join.upperAuth, ether_sprintf(join.bssid), r.akms, r.caps,
+        // Not in net80211's table yet (right after boot): try WPA2 anyway;
+        // the handshake fails by itself on a network without PSK.
+        bool known = r.rsn;
+        bool psk = !known || ((r.akms & (1u << 2)) && !(r.caps & 0x40));
+        XYLog("WCL join asks for WPA3 (upper 0x%x) on %s: network %s akms 0x%x rsn caps 0x%04x -> %s\n",
+              join.upperAuth, ether_sprintf(join.bssid), known ? "known," : "not scanned yet,", r.akms, r.caps,
               psk ? "WPA2-PSK from the password (SAE not implemented yet)" : "not possible without SAE");
         if (psk)
             join.upperAuth = APPLE80211_AUTHTYPE_WPA2_PSK;
