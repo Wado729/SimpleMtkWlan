@@ -2756,6 +2756,13 @@ common:
 		sc->sc_7927_he = !PE_parse_boot_argn("-mtk7927nohe", &off,
 		    sizeof(off));
 		mt7927_he_caps(ic, true);
+		/*
+		 * The front end reports HE to macOS from this (card
+		 * capabilities byte 17 bit 7, WCLDeviceConfiguration::
+		 * isHeSupported); without it the menu says 802.11ac.
+		 */
+		if (sc->sc_7927_he)
+			ic->ic_caps |= IEEE80211_C_HE;
 	}
 
 #if NOTYET
