@@ -474,6 +474,28 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *r
 
 IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
 {
+    /*
+     * WPA3 (SAE) asked for, with the password itself, on a network that
+     * also takes WPA2-PSK (transition mode): join with WPA2-PSK from that
+     * password until SAE is implemented, as AirPort_RTW89 falls back. Only
+     * when the network's RSN element offers PSK (AKM 2) and does not
+     * require management frame protection; SAE-only networks still fail.
+     */
+    const uint32_t saeAuth = APPLE80211_AUTHTYPE_WPA3_SAE | APPLE80211_AUTHTYPE_WPA3_FT_SAE;
+    if ((join.upperAuth & saeAuth) && !(join.upperAuth & ~(saeAuth | APPLE80211_AUTHTYPE_WPA2_PSK)) &&
+        AirportWCL::isPassphrase(join)) {
+        ieee80211com *jic = fHalService->get80211Controller();
+        ieee80211_node *jn = ieee80211_find_node(jic, join.bssid);
+        AirportWCL::RSNSummary r = {};
+        if (jn && jn->ni_rsnie && jn->ni_rsnie[1] >= 2)
+            r = AirportWCL::summarizeRSN(jn->ni_rsnie, size_t(jn->ni_rsnie[1]) + 2);
+        bool psk = r.rsn && (r.akms & (1u << 2)) && !(r.caps & 0x40);
+        XYLog("WCL join asks for WPA3 (upper 0x%x) on %s: network akms 0x%x rsn caps 0x%04x -> %s\n",
+              join.upperAuth, ether_sprintf(join.bssid), r.akms, r.caps,
+              psk ? "WPA2-PSK from the password (SAE not implemented yet)" : "not possible without SAE");
+        if (psk)
+            join.upperAuth = APPLE80211_AUTHTYPE_WPA2_PSK;
+    }
     auto auth = AirportWCL::classifyLegacyAuth(join);
     XYLog("WCL join ssid_len=%u bssid=%s chanspec=0x%x auth lower=%u upper=0x%x -> %s, key len=%u type=%u%s, rsn_ie len=%u\n",
           join.ssidLength, ether_sprintf(join.bssid), join.channelSpec, join.lowerAuth, join.upperAuth,
