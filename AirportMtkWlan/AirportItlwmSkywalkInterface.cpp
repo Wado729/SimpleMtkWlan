@@ -861,6 +861,14 @@ getSUPPORTED_CHANNELS(struct apple80211_sup_channel_data *ad)
             ad->num_channels++;
         }
     }
+    // 6 GHz: flag 0x2000 (IO80211.framework's 6 GHz bit, per AirPort_RTW89)
+    if (ic->ic_6ghz_channels)
+        for (unsigned ch = 1; ch <= 233 && ad->num_channels < APPLE80211_MAX_CHANNELS; ch += 4) {
+            ad->supported_channels[ad->num_channels].version = APPLE80211_VERSION;
+            ad->supported_channels[ad->num_channels].channel = ch;
+            ad->supported_channels[ad->num_channels].flags = 0x2000 | APPLE80211_C_FLAG_20MHZ;
+            ad->num_channels++;
+        }
     return kIOReturnSuccess;
 }
 

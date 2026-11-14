@@ -386,6 +386,37 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     IOFree(metadata, size);
 }
 
+/*
+ * A 6 GHz network the driver heard (IEEE80211_EVT_BEACON_6G): no net80211
+ * node, so the metadata comes from the frame. Chanspec band 6G (0x5000: WL_CHANSPEC_BAND_6G 0x4000 | 20 MHz 0x1000).
+ */
+void AirportItlwmSkywalkInterface::publishWCLBeacon6G(const ieee80211_beacon6g_event *ev)
+{
+    if (!ev || !ev->bssid || ev->ssid_len > 32 || !ev->chan || ev->chan > 233 ||
+        !AirportWCL::validIEs(ev->ies, ev->length))
+        return;
+    size_t size = sizeof(AirportWCL::BeaconMetadata) + ev->length;
+    auto metadata = static_cast<AirportWCL::BeaconMetadata *>(IOMalloc(size));
+    if (!metadata)
+        return;
+    *metadata = {};
+    metadata->channelSpec = uint16_t(ev->chan | 0x5000);
+    metadata->channel = ev->chan;
+    metadata->ssidLength = ev->ssid_len;
+    if (ev->ssid && ev->ssid_len)
+        memcpy(metadata->ssid, ev->ssid, ev->ssid_len);
+    memcpy(metadata->bssid, ev->bssid, 6);
+    metadata->rssi = ev->rssi;
+    metadata->interval = ev->intval;
+    metadata->capability = ev->capinfo;
+    metadata->flags = (ev->ssid_len ? AirportWCL::SSIDPresent : 0) | AirportWCL::RSSIValid;
+    memcpy(metadata + 1, ev->ies, ev->length);
+    metadata->ieLength = uint32_t(ev->length);
+    size_t messageSize = sizeof(*metadata) + metadata->ieLength;
+    instance->postMessage(this, AirportWCL::ScanResult, metadata, messageSize, true);
+    IOFree(metadata, size);
+}
+
 void AirportItlwmSkywalkInterface::clearWCLPMKSA()
 {
     auto ic = fHalService->get80211Controller();
@@ -850,6 +881,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                 resumeWCLJoin();
             break;
         }
+        case IEEE80211_EVT_BEACON_6G:
+            if (data && (scanPending || joinPending || ic->ic_state == IEEE80211_S_SCAN))
+                publishWCLBeacon6G(static_cast<const ieee80211_beacon6g_event *>(data));
+            break;
         case IEEE80211_EVT_BEACON: {
             auto beacon = static_cast<ieee80211_beacon_event *>(data);
             if (!beacon)
@@ -1100,6 +1135,10 @@ IOReturn AirportItlwmSkywalkInterface::copyWCLChannels(void *data)
             IEEE80211_IS_CHAN_HT40(channel) || IEEE80211_IS_CHAN_VHT40(channel),
             IEEE80211_IS_CHAN_VHT80(channel));
     }
+    // 6 GHz (driver scans it; net80211 has no table entries for it)
+    if (ic->ic_6ghz_channels)
+        for (unsigned ch = 1; ch <= 233; ch += 4)
+            AirportWCL::append6GHzChannel(*info, ch);
     apple80211_country_code_data country = {};
     if (instance->getCOUNTRY_CODE(static_cast<OSObject *>(this), &country) == kIOReturnSuccess)
         memcpy(info->country, country.cc, sizeof(country.cc));

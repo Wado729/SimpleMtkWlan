@@ -18,7 +18,10 @@ pre=r'''
 #define MT7927_CIPHER_AES_CCMP 4
 struct ieee80211_frame{uint8_t i_fc[2];uint8_t rest[22];};
 struct chan{int ic_flags;};
-struct ieee80211com{chan ic_channels[256];};
+struct ieee80211com;
+#define IEEE80211_EVT_BEACON_6G 9
+struct ieee80211_beacon6g_event{const uint8_t*bssid;const uint8_t*ssid;uint8_t ssid_len;uint8_t chan;int8_t rssi;uint16_t intval,capinfo;const uint8_t*ies;size_t length;};
+struct ieee80211com{chan ic_channels[256];void(*ic_event_handler)(ieee80211com*,int,void*)=nullptr;uint8_t ic_6ghz_channels=0;};
 struct capa{uint8_t antenna_mask=3;};
 #define MT7927_RXD3_CSUM ((1U << 26) | (1U << 27))
 struct mt7927_bringup{uint32_t info;};
@@ -79,6 +82,15 @@ int main(){
    next={}; next.hdr_off=32; next.frame_len=(uint32_t)buf.size()-32; next.chan=69; next.band=6; next.rssi=-79;
    assert(mt7927_mac_fill_rx(&sc,&m,&rxi)==-1 && sc.sc_7927_rx_drop[0]==d0+1);}
   assert(sc.sc_7927_rx_6g==2 && sc.sc_7927_6g_n==1 && logs.size()==1);
+  /* phase 4e.2: with 6 GHz on, every one goes to the front end as an event */
+  static std::vector<std::string> evs; sc.sc_ic.ic_6ghz_channels=1;
+  sc.sc_ic.ic_event_handler=[](ieee80211com*,int code,void*d){auto e=(ieee80211_beacon6g_event*)d;assert(code==9);
+    char l[96]; snprintf(l,sizeof l,"%.*s ch %u rssi %d int %u ies %zu",e->ssid_len,(const char*)e->ssid,e->chan,e->rssi,e->intval,e->length); evs.push_back(l);};
+  f[32]=100; f[34]=0x11; { mbuf m{buf.data(),buf.size()}; ieee80211_rxinfo rxi{};
+   next={}; next.hdr_off=32; next.frame_len=(uint32_t)buf.size()-32; next.chan=69; next.band=6; next.rssi=-76;
+   assert(mt7927_mac_fill_rx(&sc,&m,&rxi)==-1); }
+  assert(evs.size()==1 && evs[0]=="Home_6GHz ch 69 rssi -76 int 100 ies 17" && logs.size()==1);
+  sc.sc_ic.ic_event_handler=nullptr; sc.sc_ic.ic_6ghz_channels=0;
   assert(logs[0].find("6 GHz: beacon \"Home_6GHz\" 40:00:00:00:03:4c ch 69 rssi -79")!=std::string::npos);
  }
  { /* no PN: header stays, protected bit cleared */

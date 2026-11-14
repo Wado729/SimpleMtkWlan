@@ -261,6 +261,26 @@ inline bool appendChannel(NativeChannelInfo &info, unsigned channel, bool fiveGH
     return true;
 }
 
+// A 6 GHz channel: chanspec band 6G (WL_CHANSPEC_BAND_6G 0x4000 in
+// Broadcom's bcmwifi_channels.h) with 20 MHz (0x1000), the encoding the
+// 2.4 (0x1000) and 5 GHz (0xd000) entries already use; passive (6 GHz is
+// NO_IR until a beacon). The channel bitmap's 6 GHz bit is not known.
+inline bool append6GHzChannel(NativeChannelInfo &info, unsigned channel)
+{
+    if (!channel || channel > 233 || info.count >= 400)
+        return false;
+    unsigned index = info.count++;
+    uint16_t spec = uint16_t(channel | 0x5000);
+    info.channelSpec[index] = spec;
+    info.firmwareChannelSpec[index] = spec;
+    info.channel[index] = uint8_t(channel);
+    info.passive[index] = 1;
+    info.supports40MHz[index] = 1;
+    info.supports80MHz[index] = 1;
+    info.channelBitmap[index] = 3U | 32U;
+    return true;
+}
+
 struct TrafficCounters {
     uint64_t realtimeInfraTx;
     uint64_t realtimeInfraRx;

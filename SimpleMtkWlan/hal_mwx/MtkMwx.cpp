@@ -9329,6 +9329,7 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 		    &off, sizeof(off));
 		sc->sc_7927_scan6g = !PE_parse_boot_argn("-mtk7927no6g",
 		    &off, sizeof(off));
+		sc->sc_ic.ic_6ghz_channels = sc->sc_7927_scan6g;
 	}
 	mt7927_engine_set_rx_decap(sc->sc_7927, sc->sc_7927_rx_decap);
 	timeout_set(&sc->sc_7927_reorder_to, mt7927_reorder_timeo, sc);
@@ -11174,6 +11175,29 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 				    f[0] == 0x80 ? "beacon" : "probe response",
 				    ssid[0] ? ssid : "(hidden)", ether_sprintf(f + 16),
 				    ri.chan, ri.rssi);
+			}
+			/* phase 4e.2: to the front end, which shows it in macOS */
+			if (ic->ic_event_handler != NULL && ic->ic_6ghz_channels) {
+				struct ieee80211_beacon6g_event ev;
+				const uint8_t *ie = f + 36, *end = f + ri.frame_len;
+
+				memset(&ev, 0, sizeof(ev));
+				ev.bssid = f + 16;
+				ev.chan = ri.chan;
+				ev.rssi = ri.rssi;
+				ev.intval = (uint16_t)(f[32] | (f[33] << 8));
+				ev.capinfo = (uint16_t)(f[34] | (f[35] << 8));
+				ev.ies = ie;
+				ev.length = (size_t)(end - ie);
+				while (ie + 2 <= end && ie + 2 + ie[1] <= end) {
+					if (ie[0] == 0 && ie[1] <= 32) {
+						ev.ssid = ie + 2;
+						ev.ssid_len = ie[1];
+						break;
+					}
+					ie += 2 + ie[1];
+				}
+				ic->ic_event_handler(ic, IEEE80211_EVT_BEACON_6G, &ev);
 			}
 		}
 		sc->sc_7927_rx_drop[0]++;

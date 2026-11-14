@@ -593,6 +593,7 @@ struct ieee80211com {
     uint8_t ic_ppe_thres[IEEE80211_HE_PPE_THRES_MAX_LEN]; /* Holds the PPE Thresholds data. */
     u_int16_t ic_rx_ba_max_winsz; /* largest RX Block Ack window, 0: IEEE80211_BA_MAX_WINSZ */
     u_int16_t ic_tx_ba_max_winsz; /* TX Block Ack window we request, 0: IEEE80211_BA_MAX_WINSZ */
+    u_int8_t ic_6ghz_channels;   /* driver scans 6 GHz (its networks go out as IEEE80211_EVT_BEACON_6G) */
     
 	TAILQ_HEAD(, ieee80211_ess)	 ic_ess;
 };
@@ -703,6 +704,23 @@ struct ieee80211_ess {
 #define IEEE80211_EVT_STA_DEAUTH                2
 #define IEEE80211_EVT_COUNTRY_CODE_UPDATE       3
 #define IEEE80211_EVT_SCAN_DONE                 4
+/*
+ * A 6 GHz beacon or probe response the driver heard. net80211's channel
+ * table has no 6 GHz entries (the numbers clash with 2.4/5 GHz), so there
+ * is no node: the front end publishes it to macOS as it is.
+ */
+#define IEEE80211_EVT_BEACON_6G                 9
+struct ieee80211_beacon6g_event {
+    const uint8_t *bssid;
+    const uint8_t *ssid;
+    uint8_t ssid_len;
+    uint8_t chan;           /* 6 GHz channel number, 1-233 */
+    int8_t rssi;            /* dBm */
+    uint16_t intval;
+    uint16_t capinfo;
+    const uint8_t *ies;
+    size_t length;
+};
 #ifdef AIRPORT_WCL
 #define IEEE80211_EVT_BEACON 5
 #define IEEE80211_EVT_DRIVER_READY 6

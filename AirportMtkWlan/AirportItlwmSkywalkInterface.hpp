@@ -444,6 +444,7 @@ private:
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
+    void publishWCLBeacon6G(const ieee80211_beacon6g_event *);
     void notifyWCLFirstBeacon(const char *);
     void synthesizeWCLFirstBeacon();
     IOTimerEventSource *joinTimer;
