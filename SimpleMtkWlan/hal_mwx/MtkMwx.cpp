@@ -2828,6 +2828,10 @@ common:
 		sc->sc_7927_he = !PE_parse_boot_argn("-mtk7927nohe", &off,
 		    sizeof(off));
 		mt7927_he_caps(ic, true);
+		/* phase 4g (review): 6 GHz needs HE; an association
+		 * request without it is refused (DENIED_HE_NOT_SUPPORTED) */
+		if (!sc->sc_7927_he)
+			sc->sc_7927_join6g = false;
 		/*
 		 * The front end reports HE to macOS from this (card
 		 * capabilities byte 17 bit 7, WCLDeviceConfiguration::
@@ -9748,9 +9752,15 @@ mt7927_hal_scan(struct mwx_softc *sc)
 		 * Phase 4g: and the other channels where networks were heard,
 		 * so a join scan finds a network off the PSC grid.
 		 */
-		for (psc = 1; psc <= 233 && n < 64; psc += 4) {
-			if (((psc - 5) % 16) == 0 ||
-			    !(sc->sc_7927_6g_heard[psc / 8] & (1U << (psc % 8))))
+		for (psc = 1; sc->sc_7927_join6g && psc <= 233 && n < 64;
+		    psc += 4) {
+			bool heard6 = sc->sc_7927_6g_heard[psc / 8] &
+			    (1U << (psc % 8));
+#ifdef AIRPORT_WCL
+			/* the channel macOS joins on (startWCLJoin) */
+			heard6 = heard6 || (ic->ic_wcl_join_chan6g == psc);
+#endif
+			if (((psc - 5) % 16) == 0 || !heard6)
 				continue;
 			ch[n].band = 3;
 			ch[n].chan = (uint8_t)psc;
@@ -10048,8 +10058,13 @@ mt7927_bss_fill(struct mwx_softc *sc, struct ieee80211_node *ni,
 		 * the A-MPDU factor/density come from them
 		 * (mt7925_mcu_sta_phy_tlv).
 		 */
-		uint16_t c6 = ni->ni_he_6ghz_capa;
+		uint16_t c6 = he ? ni->ni_he_6ghz_capa : 0;
 
+		/*
+		 * Review: at AUTH Linux's link_sta is still empty (no
+		 * he_6ghz_capa), so only the phymode goes then; the rest at
+		 * association, with HE.
+		 */
 		bss->phymode = 0x01 | 0x10 | 0x20 | 0x80;
 		bss->he_6g_capa = c6;
 		if (c6 != 0) {
@@ -10081,6 +10096,11 @@ mt7927_bss_fill(struct mwx_softc *sc, struct ieee80211_node *ni,
 			    1 + IEEE80211_VHTCAP_MAX_MPDU_LENGTH_3895;
 		if (bss->amsdu > 1 + IEEE80211_VHTCAP_MAX_MPDU_LENGTH_11454)
 			bss->amsdu = 1 + IEEE80211_VHTCAP_MAX_MPDU_LENGTH_3895;
+	} else if (sc->sc_7927_amsdu_ok && bss->he_6g_capa) {
+		/* phase 4g: on 6 GHz from the HE 6 GHz capabilities */
+		bss->amsdu = (uint8_t)(1 + ((bss->he_6g_capa &
+		    IEEE80211_HE_6GHZ_CAP_MAX_MPDU_LEN) >>
+		    IEEE80211_HE_6GHZ_CAP_MAX_MPDU_LEN_SHIFT));
 	}
 	bss->rx_hdr_trans = sc->sc_7927_rx_decap;
 }

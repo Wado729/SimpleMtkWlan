@@ -746,6 +746,10 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     }
     ic->ic_des_esslen = join.ssidLength;
     memcpy(ic->ic_des_essid, join.ssid, sizeof(ic->ic_des_essid));
+    // Phase 4g: a 6 GHz join (chanspec band 0x4000): its channel goes into
+    // the join scan even off the PSC grid
+    ic->ic_wcl_join_chan6g = (join.channelSpec & 0xc000) == 0x4000 ?
+        uint8_t(join.channelSpec & 0xff) : 0;
     memcpy(ic->ic_des_bssid, join.bssid, 6);
     memcpy(joinBSSID, join.bssid, 6);
     ic->ic_flags |= IEEE80211_F_DESBSSID;

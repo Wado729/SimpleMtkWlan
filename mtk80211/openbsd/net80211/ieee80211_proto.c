@@ -893,6 +893,19 @@ ieee80211_he_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
             width = IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_20MHZ;
         if (center < 1 || center > 233)
             width = IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_20MHZ;
+        else if (width != IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_20MHZ) {
+            /*
+             * The center must hold the primary (Ersiter's check): primary
+             * 20 MHz centers sit 10, 30, 50 ... MHz from it, within half
+             * the width. Otherwise 20 MHz at the primary.
+             */
+            int prim = (int)ieee80211_chan2number(ic, ni->ni_chan);
+            int dist = abs(prim - (int)center) * 5;
+            int half = (20 << width) / 2;
+
+            if (dist < 10 || dist > half - 10 || (dist - 10) % 20)
+                width = IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_20MHZ;
+        }
         switch (width) {
         case IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_160MHZ:
             ni->ni_chw = IEEE80211_CHAN_WIDTH_160;

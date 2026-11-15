@@ -35,7 +35,12 @@ funcs = "".join([
     fn(c80211, "ieee80211_ieee2mhz", "u_int"),
     fn(outc, "ieee80211_add_he_6ghz_capa", "uint8_t *"),
     fn(proto, "ieee80211_he_negotiate", "void"),
+    fn(outc, "ieee80211_can_use_ampdu", "int"),
 ])
+inp = (nb / "ieee80211_input.c").read_text()
+# the ADDBA request / BAR gates (review of 4g: HT-only dropped every 6 GHz BA)
+gates = [m.group(1) for m in re.finditer(r"\n    if \((!\(ni->ni_flags & [^\n]*)\) \{\n        DPRINTF\(\(\"received (?:ADDBA req|BlockAckReq) from non-HT STA", inp)]
+assert len(gates) == 2, gates
 # setmode's active-set loop, as a function over the same table
 sm = c80211[c80211.index("    memset(ic->ic_chan_active, 0, sizeof(ic->ic_chan_active));"):]
 sm = sm[:sm.index("    /*\n     * If no current/default channel")]
@@ -91,13 +96,19 @@ enum ieee80211_phymode { IEEE80211_MODE_AUTO, IEEE80211_MODE_11A, IEEE80211_MODE
 #define IEEE80211_NODE_QOS 0x0002
 #define IEEE80211_NODE_VHT 0x10000
 #define IEEE80211_NODE_HE 0x200000
+#define IEEE80211_C_TX_AMPDU 0x00010000
+#define IEEE80211_F_RSNON 0x00200000
+#define IEEE80211_PROTO_RSN 0x01
+enum { IEEE80211_M_STA = 1 };
 ''' + defs + r'''
+struct ieee80211_node;
 struct ieee80211_channel { u_int16_t ic_freq; u_int32_t ic_flags; u_int16_t ic_center_freq1, ic_center_freq2; };
 struct _ifnet { const char *if_xname; };
 struct ieee80211_rateset { u_int8_t rs_nrates; u_int8_t rs_rates[15]; };
 struct ieee80211com {
   struct _ifnet ic_if; struct ieee80211_channel ic_channels[IEEE80211_CHAN_MAX+1];
   u_char ic_chan_active[32]; u_int32_t ic_modecaps, ic_flags, ic_caps; u_int8_t ic_ampdu_params;
+  int ic_opmode; struct ieee80211_node *ic_bss;
   struct ieee80211_he_cap_elem ic_he_cap_elem; struct ieee80211_he_mcs_nss_supp ic_he_mcs_nss_supp;
   uint16_t ic_vht_tx_mcs_map, ic_vht_rx_mcs_map;
 };
@@ -107,8 +118,9 @@ struct ieee80211_node {
   u_int8_t ni_rxmcs[10]; u_int16_t ni_htcaps; u_int8_t ni_chw; u_int32_t ni_vhtcaps; u_int16_t ni_htop1;
   struct ieee80211_vht_mcs_info ni_vht_mcsinfo; struct ieee80211_he_cap_elem ni_he_cap_elem;
   struct ieee80211_he_mcs_nss_supp ni_he_mcs_nss_supp; uint32_t ni_he_oper_params; uint16_t ni_he_oper_nss_set;
-  uint8_t ni_he_optional[8]; uint16_t ni_he_6ghz_capa;
+  uint8_t ni_he_optional[8]; uint16_t ni_he_6ghz_capa; u_int32_t ni_rsnprotos;
 };
+static int ba_gate_drops(struct ieee80211_node *ni, int k){ if (k == 0) return ''' + gates[0] + r'''; return ''' + gates[1] + r'''; }
 #define IEEE80211_ADDR_COPY(d,s) memcpy(d,s,6)
 #define LE_WRITE_2(p,v) do{(p)[0]=(uint8_t)(v);(p)[1]=(uint8_t)((v)>>8);}while(0)
 ''' + funcs + r'''
@@ -185,6 +197,12 @@ int main(){
     uint8_t bw,cc; mwx_node_chan_width(&ni,&bw,&cc);
     assert(bw==(t.chw==IEEE80211_CHAN_WIDTH_160?CMD_CBW_160MHZ:t.chw==IEEE80211_CHAN_WIDTH_80?CMD_CBW_80MHZ:t.chw==IEEE80211_CHAN_WIDTH_40?CMD_CBW_40MHZ:CMD_CBW_20MHZ));
     assert(cc==(t.center?t.center:69)); }
+  /* a center that does not hold the primary: 20 MHz at the primary */
+  { ni.ni_flags=0; ni.ni_he_cap_elem.phy_cap_info[0]=0x0c; ni.ni_he_oper_params=IEEE80211_HE_OPERATION_6GHZ_OP_INFO;
+    memset(ni.ni_he_optional,0,8); ni.ni_he_optional[0]=69; ni.ni_he_optional[1]=2; ni.ni_he_optional[2]=87;
+    ieee80211_he_negotiate(&ic,&ni); assert(ni.ni_chw==IEEE80211_CHAN_WIDTH_20 && c69->ic_center_freq1==c69->ic_freq);
+    ni.ni_he_optional[1]=3; ni.ni_he_optional[2]=71; ni.ni_he_optional[3]=95;          /* bogus 160 center */
+    ieee80211_he_negotiate(&ic,&ni); assert(ni.ni_chw==IEEE80211_CHAN_WIDTH_80 && c69->ic_center_freq1==5950+5*71); }
   /* no 6 GHz Operation Info: 20 MHz */
   ni.ni_he_oper_params=0; ieee80211_he_negotiate(&ic,&ni); assert(ni.ni_chw==IEEE80211_CHAN_WIDTH_20);
   /* bss_fill on Home_6GHz-like AP: ch 69, 160 MHz, HE, AP 6 GHz caps */
@@ -201,13 +219,22 @@ int main(){
   assert(b.he_6g_capa==0x36bd && b.ampdu==((7&3)|(5<<2)) && b.max_ampdu_len==7 && b.he==1);
   assert(b.phy_type==((1U<<MT7927_PHY_TYPE_OFDM_INDEX)|(1U<<6)) && b.vht_cap==0 && b.ht_cap==0);
   assert(b.bw==CMD_CBW_160MHZ && b.center_chan==79 && b.basic_rates==0x15 && b.ra_legacy==(0xff<<6));
-  assert(b.he_mcs[0]==0xfffa && b.he_mcs[1]==0xfffa);
+  assert(b.he_mcs[0]==0xfffa && b.he_mcs[1]==0xfffa && b.amsdu==1+2);
+  /* at AUTH (HE not negotiated yet) only the phymode, as Linux's empty link_sta */
+  { uint32_t f=ni.ni_flags; ni.ni_flags&=~IEEE80211_NODE_HE; mt7927_bss_fill(&sc,&ni,&b);
+    assert(b.band==3 && b.phymode==0xb1 && b.phymode_ext==0 && !b.vht_tlv && !b.he_6g_capa && b.ampdu==0 && b.amsdu==0 && b.bw==CMD_CBW_20MHZ && b.center_chan==69);
+    ni.ni_flags=f; }
+  /* Block Ack on a 6 GHz BSS: HE without HT may aggregate; ADDBA/BAR not dropped */
+  { struct ieee80211_node bn; memset(&bn,0,sizeof bn); bn.ni_flags=IEEE80211_NODE_HE; bn.ni_rsnprotos=IEEE80211_PROTO_RSN;
+    ic.ic_caps=IEEE80211_C_TX_AMPDU; ic.ic_flags=IEEE80211_F_RSNON; ic.ic_opmode=IEEE80211_M_STA; ic.ic_bss=&bn;
+    struct ieee80211_node *ni=&bn; assert(ieee80211_can_use_ampdu(&ic,&bn) && !ba_gate_drops(ni,0) && !ba_gate_drops(ni,1));
+    bn.ni_flags=0; assert(!ieee80211_can_use_ampdu(&ic,&bn) && ba_gate_drops(ni,0) && ba_gate_drops(ni,1)); }
   /* without the AP's 6 GHz caps: no AX_6G, no forced VHT TLV, no HE_6G */
   ni.ni_he_6ghz_capa=0; mt7927_bss_fill(&sc,&ni,&b); assert(b.phymode_ext==0 && b.vht_tlv==0 && b.he_6g_capa==0 && b.band==3);
   /* a 5 GHz AP is untouched: band 2, channel = index, no 6 GHz fields */
   struct ieee80211_node n5; memset(&n5,0,sizeof n5); n5.ni_chan=&sc.sc_ic.ic_channels[36]; n5.ni_rates=ni.ni_rates;
   mt7927_bss_fill(&sc,&n5,&b); assert(b.band==2 && b.chan==36 && b.phymode==0x01 && b.phymode_ext==0 && !b.vht_tlv && !b.he_6g_capa);
-  puts("PASS: 6 GHz channel table (59 entries at 182..240), numbers/frequencies/lookups, active set (all modes but 11b), HE 6 GHz width/center, HE 6 GHz capa element, band-3 BSS/STA fields; 5 GHz unchanged; ASan/UBSan.");
+  puts("PASS: 6 GHz channel table (59 entries at 182..240), numbers/frequencies/lookups, active set (all modes but 11b), HE 6 GHz width/center, HE 6 GHz capa element, band-3 BSS/STA fields (AUTH vs association), Block Ack gates for HE-only peers, center sanity; 5 GHz unchanged; ASan/UBSan.");
 }
 '''
 (d / "t.cpp").write_text(prog)

@@ -654,7 +654,7 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
             if (ic->ic_opmode == IEEE80211_M_STA)
                 ++ic->ic_wcl_rx_packets[hasqos ? ieee80211_wcl_ac(tid) : EDCA_AC_BE];
 #endif
-            if ((ni->ni_flags & IEEE80211_NODE_HT) &&
+            if ((ni->ni_flags & (IEEE80211_NODE_HT | IEEE80211_NODE_HE)) &&
                 hasqos && (qos & IEEE80211_QOS_AMSDU))
                 ieee80211_amsdu_decap(ic, m, ni, hdrlen, ml);
             else
@@ -3125,7 +3125,8 @@ ieee80211_recv_addba_req(struct ieee80211com *ic, mbuf_t m,
         ((ic->ic_flags & IEEE80211_F_RSNON) && !ni->ni_port_valid))
         return;
     
-    if (!(ni->ni_flags & IEEE80211_NODE_HT)) {
+    /* phase 4g: 6 GHz peers are HE without HT */
+    if (!(ni->ni_flags & (IEEE80211_NODE_HT | IEEE80211_NODE_HE))) {
         DPRINTF(("received ADDBA req from non-HT STA %s\n",
                  ether_sprintf(ni->ni_macaddr)));
         return;
@@ -3733,7 +3734,7 @@ ieee80211_recv_bar(struct ieee80211com *ic, mbuf_t m,
     u_int16_t ctl, ssn;
     u_int8_t tid, ntids;
     
-    if (!(ni->ni_flags & IEEE80211_NODE_HT)) {
+    if (!(ni->ni_flags & (IEEE80211_NODE_HT | IEEE80211_NODE_HE))) {
         DPRINTF(("received BlockAckReq from non-HT STA %s\n",
                  ether_sprintf(ni->ni_macaddr)));
         return;
