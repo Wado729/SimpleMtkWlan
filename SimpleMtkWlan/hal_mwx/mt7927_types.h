@@ -11,7 +11,7 @@
 struct mt7927_bss {
 	uint8_t		bssid[6];
 	uint8_t		chan;		/* control channel */
-	uint8_t		band;		/* 1: 2.4 GHz, 2: 5 GHz */
+	uint8_t		band;		/* 1: 2.4 GHz, 2: 5 GHz, 3: 6 GHz */
 	uint16_t	bcn_int;
 	uint8_t		dtim;
 	uint8_t		qos;
@@ -45,6 +45,10 @@ struct mt7927_bss {
 	uint8_t		he_color_en;	/* color not disabled by the AP */
 	uint8_t		he_pe;		/* default PE duration (HE operation) */
 	uint16_t	he_rts;		/* TXOP duration RTS threshold (HE operation) */
+	/* phase 4g: 6 GHz (band 3) */
+	uint8_t		phymode_ext;	/* BSS_INFO basic: PHY_MODE_AX_6G BIT(0) */
+	uint8_t		vht_tlv;	/* STA_REC_VHT even without VHT (6 GHz) */
+	uint16_t	he_6g_capa;	/* the AP's HE 6 GHz Band Capabilities: STA_REC_HE_6G */
 };
 
 /* MT7927 phase 4b: per-frame TXD inputs. */

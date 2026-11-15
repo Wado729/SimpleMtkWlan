@@ -486,6 +486,7 @@ struct ieee80211_node {
     uint32_t        ni_he_oper_params;
     uint16_t        ni_he_oper_nss_set;
     uint8_t         ni_he_optional[8];
+    uint16_t        ni_he_6ghz_capa;    /* phase 4g: HE 6 GHz Band Capabilities (host order), 0 if none */
     
 	/* Timeout handlers which trigger Tx Block Ack negotiation. */
 	CTimeout*		ni_addba_req_to[IEEE80211_NUM_TID];

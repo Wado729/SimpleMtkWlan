@@ -26,7 +26,13 @@ struct capa{uint8_t antenna_mask=3;};
 #define MT7927_RXD3_CSUM ((1U << 26) | (1U << 27))
 struct mt7927_bringup{uint32_t info;};
 struct mwx_softc{ieee80211com sc_ic;capa sc_capa;unsigned sc_7927_rx_drop[8]={0};unsigned sc_7927_rx_hwdec=0,sc_7927_rx_hwdec_nopn=0,sc_7927_rx_csum=0,sc_7927_rx_untrans_amsdu=0;mt7927_bringup*sc_7927;
- unsigned sc_7927_rx_6g=0;uint8_t sc_7927_6g_bssid[32][6];unsigned sc_7927_6g_n=0;uint8_t sc_7927_6g_heard[30];};
+ unsigned sc_7927_rx_6g=0;uint8_t sc_7927_6g_bssid[32][6];unsigned sc_7927_6g_n=0;uint8_t sc_7927_6g_heard[30];bool sc_7927_join6g=false;};
+#define IEEE80211_CHAN_6GHZ 0x40000000
+typedef unsigned u_int;
+/* net80211's ieee80211_ieee2chanidx() for the 6 GHz band (phase 4g) */
+u_int ieee80211_ieee2chanidx(ieee80211com*ic,u_int ch,u_int flags){
+ if(!(flags&IEEE80211_CHAN_6GHZ)||ch<1||ch>233||(ch-1)%4)return 0; u_int idx=181+(ch+3)/4;
+ return (ic->ic_channels[idx].ic_flags&IEEE80211_CHAN_6GHZ)?idx:0;}
 #define nitems(a) (sizeof(a)/sizeof((a)[0]))
 static std::vector<std::string> logs; static char ebuf[18];
 static const char*ether_sprintf(const uint8_t*a){snprintf(ebuf,sizeof ebuf,"%02x:%02x:%02x:%02x:%02x:%02x",a[0],a[1],a[2],a[3],a[4],a[5]);return ebuf;}
@@ -94,6 +100,23 @@ int main(){
   sc.sc_ic.ic_event_handler=nullptr; sc.sc_ic.ic_6ghz_channels=0;
   assert(logs[0].find("6 GHz: beacon \"Home_6GHz\" 40:00:00:00:03:4c ch 69 rssi -79")!=std::string::npos);
  }
+ { /* phase 4g: with 6 GHz in the channel table, the frame goes on at its index */
+  std::vector<uint8_t> buf(32+36+2+9+2+4,0); uint8_t*f=buf.data()+32; f[0]=0x80;
+  const uint8_t bss[6]={0x72,0x00,0x00,0x00,0x03,0x4d}; memcpy(f+16,bss,6); f[36]=0; f[37]=9; memcpy(f+38,"Home_6GHz",9);
+  f[47]=1; f[48]=4; sc.sc_7927_join6g=true;
+  { mbuf m{buf.data(),buf.size()}; ieee80211_rxinfo rxi{}; unsigned d0=sc.sc_7927_rx_drop[0];   /* no entry: dropped */
+    next={}; next.hdr_off=32; next.frame_len=(uint32_t)buf.size()-32; next.chan=69; next.band=6; next.rssi=-70;
+    assert(mt7927_mac_fill_rx(&sc,&m,&rxi)==-1 && sc.sc_7927_rx_drop[0]==d0+1); }
+  sc.sc_ic.ic_channels[199].ic_flags=IEEE80211_CHAN_6GHZ|1;
+  { mbuf m{buf.data(),buf.size()}; ieee80211_rxinfo rxi{}; unsigned d0=sc.sc_7927_rx_drop[0];
+    next={}; next.hdr_off=32; next.frame_len=(uint32_t)buf.size()-32; next.chan=69; next.band=6; next.rssi=-70;
+    assert(mt7927_mac_fill_rx(&sc,&m,&rxi)==0 && rxi.rxi_chan==199 && rxi.rxi_rssi==-70 &&
+           sc.sc_7927_rx_drop[0]==d0 && m.data==buf.data()+32 && sc.sc_7927_6g_n==2); }
+  { mbuf m{buf.data(),buf.size()}; ieee80211_rxinfo rxi{};                                    /* not on the 20 MHz grid */
+    next={}; next.hdr_off=32; next.frame_len=(uint32_t)buf.size()-32; next.chan=70; next.band=6;
+    assert(mt7927_mac_fill_rx(&sc,&m,&rxi)==-1); }
+  sc.sc_7927_join6g=false; sc.sc_ic.ic_channels[199].ic_flags=1;
+ }
  { /* no PN: header stays, protected bit cleared */
   std::vector<uint8_t> buf; frame(buf,32,true); buf[33]|=0x40; mbuf m{buf.data(),buf.size()}; ieee80211_rxinfo rxi{};
   next={}; next.hdr_off=32; next.frame_len=(uint32_t)buf.size()-32; next.chan=36; next.decrypted=true; next.sec_mode=4;
@@ -133,7 +156,7 @@ int main(){
   parse_rv=3; assert(mt7927_mac_fill_rx(&sc,&m,&rxi)==-1 && sc.sc_7927_rx_drop[3]==1); parse_rv=0;
   next={}; next.band=6; next.chan=37; assert(mt7927_mac_fill_rx(&sc,&m,&rxi)==-1);
  }
- puts("PASS: hardware-decrypted CCMP frames get their header rebuilt from the group-1 PN and key ID (QoS and non-QoS), header/payload intact; no-PN and non-CCMP fall back; undecrypted frames untouched; ASan/UBSan.");
+ puts("PASS: 6 GHz frames reach net80211 at their table index when it has one (phase 4g); hardware-decrypted CCMP frames get their header rebuilt from the group-1 PN and key ID (QoS and non-QoS), header/payload intact; no-PN and non-CCMP fall back; undecrypted frames untouched; ASan/UBSan.");
 }
 '''
 tmp=tempfile.TemporaryDirectory(prefix='mtk-hwdec-');art=Path(tmp.name)

@@ -817,7 +817,7 @@ ieee80211_add_ds_params(u_int8_t *frm, struct ieee80211com *ic,
 {
 	*frm++ = IEEE80211_ELEMID_DSPARMS;
     *frm++ = 1;
-    *frm++ = ieee80211_chan2ieee(ic, ni->ni_chan);
+    *frm++ = ieee80211_chan2number(ic, ni->ni_chan);
     return frm;
 }
 
@@ -1283,6 +1283,30 @@ ieee80211_add_vhtcaps(uint8_t *frm, struct ieee80211com *ic)
     LE_WRITE_2(frm, ic->ic_vht_tx_mcs_map); frm += 2;
     LE_WRITE_2(frm, ic->ic_vht_tx_highest); frm += 2;
     return frm;
+}
+
+/*
+ * Phase 4g: HE 6 GHz Band Capabilities element (802.11ax 9.4.2.263), as
+ * mt7925_init_he_caps() fills it for 6 GHz: the HT A-MPDU spacing, 1 MiB
+ * A-MPDUs, 11454-byte MPDUs, antenna patterns consistent; SM power save
+ * disabled, as mac80211 sends it (ieee80211_add_he_6ghz_capa()).
+ */
+uint8_t *
+ieee80211_add_he_6ghz_capa(uint8_t *frm, struct ieee80211com *ic)
+{
+    uint16_t capa;
+
+    capa = (uint16_t)((ic->ic_ampdu_params & IEEE80211_AMPDU_PARAM_SS) >> 2);
+    capa |= 7 << IEEE80211_HE_6GHZ_CAP_MAX_AMPDU_LEN_EXP_SHIFT;
+    capa |= 2 << IEEE80211_HE_6GHZ_CAP_MAX_MPDU_LEN_SHIFT;
+    capa |= 3 << IEEE80211_HE_6GHZ_CAP_SM_PS_SHIFT;
+    capa |= IEEE80211_HE_6GHZ_CAP_RX_ANTPAT_CONS |
+        IEEE80211_HE_6GHZ_CAP_TX_ANTPAT_CONS;
+    *frm++ = IEEE80211_ELEMID_EXTENSION;
+    *frm++ = 3;
+    *frm++ = IEEE80211_ELEMID_EXT_HE_6GHZ_CAPA;
+    LE_WRITE_2(frm, capa);
+    return frm + 2;
 }
 
 uint8_t *
@@ -1770,7 +1794,7 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 		2 + IEEE80211_WPAIE_MAXLEN : 0) +
 	    ((ic->ic_flags & IEEE80211_F_HTON) ? sizeof(struct ieee80211_ie_htcap) + sizeof(struct ieee80211_wme_info) : 0) +
         ((ic->ic_flags & IEEE80211_F_VHTON) ? sizeof(struct ieee80211_ie_vhtcap) + 2 : 0) +
-        ((ic->ic_flags & IEEE80211_F_HEON) ? (sizeof(struct ieee80211_he_cap_elem) + 2 + 1 + sizeof(struct ieee80211_he_mcs_nss_supp) + IEEE80211_HE_PPE_THRES_MAX_LEN) : 0));
+        ((ic->ic_flags & IEEE80211_F_HEON) ? (sizeof(struct ieee80211_he_cap_elem) + 2 + 1 + sizeof(struct ieee80211_he_mcs_nss_supp) + IEEE80211_HE_PPE_THRES_MAX_LEN + 5 /* HE 6 GHz */) : 0));
 	if (m == NULL)
 		return NULL;
 
@@ -1820,16 +1844,26 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 #endif
 		frm = ieee80211_add_wpa(frm, ic, ni);
 	}
+	/*
+	 * Phase 4g: no HT or VHT Capabilities on 6 GHz (802.11ax 26.17.2;
+	 * mac80211 has no HT/VHT 6 GHz band caps), but the HE 6 GHz Band
+	 * Capabilities instead. WMM stays.
+	 */
 	if (ic->ic_flags & IEEE80211_F_HTON) {
-		frm = ieee80211_add_htcaps(frm, ic);
+		if (!IEEE80211_IS_CHAN_6GHZ(ni->ni_chan))
+			frm = ieee80211_add_htcaps(frm, ic);
 		frm = ieee80211_add_wme_info(frm, ic);
 	}
     
-    if (ic->ic_flags & IEEE80211_F_VHTON)
+    if ((ic->ic_flags & IEEE80211_F_VHTON) &&
+        !IEEE80211_IS_CHAN_6GHZ(ni->ni_chan))
         frm = ieee80211_add_vhtcaps(frm, ic);
     
-    if (ic->ic_flags & IEEE80211_F_HEON)
+    if (ic->ic_flags & IEEE80211_F_HEON) {
         frm = ieee80211_add_hecaps(frm, ic);
+        if (IEEE80211_IS_CHAN_6GHZ(ni->ni_chan))
+            frm = ieee80211_add_he_6ghz_capa(frm, ic);
+    }
 
     size_t l = frm - mtod(m, u_int8_t *);
     mbuf_pkthdr_setlen(m, l);

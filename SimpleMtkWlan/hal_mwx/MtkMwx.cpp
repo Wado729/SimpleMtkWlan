@@ -602,6 +602,7 @@ struct mwx_softc {
 	uint32_t		sc_7927_rx_drop[8];
 	/* phase 4e.1: 6 GHz scanning (heard, not yet given to net80211) */
 	bool			sc_7927_scan6g;		/* off: -mtk7927no6g */
+	bool			sc_7927_join6g;		/* phase 4g; off: -mtk7927no6gjoin */
 	bool			sc_7927_nobgscan;	/* -mtk7927nobgscan */
 	uint32_t		sc_7927_rx_6g;		/* 6 GHz frames received */
 	uint8_t			sc_7927_6g_bssid[32][6];
@@ -2432,13 +2433,29 @@ mwx_preinit(struct mwx_softc *sc)
 			    IEEE80211_CHAN_VHT40 | IEEE80211_CHAN_VHT80;
 		}
 	}
-#ifdef NOTYET
-	/* TODO support for 6GHz */
-	if (sc->sc_capa.has_6ghz) {
-		for (i = 0; i < MWX_NUM_6GHZ_CHANNELS; i++) {
+	/*
+	 * Phase 4g: the 20 MHz 6 GHz channels (1, 5, ... 233) at indexes
+	 * 182..240 (IEEE80211_6GHZ_CHANIDX), as Ersiter's iwx does. OFDM
+	 * 5 GHz-style entries plus IEEE80211_CHAN_6GHZ; passive (NO_IR).
+	 * The scan and macOS channel lists add 6 GHz on their own and skip
+	 * these.
+	 */
+	if (sc->sc_hwtype == MWX_HW_MT7927 && sc->sc_7927_join6g) {
+		unsigned c6;
+
+		if (ic->ic_sup_rates[IEEE80211_MODE_11A].rs_nrates == 0)
+			ic->ic_sup_rates[IEEE80211_MODE_11A] =
+			    ieee80211_std_rateset_11a;
+		for (c6 = 1; c6 <= 233; c6 += 4) {
+			struct ieee80211_channel *c =
+			    &ic->ic_channels[IEEE80211_6GHZ_CHANIDX(c6)];
+
+			c->ic_freq = (u_int16_t)ieee80211_ieee2mhz(c6,
+			    IEEE80211_CHAN_6GHZ);
+			c->ic_flags = IEEE80211_CHAN_A | IEEE80211_CHAN_6GHZ |
+			    IEEE80211_CHAN_PASSIVE;
 		}
 	}
-#endif
 
 	/* HT MCS set: MCS 0-7 per spatial stream. */
 	memset(ic->ic_sup_mcs, 0, sizeof(ic->ic_sup_mcs));
@@ -4633,6 +4650,7 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 #define	MT7927_BSS_TAG_BSS_COLOR	4	/* UNI_BSS_INFO_BSS_COLOR */
 #define	MT7927_BSS_TAG_HE_BASIC		5	/* UNI_BSS_INFO_HE_BASIC */
 #define	MT7927_STA_TAG_HE_V2		0x19	/* STA_REC_HE_V2 */
+#define	MT7927_STA_TAG_HE_6G		0x17	/* STA_REC_HE_6G (phase 4g) */
 #define	MT7927_STA_TAG_BASIC		0
 #define	MT7927_STA_TAG_RA		1
 #define	MT7927_STA_TAG_BA		6
@@ -7942,7 +7960,7 @@ mt7927_bss_info(struct mt7927_bringup *b, const struct mt7927_vif *v,
 	mt7927_put16(t + 26, bss->peer_wcid);			/* sta_idx */
 	mt7927_put16(t + 28, bss->band == 1 ? MT7927_PHY_TYPE_ERP_INDEX :
 	    MT7927_PHY_TYPE_OFDM_INDEX);			/* nonht_basic_phy */
-	t[30] = 0;						/* phymode_ext */
+	t[30] = bss->phymode_ext;				/* phase 4g: AX_6G */
 	t[31] = v->idx;						/* link_idx */
 
 	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_SEC, 8);	/* mt7925_mcu_bss_sec_tlv */
@@ -8002,7 +8020,7 @@ mt7927_bss_info(struct mt7927_bringup *b, const struct mt7927_vif *v,
 		t[9] = 2;					/* rx_streams */
 		t[10] = bss->bw ? 4 : 0;			/* ht_op_info: 40M allowed */
 		t[11] = bss->chan < center ? 1 : bss->chan > center ? 3 : 0;	/* sco */
-		t[12] = bss->band;				/* 1: 2.4, 2: 5 GHz */
+		t[12] = bss->band;				/* 1: 2.4, 2: 5, 3: 6 GHz */
 
 		t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_MBSSID, 8);
 	}
@@ -8061,7 +8079,7 @@ mt7927_sta_rec(struct mt7927_bringup *b, const struct mt7927_vif *v,
 				t = mt7927_msg_tlv(&m, MT7927_STA_TAG_HT, 8);
 				mt7927_put16(t + 4, bss->ht_cap);
 			}
-			if (bss->vht_cap) {			/* sta_rec_vht */
+			if (bss->vht_cap || bss->vht_tlv) {	/* sta_rec_vht */
 				t = mt7927_msg_tlv(&m, MT7927_STA_TAG_VHT, 16);
 				mt7927_put32(t + 4, bss->vht_cap);
 				mt7927_put16(t + 8, bss->vht_rx_mcs);
@@ -8081,6 +8099,10 @@ mt7927_sta_rec(struct mt7927_bringup *b, const struct mt7927_vif *v,
 				mt7927_put16(t + 22, bss->he_mcs[0]);	/* BW80 */
 				mt7927_put16(t + 24, bss->he_mcs[1]);	/* BW160 */
 				mt7927_put16(t + 26, bss->he_mcs[2]);	/* BW8080 */
+			}
+			if (bss->he_6g_capa) {			/* mt7925_mcu_sta_he_6g_tlv */
+				t = mt7927_msg_tlv(&m, MT7927_STA_TAG_HE_6G, 8);
+				mt7927_put16(t + 4, bss->he_6g_capa);
 			}
 
 			t = mt7927_msg_tlv(&m, MT7927_STA_TAG_RA, 16);
@@ -8743,8 +8765,18 @@ mt7927_txpower_band(struct mt7927_bringup *b, int band)
 	    56, 58, 60, 62, 64, 100, 102, 104, 106, 108, 110, 112, 114, 116, 118,
 	    120, 122, 124, 126, 128, 132, 134, 136, 138, 140, 142, 144, 149, 151,
 	    153, 155, 157, 159, 161, 165, 167 };
-	const uint8_t *list = band == 2 ? ch2 : ch5;
-	int n = band == 2 ? (int)nitems(ch2) : (int)nitems(ch5);
+	/* phase 4g: mt7925's chan_list_6ghz */
+	static const uint8_t ch6[] = { 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21,
+	    23, 25, 27, 29, 33, 35, 37, 39, 41, 43, 45, 47, 49, 51, 53, 55, 57,
+	    59, 61, 65, 67, 69, 71, 73, 75, 77, 79, 81, 83, 85, 87, 89, 91, 93,
+	    97, 99, 101, 103, 105, 107, 109, 111, 113, 115, 117, 119, 121, 123,
+	    125, 129, 131, 133, 135, 137, 139, 141, 143, 145, 147, 149, 151, 153,
+	    155, 157, 161, 163, 165, 167, 169, 171, 173, 175, 177, 179, 181, 183,
+	    185, 187, 189, 193, 195, 197, 199, 201, 203, 205, 207, 209, 211, 213,
+	    215, 217, 219, 221, 225, 227, 229, 233 };
+	const uint8_t *list = band == 2 ? ch2 : band == 6 ? ch6 : ch5;
+	int n = band == 2 ? (int)nitems(ch2) : band == 6 ? (int)nitems(ch6) :
+	    (int)nitems(ch5);
 	int i, j, idx = 0, batches = (n + 2) / 3, rv = 0;
 	uint8_t last = list[n - 1];
 	for (i = 0; i < batches && rv == 0; i++) {
@@ -8758,15 +8790,20 @@ mt7927_txpower_band(struct mt7927_bringup *b, int band)
 		tmp[6] = (mlen - 4) & 0xff;
 		tmp[7] = (mlen - 4) >> 8;
 		tmp[12] = (uint8_t)nch;
-		tmp[13] = band == 2 ? 1 : 2;
+		tmp[13] = band == 2 ? 1 : band == 6 ? 3 : 2;
 		tmp[16] = b->alpha2[0];
 		tmp[17] = b->alpha2[1];
 		for (j = 0; j < nch; j++, idx++) {
 			uint8_t *sku = tmp + MT7927_TXPWR_HDR + j * MT7927_SKU_LEN;
 			uint8_t c = list[idx];
-			bool known = band == 2 || (c % 4 == 0 && c <= 144) ||
-			    (c >= 149 && c % 4 == 1);
-			int8_t pw = known ? 40 : 127;
+			bool known = band == 2 || (band == 6 ? c % 4 == 1 :
+			    (c % 4 == 0 && c <= 144) || (c >= 149 && c % 4 == 1));
+			/*
+			 * Phase 4g: 6 GHz at 12 dBm, wireless-regdb's US rule
+			 * (5925-7125, 12 dBm, the narrowest-bandwidth client
+			 * figure); the firmware's own country limits still apply.
+			 */
+			int8_t pw = !known ? 127 : band == 6 ? 24 : 40;
 
 			tmp[14] = c == last;	/* last_msg */
 			sku[0] = c;
@@ -8791,6 +8828,13 @@ mt7927_set_rate_txpower(struct mt7927_bringup *b)
 	rv = mt7927_txpower_band(b, 2);
 	if (rv == 0)
 		rv = mt7927_txpower_band(b, 5);
+	/* phase 4g: and 6 GHz (mt7925_mcu_set_rate_txpower) when joinable */
+	if (rv == 0 && b->sc->sc_7927_join6g) {
+		int rv6 = mt7927_txpower_band(b, 6);
+
+		MWX_DEV_LOG(b->sc, "MT7927 rate TX power limits 6 GHz -> %d\n",
+		    rv6);
+	}
 	mt7927_op_unlock(b);
 	MWX_DEV_LOG(b->sc, "MT7927 rate TX power limits (2.4 + 5 GHz) -> %d\n", rv);
 	return rv;
@@ -9401,6 +9445,9 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 		sc->sc_7927_scan6g = !PE_parse_boot_argn("-mtk7927no6g",
 		    &off, sizeof(off));
 		sc->sc_ic.ic_6ghz_channels = sc->sc_7927_scan6g;
+		/* phase 4g: 6 GHz in net80211's table, to join there */
+		sc->sc_7927_join6g = sc->sc_7927_scan6g &&
+		    !PE_parse_boot_argn("-mtk7927no6gjoin", &off, sizeof(off));
 #ifdef AIRPORT_WCL
 		sc->sc_ic.ic_wcl_scan_restart_supported = true;
 #endif
@@ -9670,7 +9717,8 @@ mt7927_hal_scan(struct mwx_softc *sc)
 	    c <= &ic->ic_channels[IEEE80211_CHAN_MAX] && n < 64; c++) {
 		unsigned num = (unsigned)(c - ic->ic_channels);
 
-		if (c->ic_flags == 0)
+		/* 6 GHz table entries (phase 4g): band 3, added below */
+		if (c->ic_flags == 0 || IEEE80211_IS_CHAN_6GHZ(c))
 			continue;
 #ifdef AIRPORT_WCL
 		if (restricted && !(ic->ic_wcl_scan_channels[num / 8] &
@@ -9692,6 +9740,18 @@ mt7927_hal_scan(struct mwx_softc *sc)
 		int psc;
 
 		for (psc = 5; psc <= 229 && n < 64; psc += 16) {
+			ch[n].band = 3;
+			ch[n].chan = (uint8_t)psc;
+			n++;
+		}
+		/*
+		 * Phase 4g: and the other channels where networks were heard,
+		 * so a join scan finds a network off the PSC grid.
+		 */
+		for (psc = 1; psc <= 233 && n < 64; psc += 4) {
+			if (((psc - 5) % 16) == 0 ||
+			    !(sc->sc_7927_6g_heard[psc / 8] & (1U << (psc % 8))))
+				continue;
 			ch[n].band = 3;
 			ch[n].chan = (uint8_t)psc;
 			n++;
@@ -9867,8 +9927,9 @@ mt7927_bss_fill(struct mwx_softc *sc, struct ieee80211_node *ni,
 
 	memset(bss, 0, sizeof(*bss));
 	IEEE80211_ADDR_COPY(bss->bssid, ni->ni_bssid);
-	bss->chan = (uint8_t)ieee80211_chan2ieee(ic, ni->ni_chan);
-	bss->band = five ? 2 : 1;
+	/* phase 4g: the number on the air (a 6 GHz table index is not) */
+	bss->chan = (uint8_t)ieee80211_chan2number(ic, ni->ni_chan);
+	bss->band = IEEE80211_IS_CHAN_6GHZ(ni->ni_chan) ? 3 : five ? 2 : 1;
 	bss->bcn_int = ni->ni_intval ? ni->ni_intval : 100;
 	bss->dtim = ni->ni_dtimperiod ? ni->ni_dtimperiod : 1;
 	bss->aid = IEEE80211_AID(ni->ni_associd);
@@ -9977,6 +10038,35 @@ mt7927_bss_fill(struct mwx_softc *sc, struct ieee80211_node *ni,
 		bss->he_rts = (uint16_t)((op & IEEE80211_HE_OPERATION_RTS_THRESHOLD_MASK) >>
 		    IEEE80211_HE_OPERATION_RTS_THRESHOLD_OFFSET);
 	}
+	if (bss->band == 3) {
+		/*
+		 * Phase 4g, mt7925 on 6 GHz: phymode A | AN | AC | AX_5G
+		 * (mt76_connac_get_phy_mode), phymode_ext AX_6G when the AP
+		 * sent HE 6 GHz capabilities (mt7925_get_phy_mode_ext);
+		 * STA_REC_VHT is sent anyway ("necessary to let hw work
+		 * normally"), STA_REC_HE_6G carries the AP's capabilities, and
+		 * the A-MPDU factor/density come from them
+		 * (mt7925_mcu_sta_phy_tlv).
+		 */
+		uint16_t c6 = ni->ni_he_6ghz_capa;
+
+		bss->phymode = 0x01 | 0x10 | 0x20 | 0x80;
+		bss->he_6g_capa = c6;
+		if (c6 != 0) {
+			uint8_t af = (uint8_t)((c6 &
+			    IEEE80211_HE_6GHZ_CAP_MAX_AMPDU_LEN_EXP) >>
+			    IEEE80211_HE_6GHZ_CAP_MAX_AMPDU_LEN_EXP_SHIFT);
+			uint8_t mm = (uint8_t)(c6 &
+			    IEEE80211_HE_6GHZ_CAP_MIN_MPDU_START);
+
+			bss->phymode_ext = 0x01;		/* PHY_MODE_AX_6G */
+			bss->vht_tlv = 1;
+			/* IEEE80211_HT_AMPDU_PARM_FACTOR 0x3 / _DENSITY 0x1c,
+			 * as FIELD_PREP fills them (the factor is 3 bits here) */
+			bss->ampdu = (uint8_t)((af & 0x3) | ((mm & 0x7) << 2));
+			bss->max_ampdu_len = af;
+		}
+	}
 	mwx_node_chan_width(ni, &bss->bw, &bss->center_chan);
 	if (bss->bw == CMD_CBW_20MHZ)
 		bss->center_chan = bss->chan;
@@ -10060,7 +10150,7 @@ mt7927_join_prepare(struct mwx_softc *sc)
 	mt7927_bss_fill(sc, ni, &bss);
 	/* the association request's HE caps are for the AP's band */
 	if (sc->sc_7927_he)
-		mt7927_he_caps(ic, bss.band == 2);
+		mt7927_he_caps(ic, bss.band != 1);
 	if (sc->sc_7927_joined &&
 	    !IEEE80211_ADDR_EQ(sc->sc_7927_bss.bssid, bss.bssid))
 		mt7927_join_teardown(sc, "new AP");
@@ -10093,7 +10183,7 @@ mt7927_join_prepare(struct mwx_softc *sc)
 	MWX_DEV_LOG(sc, "MT7927 joining \"%.*s\" %s ch %u (%s GHz) rssi %d "
 	    "%s%s rates basic 0x%x ra 0x%x\n", ni->ni_esslen,
 	    (const char *)ni->ni_essid, ether_sprintf(bss.bssid), bss.chan,
-	    bss.band == 1 ? "2.4" : "5", ni->ni_rssi,
+	    bss.band == 1 ? "2.4" : bss.band == 3 ? "6" : "5", ni->ni_rssi,
 	    (ni->ni_flags & IEEE80211_NODE_HT) ? "HT " : "",
 	    (ni->ni_flags & IEEE80211_NODE_VHT) ? "VHT " : "",
 	    bss.basic_rates, bss.ra_legacy);
@@ -11372,11 +11462,14 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	}
 	if (ri.band == 6) {
 		/*
-		 * 6 GHz: net80211's channel table has no 6 GHz entries yet
-		 * (its numbers clash with 2.4/5 GHz), so the frame is dropped;
-		 * log each network heard once, to see what the radio gets.
+		 * 6 GHz: log each network heard once and hand beacons to the
+		 * front end (macOS's scan list, phase 4e.2). Phase 4g: then on
+		 * to net80211 at the channel's table index (181 + (ch+3)/4), to
+		 * join there (with -mtk7927no6gjoin: dropped, as before).
 		 */
 		const uint8_t *f = mtod(m, const uint8_t *) + ri.hdr_off;
+		u_int idx6 = sc->sc_7927_join6g ? ieee80211_ieee2chanidx(ic,
+		    ri.chan, IEEE80211_CHAN_6GHZ) : 0;
 
 		sc->sc_7927_rx_6g++;
 		if (ri.frame_len >= 36 && (f[0] == 0x80 || f[0] == 0x50)) {
@@ -11435,8 +11528,11 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 				ic->ic_event_handler(ic, IEEE80211_EVT_BEACON_6G, &ev);
 			}
 		}
-		sc->sc_7927_rx_drop[0]++;
-		return -1;
+		if (idx6 == 0) {
+			sc->sc_7927_rx_drop[0]++;
+			return -1;
+		}
+		ri.chan = idx6;
 	}
 	if (ri.chan == 0 || ri.chan > IEEE80211_CHAN_MAX ||
 	    ic->ic_channels[ri.chan].ic_flags == 0) {
@@ -11587,7 +11683,7 @@ mt7927_end_scan_action(OSObject *, void *arg0, void *, void *, void *)
 			ssid[l] = '\0';
 			MWX_DEV_LOG(sc, "MT7927   %-32s ch %3u rssi %3d %s%s\n",
 			    l ? ssid : "(hidden)",
-			    ieee80211_chan2ieee(ic, ni->ni_chan), ni->ni_rssi,
+			    ieee80211_chan2number(ic, ni->ni_chan), ni->ni_rssi,
 			    ether_sprintf(ni->ni_bssid),
 			    (ni->ni_capinfo & IEEE80211_CAPINFO_PRIVACY) ?
 			    " secured" : "");
@@ -12944,7 +13040,7 @@ mt7921_mcu_set_channel_domain(struct mwx_softc *sc)
 	hdr->bw_5g = 3; /* BW_20_40_80_160M */
 	for (i = 0; i <= IEEE80211_CHAN_MAX; i++) {
 		chan = &ic->ic_channels[i];
-		if (!IEEE80211_IS_CHAN_5GHZ(chan))
+		if (!IEEE80211_IS_CHAN_5GHZ(chan) || IEEE80211_IS_CHAN_6GHZ(chan))
 			continue;
 
 		channel->hw_value = htole16(ieee80211_chan2ieee(ic, chan));
@@ -13006,6 +13102,28 @@ mwx_node_chan_width(struct ieee80211_node *ni, uint8_t *bw, uint8_t *center)
 	*center = ieee80211_mhz2ieee(ni->ni_chan->ic_freq, ni->ni_chan->ic_flags);
 	if (ni->ni_chan->ic_center_freq1 == 0)
 		return;
+	/* phase 4g: 6 GHz widths come from HE (ieee80211_he_negotiate) */
+	if (IEEE80211_IS_CHAN_6GHZ(ni->ni_chan)) {
+		if (!(ni->ni_flags & IEEE80211_NODE_HE))
+			return;
+		switch (ni->ni_chw) {
+		case IEEE80211_CHAN_WIDTH_160:
+			*bw = CMD_CBW_160MHZ;
+			break;
+		case IEEE80211_CHAN_WIDTH_80:
+		case IEEE80211_CHAN_WIDTH_80P80:
+			*bw = CMD_CBW_80MHZ;
+			break;
+		case IEEE80211_CHAN_WIDTH_40:
+			*bw = CMD_CBW_40MHZ;
+			break;
+		default:
+			return;
+		}
+		*center = ieee80211_mhz2ieee(ni->ni_chan->ic_center_freq1,
+		    ni->ni_chan->ic_flags);
+		return;
+	}
 	if ((ni->ni_flags & IEEE80211_NODE_VHT) &&
 	    ni->ni_chw == IEEE80211_CHAN_WIDTH_160) {
 		*bw = CMD_CBW_160MHZ;

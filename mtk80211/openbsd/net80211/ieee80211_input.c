@@ -1729,9 +1729,10 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     const uint8_t *vhtopmode;
     const uint8_t *hecap;
     const uint8_t *heopmode;
+    const uint8_t *he6cap = NULL;
     u_int16_t capinfo, bintval;
-    u_int8_t chan, bchan, erp, dtim_count, dtim_period;
-    int is_new;
+    u_int8_t chan, bchan, erp, dtim_count, dtim_period, rxchan;
+    int is_new, rx6g;
     
     /*
      * We process beacon/probe response frames for:
@@ -1775,6 +1776,9 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
      else
          bchan = ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan);
     chan = bchan;
+    /* phase 4g: heard on a 6 GHz channel (rxi_chan is its table index) */
+    rxchan = rxi->rxi_chan;
+    rx6g = rxchan != 0 && IEEE80211_IS_CHAN_6GHZ(&ic->ic_channels[rxchan]);
     erp = 0;
     dtim_count = dtim_period = 0;
     while (frm + 2 <= efrm) {
@@ -1797,7 +1801,9 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
                     ic->ic_stats.is_rx_elem_toosmall++;
                     break;
                 }
-                chan = frm[2];
+                /* a 6 GHz number is not a table index */
+                if (!rx6g)
+                    chan = frm[2];
                 break;
             case IEEE80211_ELEMID_XRATES:
                 xrates = frm;
@@ -1868,6 +1874,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
                     case IEEE80211_ELEMID_EXT_HE_SPR:
                         break;
                     case IEEE80211_ELEMID_EXT_HE_6GHZ_CAPA:
+                        he6cap = frm;
                         break;
                 }
                 break;
@@ -1896,6 +1903,22 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         DPRINTF(("vhtopmode ie too short, got %d, expected %lu\n", vhtopmode[1], sizeof(struct ieee80211_ie_vht_operation) - 2));
         vhtopmode = NULL;
     }
+    /*
+     * Phase 4g: on 6 GHz the HE Operation's 6 GHz Operation Information
+     * names the primary channel (a duplicate beacon can be heard on another
+     * 20 MHz of the BSS); there is no DS Parameter Set.
+     */
+    if (rx6g && heopmode != NULL &&
+        heopmode[1] >= 1 + sizeof(struct ieee80211_he_operation) &&
+        heopmode[1] >= ieee80211_he_oper_size(heopmode + 3)) {
+        const struct ieee80211_he_6ghz_oper *op6 = ieee80211_he_6ghz_oper(
+            (const struct ieee80211_he_operation *)(heopmode + 3));
+        u_int pidx = op6 != NULL ? ieee80211_ieee2chanidx(ic, op6->primary,
+            IEEE80211_CHAN_6GHZ) : 0;
+
+        if (pidx != 0)
+            rxchan = bchan = chan = (u_int8_t)pidx;
+    }
     if (
 #if IEEE80211_CHAN_MAX < 255
         chan > IEEE80211_CHAN_MAX ||
@@ -1908,7 +1931,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         ic->ic_stats.is_rx_badchan++;
         return;
     }
-    if ((rxi->rxi_chan != 0 && chan != rxi->rxi_chan) ||
+    if ((rxchan != 0 && chan != rxchan) ||
         ((ic->ic_state != IEEE80211_S_SCAN ||
          !(ic->ic_caps & IEEE80211_C_SCANALL)) &&
         chan != bchan)) {
@@ -1949,6 +1972,10 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         is_new = 0;
     
     ni->ni_chan = &ic->ic_channels[chan];
+    if (he6cap != NULL && he6cap[1] >= 3)
+        ni->ni_he_6ghz_capa = LE_READ_2(he6cap + 3);
+    else if (rx6g)
+        ni->ni_he_6ghz_capa = 0;
     
     if (htcaps)
         ieee80211_setup_htcaps(ni, htcaps + 2, htcaps[1]);
@@ -2737,6 +2764,7 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     const uint8_t *vhtopmode;
     const uint8_t *hecap;
     const uint8_t *heopmode;
+    const uint8_t *he6cap = NULL;
     u_int16_t capinfo, status, associd;
     u_int8_t rate;
     
@@ -2835,6 +2863,7 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
                     case IEEE80211_ELEMID_EXT_HE_SPR:
                         break;
                     case IEEE80211_ELEMID_EXT_HE_6GHZ_CAPA:
+                        he6cap = frm;
                         break;
                 }
                 break;
@@ -2857,6 +2886,9 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     }
     ni->ni_capinfo = capinfo;
     ni->ni_associd = associd;
+    /* phase 4g: the AP's HE 6 GHz Band Capabilities (STA_REC_HE_6G) */
+    if (he6cap != NULL && he6cap[1] >= 3)
+        ni->ni_he_6ghz_capa = LE_READ_2(he6cap + 3);
     if (edcaie != NULL || wmmie != NULL) {
         /* force update of EDCA parameters */
         ic->ic_edca_updtcount = -1;

@@ -330,6 +330,13 @@ struct ieee80211_channel {
 #define IEEE80211_CHAN_VHT80    0x08000000 /* VHT80 channel */
 #define IEEE80211_CHAN_VHT160    0x10000000 /* VHT160 channel */
 #define IEEE80211_CHAN_VHT80_80    0x20000000 /* VHT80+80 channel */
+/*
+ * Phase 4g: a 6 GHz channel (Ersiter's flag). Its table index is
+ * 181 + (ch + 3) / 4 (ch 1 -> 182 ... ch 233 -> 240), clear of 2.4/5 GHz;
+ * ieee80211_chan2number() gives the number on the air. The entries also
+ * carry IEEE80211_CHAN_A, so rates and modes follow 5 GHz OFDM.
+ */
+#define IEEE80211_CHAN_6GHZ    0x40000000 /* 6 GHz spectrum channel */
 
 #define IEEE80211_CHAN_HT40    (IEEE80211_CHAN_HT40U | IEEE80211_CHAN_HT40D)
 #define IEEE80211_CHAN_HT    (IEEE80211_CHAN_HT20 | IEEE80211_CHAN_HT40)
@@ -340,7 +347,7 @@ struct ieee80211_channel {
                 | IEEE80211_CHAN_VHT160)
 
 #define IEEE80211_CHAN_ALL  \
-    (IEEE80211_CHAN_2GHZ | IEEE80211_CHAN_5GHZ | \
+    (IEEE80211_CHAN_2GHZ | IEEE80211_CHAN_5GHZ | IEEE80211_CHAN_6GHZ | \
     IEEE80211_CHAN_CCK | IEEE80211_CHAN_OFDM | IEEE80211_CHAN_PASSIVE | IEEE80211_CHAN_DYN | IEEE80211_CHAN_XR | \
     IEEE80211_CHAN_HT | IEEE80211_CHAN_VHT)
 
@@ -373,6 +380,9 @@ struct ieee80211_channel {
 	(((_c)->ic_flags & IEEE80211_CHAN_2GHZ) != 0)
 #define	IEEE80211_IS_CHAN_5GHZ(_c) \
 	(((_c)->ic_flags & IEEE80211_CHAN_5GHZ) != 0)
+#define	IEEE80211_IS_CHAN_6GHZ(_c) \
+	(((_c)->ic_flags & IEEE80211_CHAN_6GHZ) != 0)
+#define	IEEE80211_6GHZ_CHANIDX(_ch)	(181 + ((_ch) + 3) / 4)
 #define	IEEE80211_IS_CHAN_OFDM(_c) \
 	(((_c)->ic_flags & IEEE80211_CHAN_OFDM) != 0)
 #define	IEEE80211_IS_CHAN_CCK(_c) \
@@ -781,6 +791,9 @@ u_int	ieee80211_mhz2ieee(u_int, u_int);
 u_int	ieee80211_chan2ieee(struct ieee80211com *,
 		const struct ieee80211_channel *);
 u_int	ieee80211_ieee2mhz(u_int, u_int);
+u_int	ieee80211_chan2number(struct ieee80211com *,
+		const struct ieee80211_channel *);
+u_int	ieee80211_ieee2chanidx(struct ieee80211com *, u_int, u_int);
 int	ieee80211_min_basic_rate(struct ieee80211com *);
 int	ieee80211_max_basic_rate(struct ieee80211com *);
 int	ieee80211_setmode(struct ieee80211com *, enum ieee80211_phymode);

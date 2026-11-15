@@ -312,6 +312,8 @@ ieee80211_ifdetach(struct _ifnet *ifp)
 u_int
 ieee80211_mhz2ieee(u_int freq, u_int flags)
 {
+    if (flags & IEEE80211_CHAN_6GHZ)        /* 6 GHz band */
+        return (freq - 5950) / 5;
     if (flags & IEEE80211_CHAN_2GHZ) {    /* 2GHz band */
         if (freq == 2484)
             return 14;
@@ -349,11 +351,54 @@ ieee80211_chan2ieee(struct ieee80211com *ic, const struct ieee80211_channel *c)
 }
 
 /*
+ * Phase 4g (Ersiter): the channel number on the air. Table indexes are the
+ * number for 2.4/5 GHz but not for 6 GHz.
+ */
+u_int
+ieee80211_chan2number(struct ieee80211com *ic, const struct ieee80211_channel *c)
+{
+    if (c == IEEE80211_CHAN_ANYC)
+        return IEEE80211_CHAN_ANY;
+    if (ic->ic_channels <= c && c <= &ic->ic_channels[IEEE80211_CHAN_MAX]) {
+        if (IEEE80211_IS_CHAN_6GHZ(c))
+            return ieee80211_mhz2ieee(c->ic_freq, c->ic_flags);
+        return c - ic->ic_channels;
+    }
+    return 0;
+}
+
+/*
+ * The table index of an on-air channel number in a band (IEEE80211_CHAN_6GHZ
+ * or not); 0 when the table has no such channel.
+ */
+u_int
+ieee80211_ieee2chanidx(struct ieee80211com *ic, u_int chan, u_int flags)
+{
+    u_int idx;
+
+    if (flags & IEEE80211_CHAN_6GHZ) {
+        if (chan < 1 || chan > 233 || ((chan - 1) % 4) != 0)
+            return 0;
+        idx = IEEE80211_6GHZ_CHANIDX(chan);
+    } else
+        idx = chan;
+    if (idx == 0 || idx > IEEE80211_CHAN_MAX ||
+        ic->ic_channels[idx].ic_flags == 0 ||
+        ((ic->ic_channels[idx].ic_flags & IEEE80211_CHAN_6GHZ) != 0) !=
+        ((flags & IEEE80211_CHAN_6GHZ) != 0) ||
+        ieee80211_chan2number(ic, &ic->ic_channels[idx]) != chan)
+        return 0;
+    return idx;
+}
+
+/*
  * Convert IEEE channel number to MHz frequency.
  */
 u_int
 ieee80211_ieee2mhz(u_int chan, u_int flags)
 {
+    if (flags & IEEE80211_CHAN_6GHZ)        /* 6 GHz band */
+        return 5950 + chan * 5;
     if (flags & IEEE80211_CHAN_2GHZ) {    /* 2GHz band */
         if (chan == 14)
             return 2484;
@@ -1225,7 +1270,17 @@ ieee80211_setmode(struct ieee80211com *ic, enum ieee80211_phymode mode)
     memset(ic->ic_chan_active, 0, sizeof(ic->ic_chan_active));
     for (i = 0; i <= IEEE80211_CHAN_MAX; i++) {
         c = &ic->ic_channels[i];
-        if (mode == IEEE80211_MODE_AUTO) {
+        if (IEEE80211_IS_CHAN_6GHZ(c)) {
+            /*
+             * Phase 4g (after Ersiter's ieee80211_chan_in_mode): 6 GHz has
+             * no HT/VHT flags but is an 11ax band. The mode follows the
+             * current association (11n/ac/ax), and a 6 GHz network must
+             * stay valid to scan and join from any of them; only 11b
+             * leaves it out (5 GHz stays active in 11g mode already).
+             */
+            if (mode != IEEE80211_MODE_11B)
+                setbit(ic->ic_chan_active, i);
+        } else if (mode == IEEE80211_MODE_AUTO) {
             if (c->ic_flags != 0)
                 setbit(ic->ic_chan_active, i);
         } else if ((c->ic_flags & modeflags) != 0)

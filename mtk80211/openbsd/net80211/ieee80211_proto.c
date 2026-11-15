@@ -852,6 +852,69 @@ ieee80211_he_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
     
     ni->ni_flags |= IEEE80211_NODE_HE;
     
+    /*
+     * Phase 4g: on 6 GHz the width is in the HE Operation's 6 GHz Operation
+     * Information (802.11ax 9.4.2.249; mac80211 ieee80211_chandef_he_6ghz_oper):
+     * CCFS0 is the 20/40/80 MHz center (for 160 MHz the 80 MHz holding the
+     * primary), CCFS1 the 160 MHz center. No VHT/HT there.
+     */
+    if (IEEE80211_IS_CHAN_6GHZ(ni->ni_chan)) {
+        uint32_t params = ni->ni_he_oper_params;
+        size_t off = 0;
+        const struct ieee80211_he_6ghz_oper *op6;
+        uint8_t width, peer0 = ni->ni_he_cap_elem.phy_cap_info[0];
+        u_int center;
+
+        ni->ni_chw = IEEE80211_CHAN_WIDTH_20;
+        ni->ni_chan->ic_center_freq1 = ni->ni_chan->ic_freq;
+        ni->ni_chan->ic_center_freq2 = 0;
+        if (params & IEEE80211_HE_OPERATION_VHT_OPER_INFO)
+            off += 3;
+        if (params & IEEE80211_HE_OPERATION_CO_HOSTED_BSS)
+            off += 1;
+        if (!(params & IEEE80211_HE_OPERATION_6GHZ_OP_INFO) ||
+            off + sizeof(*op6) > sizeof(ni->ni_he_optional))
+            return;
+        op6 = (const struct ieee80211_he_6ghz_oper *)&ni->ni_he_optional[off];
+        width = op6->control & IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH;
+        center = op6->ccfs0;
+        if (width == IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_160MHZ) {
+            /* 160 MHz when both ends do it; else the primary 80 MHz */
+            if (op6->ccfs1 != 0 && abs((int)op6->ccfs1 - (int)op6->ccfs0) == 8 &&
+                (peer0 & IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G) &&
+                (ic->ic_he_cap_elem.phy_cap_info[0] &
+                 IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G))
+                center = op6->ccfs1;
+            else
+                width = IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_80MHZ;
+        }
+        if (width != IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_20MHZ &&
+            !(peer0 & IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G))
+            width = IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_20MHZ;
+        if (center < 1 || center > 233)
+            width = IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_20MHZ;
+        switch (width) {
+        case IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_160MHZ:
+            ni->ni_chw = IEEE80211_CHAN_WIDTH_160;
+            break;
+        case IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_80MHZ:
+            ni->ni_chw = IEEE80211_CHAN_WIDTH_80;
+            break;
+        case IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_40MHZ:
+            ni->ni_chw = IEEE80211_CHAN_WIDTH_40;
+            break;
+        default:
+            XYLog("%s 6 GHz chan_width=%s\n", __FUNCTION__,
+                  ieee80211_chan_width_name[ni->ni_chw]);
+            return;
+        }
+        ni->ni_chan->ic_center_freq1 = ieee80211_ieee2mhz(center,
+            IEEE80211_CHAN_6GHZ);
+        XYLog("%s 6 GHz chan_width=%s center %u\n", __FUNCTION__,
+              ieee80211_chan_width_name[ni->ni_chw], center);
+        return;
+    }
+    
     if (!(htole32(ni->ni_he_oper_params) & IEEE80211_HE_OPERATION_VHT_OPER_INFO))
         return;
     

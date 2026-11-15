@@ -293,6 +293,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLScan(const AirportWCL::ScanReques
         bool usable = false;
         for (unsigned channel = 1; channel <= IEEE80211_CHAN_MAX; ++channel)
             if (ic->ic_channels[channel].ic_flags &&
+                !IEEE80211_IS_CHAN_6GHZ(&ic->ic_channels[channel]) &&
                 AirportWCL::scanChannelSelected(scan.channels, true, channel))
                 usable = true;
         // 6 GHz channels: the driver scans them apart from net80211's table
@@ -375,8 +376,14 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     ieee80211com *ic = fHalService->get80211Controller();
     if (!node->ni_chan || node->ni_chan == IEEE80211_CHAN_ANYC)
         return;
-    unsigned channel = ieee80211_chan2ieee(ic, node->ni_chan);
-    if (!channel || channel > 196)
+    // Phase 4g: a 6 GHz node (index 182..240) by its number, band 6G
+    const bool is6g = IEEE80211_IS_CHAN_6GHZ(node->ni_chan);
+    unsigned channel = ieee80211_chan2number(ic, node->ni_chan);
+    if (!channel || channel > (is6g ? 233u : 196u))
+        return;
+    // macOS's 6 GHz scan list comes from IEEE80211_EVT_BEACON_6G; the node
+    // speaks only for the network joined (the BSS info WCL asks for).
+    if (is6g && !IEEE80211_ADDR_EQ(node->ni_bssid, joinBSSID))
         return;
     size_t size = sizeof(AirportWCL::BeaconMetadata) + length;
     auto metadata = static_cast<AirportWCL::BeaconMetadata *>(IOMalloc(size));
@@ -384,7 +391,8 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
         return;
     *metadata = {};
     metadata->ieLength = uint32_t(length);
-    metadata->channelSpec = uint16_t(channel | (IEEE80211_IS_CHAN_5GHZ(node->ni_chan) ? 0xd000 : 0x1000));
+    metadata->channelSpec = uint16_t(channel | (is6g ? 0x5000 :
+        IEEE80211_IS_CHAN_5GHZ(node->ni_chan) ? 0xd000 : 0x1000));
     metadata->channel = channel;
     metadata->ssidLength = node->ni_esslen;
     memcpy(metadata->ssid, node->ni_essid, node->ni_esslen);
@@ -407,7 +415,7 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
             uint32_t h = 2166136261u;
             for (unsigned i = 0; i < node->ni_esslen; ++i)
                 h = (h ^ node->ni_essid[i]) * 16777619u;
-            h = (h ^ (channel > 14 ? 5u : 2u)) * 16777619u;
+            h = (h ^ (is6g ? 6u : channel > 14 ? 5u : 2u)) * 16777619u;
             bool logged = false;
             for (unsigned i = 0; i < nseen; ++i)
                 logged |= seen[i] == h;
@@ -1210,6 +1218,8 @@ IOReturn AirportItlwmSkywalkInterface::getWCL_CHANNELS_INFO(apple80211ChannelInf
         if (!isset(ic->ic_chan_active, i))
             continue;
         const ieee80211_channel *channel = &ic->ic_channels[i];
+        if (IEEE80211_IS_CHAN_6GHZ(channel))   // phase 4g: listed below
+            continue;
         auto &entry = info->channels[info->count++];
         entry.channel = i;
         entry.channelSpec = uint16_t(i | (IEEE80211_IS_CHAN_5GHZ(channel) ? 0xd000 : 0x1000));
@@ -1250,7 +1260,8 @@ IOReturn AirportItlwmSkywalkInterface::copyWCLChannels(void *data)
     ieee80211com *ic = fHalService->get80211Controller();
     for (unsigned i = 1; i <= IEEE80211_CHAN_MAX; ++i) {
         const ieee80211_channel *channel = &ic->ic_channels[i];
-        if (!isset(ic->ic_chan_active, i) || !channel->ic_freq)
+        if (!isset(ic->ic_chan_active, i) || !channel->ic_freq ||
+            IEEE80211_IS_CHAN_6GHZ(channel))  // phase 4g: appended below
             continue;
         AirportWCL::appendChannel(*info, i, IEEE80211_IS_CHAN_5GHZ(channel),
             channel->ic_flags & IEEE80211_CHAN_DFS,
