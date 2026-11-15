@@ -38,7 +38,7 @@ struct CTimeout {};
 struct ieee80211_node { uint8_t ni_macaddr[6]; int ni_port_valid; };
 struct ifn { const char *if_xname; };
 struct ieee80211com { int ic_opmode; int ic_state; ieee80211_node *ic_bss; CTimeout *ic_assoc_to;
-  uint8_t ic_assoc_retry, ic_assoc_tries, ic_assoc_reassoc; ifn ic_if; int ic_mgt_timer; int ic_deauth_reason;
+  uint8_t ic_assoc_retry, ic_assoc_tries, ic_assoc_reassoc, ic_leave_pending; ifn ic_if; int ic_mgt_timer; int ic_deauth_reason;
   void (*ic_event_handler)(ieee80211com*, int, void*); };
 static int armed = -1, sends_assoc, sends_probe, sends_deauth, events, newstates, last_arg;
 static int timeout_add_msec(CTimeout **, int ms) { armed = ms; return 1; }
@@ -58,11 +58,12 @@ struct mt7927_bringup {};
 struct mt7927_bss { uint8_t bssid[6]; };
 struct mwx_softc { ieee80211com sc_ic; bool sc_7927_assoc; uint32_t sc_7927_run_polls, sc_7927_bcn_loss_seen, sc_7927_mib_seen,
   sc_7927_recoveries, sc_7927_last_recovery, sc_7927_poll, sc_7927_rx_bcn, sc_7927_rx_mcast, sc_7927_rx_ucast, sc_7927_rx_bss_mgt,
-  sc_7927_wd_probes, sc_7927_wd_rx_mark, sc_7927_wd_window_mark; mt7927_bringup *sc_7927; struct { int band_idx; } sc_vif; mt7927_bss sc_7927_bss; };
+  sc_7927_wd_probes, sc_7927_wd_rx_mark, sc_7927_wd_window_mark; int sc_flags; mt7927_bringup *sc_7927; struct { int band_idx; } sc_vif; mt7927_bss sc_7927_bss; };
 static uint32_t E_loss, E_rxt, E_windows;
 static void mt7927_engine_link(mt7927_bringup *, int, uint32_t *loss, uint32_t *dumps, uint32_t *rxt, uint32_t *txt, uint32_t *w) {
   *loss = E_loss; *dumps = 0; *rxt = E_rxt; *txt = 0; *w = E_windows; }
 #define MWX_DEV_LOG(sc, ...) printf(__VA_ARGS__)
+#define MWX_FLAG_SCANNING 0x1
 ''' + fn(s, "mt7927_rx_from_bss", "static uint32_t") + fn(s, "mt7927_probe_ap", "static void") + \
    "static void mt7927_link_leave(struct mwx_softc *, const char *, uint32_t, uint32_t, uint32_t);\n" + \
    fn(s, "mt7927_link_watchdog", "static void") + fn(s, "mt7927_link_leave", "static void") + r'''
@@ -82,6 +83,11 @@ int main() {
   ieee80211_assoc_comeback(&ic, 100000); assert(armed == 2000);
   ieee80211_assoc_comeback(&ic, 1); assert(armed == 10);
   ic.ic_assoc_tries = 3; armed = -1; ieee80211_assoc_comeback(&ic, 1000); assert(armed == -1);
+  /* not while a leave is on its way (state changes at the end of the task) */
+  ic.ic_assoc_tries = 1; ic.ic_leave_pending = 1; { int k = sends_assoc; ieee80211_assoc_timeout(&ic); assert(sends_assoc == k); }
+  ic.ic_leave_pending = 0;
+  /* comeback does nothing when the driver did not ask for retries */
+  ic.ic_assoc_retry = 0; armed = -1; ieee80211_assoc_comeback(&ic, 1000); assert(armed == -1); ic.ic_assoc_retry = 1;
   /* not out of ASSOC */
   ic.ic_assoc_tries = 1; ic.ic_state = IEEE80211_S_RUN; int n = sends_assoc; ieee80211_assoc_timeout(&ic); assert(sends_assoc == n);
   ic.ic_opmode = IEEE80211_M_HOSTAP; armed = -1; ieee80211_assoc_arm(&ic, 500); assert(armed == -1);
@@ -98,6 +104,9 @@ int main() {
   /* silent window: probe 1, management timer cleared */
   E_windows = 2; sc.sc_7927_poll++; mt7927_link_watchdog(&sc);
   assert(sends_probe == 1 && sc.sc_7927_wd_probes == 1 && sc.sc_ic.ic_mgt_timer == 0);
+  /* scanning: probes held */
+  sc.sc_flags = MWX_FLAG_SCANNING; sc.sc_7927_poll++; mt7927_link_watchdog(&sc); assert(sends_probe == 1 && sc.sc_7927_wd_probes == 1);
+  sc.sc_flags = 0;
   /* answered: stay */
   sc.sc_7927_rx_bss_mgt++; sc.sc_7927_poll++; mt7927_link_watchdog(&sc);
   assert(sc.sc_7927_wd_probes == 0 && newstates == 0 && sends_deauth == 0);

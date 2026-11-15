@@ -2786,6 +2786,14 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     capinfo = LE_READ_2(frm); frm += 2;
     status =  LE_READ_2(frm); frm += 2;
 
+    /*
+     * Phase 4i (review M1/M2): answered, no more retransmissions; a
+     * success must not be followed by a duplicate request while the
+     * driver sets up RUN (ic_state changes only after that), a refusal
+     * ends the attempt. Status 30 re-arms through the comeback below.
+     */
+    if (ic->ic_assoc_retry)
+        timeout_del(&ic->ic_assoc_to);
     ic->ic_assoc_status = status;
     if (status == IEEE80211_STATUS_SUCCESS) {
         if (ic->ic_event_handler) {
@@ -3012,6 +3020,15 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
     reason = LE_READ_2(frm);
 
     XYLog("Deauth received, reason %d\n", reason);
+    /*
+     * Phase 4i (review M5): we just left and told the AP; its answer to a
+     * frame still in flight is not news, and handling it would restart a
+     * join to the network being left.
+     */
+    if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_leave_pending) {
+        XYLog("Deauth ignored: leaving already\n");
+        return;
+    }
     ic->ic_deauth_reason = reason;
     if (ic->ic_event_handler) {
         (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
@@ -3078,6 +3095,10 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
     reason = LE_READ_2(frm);
     
     XYLog("Disassoc received, reason %d\n", reason);
+    if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_leave_pending) {
+        XYLog("Disassoc ignored: leaving already\n");
+        return;
+    }
     
     ic->ic_stats.is_rx_disassoc++;
     switch (ic->ic_opmode) {

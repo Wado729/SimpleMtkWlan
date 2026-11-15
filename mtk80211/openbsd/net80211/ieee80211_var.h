@@ -502,6 +502,8 @@ struct ieee80211com {
 	uint8_t			ic_assoc_retry;
 	uint8_t			ic_assoc_tries;
 	uint8_t			ic_assoc_reassoc;
+	/* phase 4i: a voluntary leave (deauth sent) until newstate runs */
+	uint8_t			ic_leave_pending;
 	u_int8_t		ic_myaddr[IEEE80211_ADDR_LEN];
 	struct ieee80211_rateset ic_sup_rates[IEEE80211_MODE_MAX];
 	struct ieee80211_channel ic_channels[IEEE80211_CHAN_MAX+1];

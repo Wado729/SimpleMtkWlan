@@ -458,8 +458,13 @@ ieee80211_assoc_timeout(void *arg)
 	struct ieee80211com *ic = (struct ieee80211com *)arg;
 	struct ieee80211_node *ni = ic->ic_bss;
 
+	/*
+	 * ic_state changes only when the driver's newstate task ends: a
+	 * leave on its way (review M3/S1) also stops retries.
+	 */
 	if (ic->ic_opmode != IEEE80211_M_STA ||
-	    ic->ic_state != IEEE80211_S_ASSOC || ni == NULL)
+	    ic->ic_state != IEEE80211_S_ASSOC || ni == NULL ||
+	    ic->ic_leave_pending)
 		return;
 	if (ic->ic_assoc_tries >= IEEE80211_ASSOC_MAX_TRIES) {
 		/* net80211's management timer rescans */
@@ -469,9 +474,8 @@ ieee80211_assoc_timeout(void *arg)
 		return;
 	}
 	ic->ic_assoc_tries++;
-	XYLog("%s: %sassociation request try %u to %s\n", ic->ic_if.if_xname,
-	    ic->ic_assoc_reassoc ? "re" : "", ic->ic_assoc_tries,
-	    ether_sprintf(ni->ni_macaddr));
+	XYLog("%s: association request try %u to %s\n", ic->ic_if.if_xname,
+	    ic->ic_assoc_tries, ether_sprintf(ni->ni_macaddr));
 	if (IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_ASSOC_REQ,
 	    ic->ic_assoc_reassoc) == 0)
 		ieee80211_assoc_arm(ic, IEEE80211_ASSOC_RETRY_MS);
@@ -497,6 +501,8 @@ ieee80211_assoc_comeback(struct ieee80211com *ic, uint32_t tu)
 {
 	uint32_t ms = tu != 0 ? (uint32_t)(((uint64_t)tu * 1024) / 1000) : 1000;
 
+	if (!ic->ic_assoc_retry || ic->ic_opmode != IEEE80211_M_STA)
+		return;
 	if (ms < 10)
 		ms = 10;
 	if (ms > IEEE80211_ASSOC_COMEBACK_MAX_MS)
@@ -1875,6 +1881,7 @@ ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 	if (ic->ic_assoc_retry && ostate == IEEE80211_S_ASSOC &&
 	    nstate != IEEE80211_S_ASSOC)
 		timeout_del(&ic->ic_assoc_to);
+	ic->ic_leave_pending = 0;
 	ieee80211_set_link_state(ic, LINK_STATE_DOWN);
 	ic->ic_xflags &= ~IEEE80211_F_TX_MGMT_ONLY;
 	switch (nstate) {
@@ -2079,16 +2086,17 @@ justcleanup:
 				    ieee80211_state_name[nstate]);
 			break;
 		case IEEE80211_S_AUTH:
+			/* tries counted before a fast answer can look (S6) */
+			ieee80211_assoc_begin(ic, 0);
 			IEEE80211_SEND_MGMT(ic, ni,
 			    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0);
-			ieee80211_assoc_begin(ic, 0);
 			break;
 		case IEEE80211_S_RUN:
 			ieee80211_stop_ampdu_tx(ic, ni, mgt);
 			ieee80211_ba_del(ni);
+			ieee80211_assoc_begin(ic, 1);
 			IEEE80211_SEND_MGMT(ic, ni,
 			    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 1);
-			ieee80211_assoc_begin(ic, 1);
 			break;
 		}
 		break;

@@ -9477,7 +9477,7 @@ mwx_reg_addr(struct mwx_softc *sc, uint32_t reg)
  * ---------------------------------------------------------------------------
  */
 void mtk_dbg_publish();
-extern "C" void mtk_dbg_snapshot(const char *why);
+extern "C" void mtk_dbg_snapshot(const char *why, bool voluntary);
 
 #define	MT7927_FW_PATCH_PATH \
 	"/Library/Firmware/mediatek/mt7927/WIFI_MT6639_PATCH_MCU_2_1_hdr.bin"
@@ -10219,6 +10219,28 @@ mt7927_vht_mcs_nss(uint16_t map)
 	return n;
 }
 
+/*
+ * Phase 4i: let queued frames (the deauth sent on leaving, protected with
+ * the PTK in the chip) leave before the station's key or entry goes, as
+ * mac80211 flushes the queues before removing the station. Bounded: on
+ * the command gate TX free events wait, so it may take the whole 100 ms.
+ */
+static void
+mt7927_tx_drain(struct mwx_softc *sc, const char *why)
+{
+	uint32_t inflight = 0, ring = 0, waited = 0;
+
+	mt7927_engine_tx_depth(sc->sc_7927, &inflight, &ring);
+	while ((inflight != 0 || ring != 0) && waited < 100) {
+		delay(5 * 1000);
+		waited += 5;
+		mt7927_engine_tx_depth(sc->sc_7927, &inflight, &ring);
+	}
+	if (waited != 0)
+		MWX_DEV_LOG(sc, "MT7927 %s: waited %u ms for the TX queue (%u in "
+		    "the chip, %u not fetched)\n", why, waited, inflight, ring);
+}
+
 static void
 mt7927_join_teardown(struct mwx_softc *sc, const char *why)
 {
@@ -10226,25 +10248,7 @@ mt7927_join_teardown(struct mwx_softc *sc, const char *why)
 
 	if (!sc->sc_7927_joined)
 		return;
-	/*
-	 * Phase 4i: let queued frames (the deauth sent on leaving, protected
-	 * with the PTK in the chip) leave before the station entry and its
-	 * key go, as mac80211 flushes the queues before removing the station.
-	 */
-	{
-		uint32_t inflight = 0, ring = 0, waited = 0;
-
-		mt7927_engine_tx_depth(sc->sc_7927, &inflight, &ring);
-		while ((inflight != 0 || ring != 0) && waited < 100) {
-			delay(5 * 1000);
-			waited += 5;
-			mt7927_engine_tx_depth(sc->sc_7927, &inflight, &ring);
-		}
-		if (waited != 0)
-			MWX_DEV_LOG(sc, "MT7927 leaving: waited %u ms for the "
-			    "TX queue (%u in the chip, %u not fetched)\n", waited,
-			    inflight, ring);
-	}
+	mt7927_tx_drain(sc, "leaving");
 	mt7927_vif_fill(sc, &v);
 	mt7927_roc_abort(sc->sc_7927, &v);
 	mt7927_sta_rec(sc->sc_7927, &v, &sc->sc_7927_bss, true, false, 0, false);
@@ -10282,6 +10286,8 @@ mt7927_join_prepare(struct mwx_softc *sc)
 		mt7927_join_teardown(sc, "new AP");
 	if (sc->sc_7927_joined) {
 		/* AUTH again on the same AP: keep the records, new ROC. */
+		if (sc->sc_7927_hwkeys != 0)
+			mt7927_tx_drain(sc, "rejoining");	/* review S3 */
 		mt7927_vif_fill(sc, &v);
 		/* the old keys go: the new association negotiates new ones */
 		if (sc->sc_7927_hwkeys & MT7927_HWKEY_PAIRWISE)
@@ -10412,10 +10418,11 @@ mt7927_newstate(struct mwx_softc *sc, enum ieee80211_state ostate,
 	    ic->ic_opmode == IEEE80211_M_STA) {
 		char why[96];
 
-		snprintf(why, sizeof(why), "RUN -> %s (arg %d) from %s",
+		snprintf(why, sizeof(why), "RUN -> %s (arg %d) from %s%s",
 		    ieee80211_state_name[nstate], arg,
-		    ether_sprintf(sc->sc_7927_bss.bssid));
-		mtk_dbg_snapshot(why);
+		    ether_sprintf(sc->sc_7927_bss.bssid),
+		    ic->ic_leave_pending ? ", macOS left" : "");
+		mtk_dbg_snapshot(why, ic->ic_leave_pending != 0);
 		mtk_dbg_publish();
 	}
 	if (nstate < IEEE80211_S_AUTH)
@@ -10920,6 +10927,23 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 				MWX_DEV_LOG(sc, "MT7927 protected management "
 				    "frame held back: the PTK is not in the chip "
 				    "yet\n");
+				continue;
+			} else if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) ==
+			    IEEE80211_FC0_TYPE_MGT &&
+			    !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+			    (ni == NULL || k != &ni->ni_pairwise_key)) {
+				/*
+				 * Phase 4i (review M3/M4): a protected unicast
+				 * management frame with no pairwise key to use
+				 * (RSN already off: ieee80211_get_txkey() gave
+				 * a group key). Never sent with the wrong key.
+				 */
+				m_freem(m);
+				if (ni != NULL)
+					ieee80211_release_node(ic, ni);
+				sc->sc_7927_tx_encfail++;
+				MWX_DEV_LOG(sc, "MT7927 protected management "
+				    "frame dropped: no pairwise key any more\n");
 				continue;
 			} else if ((m = ieee80211_encrypt(ic, m, k)) == NULL) {
 				if (ni != NULL)
@@ -12001,6 +12025,9 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 	 * Phase 4i: probing the AP (below). Any frame from it since the probe
 	 * went out (a probe response, data, a changed beacon) and we stay.
 	 */
+	/* review S5: off channel, probes and answers would be lost */
+	if (sc->sc_7927_wd_probes != 0 && (sc->sc_flags & MWX_FLAG_SCANNING))
+		return;
 	if (sc->sc_7927_wd_probes != 0) {
 		uint32_t heard = mt7927_rx_from_bss(sc);
 
@@ -12063,7 +12090,7 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 		}
 		sc->sc_7927_wd_window_mark = heard;
 	}
-	if (why == NULL)
+	if (why == NULL || (sc->sc_flags & MWX_FLAG_SCANNING))
 		return;
 	if (sc->sc_7927_wd_probes == 0) {
 		sc->sc_7927_wd_probes = 1;

@@ -852,14 +852,27 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork(const char *why)
      * needs IEEE80211_F_RSNON); the HAL lets it leave the chip before the
      * station entry goes.
      */
+    /*
+     * Review M3: ic_state changes only when the HAL's newstate task ends,
+     * so a second leave in that window (macOS: disassociate, then join)
+     * still sees RUN with RSN already off: no second deauth then (a
+     * protected frame would get a group key). M5: data TX stops first, so
+     * no class-3 frame follows the deauth.
+     */
+    timeout_del(&ic->ic_assoc_to);      /* review S1 */
     if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL &&
-        (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_ASSOC)) {
+        !ic->ic_leave_pending &&
+        (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_ASSOC) &&
+        ((ic->ic_flags & IEEE80211_F_RSNON) ||
+         !(ic->ic_bss->ni_flags & IEEE80211_NODE_TXMGMTPROT))) {
+        ic->ic_xflags |= IEEE80211_F_TX_MGMT_ONLY;
+        ic->ic_leave_pending = 1;
         int rv = IEEE80211_SEND_MGMT(ic, ic->ic_bss,
             IEEE80211_FC0_SUBTYPE_DEAUTH, IEEE80211_REASON_AUTH_LEAVE);
-        XYLog("WCL leave: deauth to %s (%s) -> %d\n",
-            ether_sprintf(ic->ic_bss->ni_macaddr),
+        XYLog("WCL leave: deauth to %s (%s) -> %d, %d management frames still "
+            "queued\n", ether_sprintf(ic->ic_bss->ni_macaddr),
             (ic->ic_bss->ni_flags & IEEE80211_NODE_TXMGMTPROT) ?
-            "protected" : "not protected", rv);
+            "protected" : "not protected", rv, mq_len(&ic->ic_mgtq));
     }
     portAuthorized = false;
     updateWCLLinkQuality(true);

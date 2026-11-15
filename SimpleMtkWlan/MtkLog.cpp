@@ -62,15 +62,18 @@ extern "C" void mtk_dbg_log(const char *fmt, ...)
 /*
  * Phase 4i: the ring above covers only minutes, so the log before each
  * disconnect (RUN left) is also copied here: the last MTK_DROP_SLOT bytes,
- * the newest MTK_DROP_SLOTS of them, published as "MtkDropLog".
+ * published as "MtkDropLog". The newest 4 disconnects macOS did not ask for
+ * and, apart (review S7: they must not push those out), the newest 2 it did.
  */
 #define MTK_DROP_SLOT  (16 * 1024)
-#define MTK_DROP_SLOTS 4
+#define MTK_DROP_INVOL 4
+#define MTK_DROP_VOL   2
+#define MTK_DROP_SLOTS (MTK_DROP_INVOL + MTK_DROP_VOL)
 static char gMtkDropBuf[MTK_DROP_SLOTS][MTK_DROP_SLOT];
 static size_t gMtkDropLen[MTK_DROP_SLOTS];
-static unsigned gMtkDropCount;
+static unsigned gMtkDropCount, gMtkDropInvol, gMtkDropVol;
 
-void mtk_dbg_snapshot(const char *why)
+void mtk_dbg_snapshot(const char *why, bool voluntary)
 {
     unsigned slot;
     size_t hdr, take, from;
@@ -79,7 +82,10 @@ void mtk_dbg_snapshot(const char *why)
 
     absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
     mtkDbgLock();
-    slot = gMtkDropCount % MTK_DROP_SLOTS;
+    if (voluntary)
+        slot = MTK_DROP_INVOL + gMtkDropVol++ % MTK_DROP_VOL;
+    else
+        slot = gMtkDropInvol++ % MTK_DROP_INVOL;
     dst = gMtkDropBuf[slot];
     hdr = (size_t)snprintf(dst, 160, "===== disconnect #%u at [%llu.%03llu]: %s =====\n",
         gMtkDropCount + 1, ns / 1000000000ULL, (ns / 1000000ULL) % 1000ULL, why);
@@ -114,10 +120,18 @@ static void mtk_drop_publish(IOService *nub)
     if (copy == NULL)
         return;
     mtkDbgLock();
-    n = gMtkDropCount < MTK_DROP_SLOTS ? gMtkDropCount : MTK_DROP_SLOTS;
-    first = gMtkDropCount - n;
+    /* not asked for first, oldest to newest; then macOS's own leaves */
+    n = gMtkDropInvol < MTK_DROP_INVOL ? gMtkDropInvol : MTK_DROP_INVOL;
+    first = gMtkDropInvol - n;
     for (i = 0; i < n; i++) {
-        unsigned slot = (first + i) % MTK_DROP_SLOTS;
+        unsigned slot = (first + i) % MTK_DROP_INVOL;
+        memcpy(copy + len, gMtkDropBuf[slot], gMtkDropLen[slot]);
+        len += gMtkDropLen[slot];
+    }
+    n = gMtkDropVol < MTK_DROP_VOL ? gMtkDropVol : MTK_DROP_VOL;
+    first = gMtkDropVol - n;
+    for (i = 0; i < n; i++) {
+        unsigned slot = MTK_DROP_INVOL + (first + i) % MTK_DROP_VOL;
         memcpy(copy + len, gMtkDropBuf[slot], gMtkDropLen[slot]);
         len += gMtkDropLen[slot];
     }

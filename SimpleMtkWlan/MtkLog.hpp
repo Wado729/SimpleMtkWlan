@@ -16,6 +16,6 @@ extern "C" void mtk_dbg_log(const char *fmt, ...) __attribute__((format(printf, 
 void mtk_dbg_set_nub(IOService *nub);
 void mtk_dbg_publish();
 /* Phase 4i: keep the log before a disconnect ("MtkDropLog"). */
-extern "C" void mtk_dbg_snapshot(const char *why);
+extern "C" void mtk_dbg_snapshot(const char *why, bool voluntary);
 
 #endif /* MtkLog_hpp */
