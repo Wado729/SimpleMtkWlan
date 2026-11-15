@@ -39,7 +39,9 @@ int main(){
   uint8_t f[32+16+64]={0}; put(f+4,1u<<18); put(f+12,(69u<<8)); 
   uint32_t v0=11|(1u<<7), v2=3|(8u<<11), v3=0xb4b4b4b4; put(f+32,v0); put(f+40,v2); put(f+44,v3);
   mt7927_rxi ri; assert(mt7927_rx_parse(f,sizeof f,3,&ri)==0);
-  assert(ri.has_rxv && ri.rx_mode==8 && ri.rx_nss==2 && ri.rx_mcs==11 && ri.rx_bw==3 && ri.rssi==-20 && ri.hdr_off==48);
+  assert(ri.has_rxv && ri.rx_mode==8 && ri.rx_nss==2 && ri.rx_mcs==11 && ri.rx_bw==3 && ri.rssi==-20 && ri.hdr_off==48 && ri.chain_rssi[0]==-20 && ri.chain_rssi[1]==-20);
+  put(f+44,0x0000a0b4); assert(mt7927_rx_parse(f,sizeof f,3,&ri)==0 && ri.chain_rssi[0]==-20 && ri.chain_rssi[1]==-30 && ri.rssi==-20);
+  put(f+44,v3);
   put(f+32,7|(0u<<7)); put(f+40,2|(4u<<11)); assert(mt7927_rx_parse(f,sizeof f,3,&ri)==0 && ri.rx_mode==4 && ri.rx_mcs==7 && ri.rx_nss==1 && ri.rx_bw==2);
   put(f+32,0x13); put(f+40,0|(2u<<11)); assert(mt7927_rx_parse(f,sizeof f,3,&ri)==0 && ri.rx_mode==2 && ri.rx_mcs==0x13);   /* HT keeps nss in the index */
   put(f+4,0); assert(mt7927_rx_parse(f,sizeof f,3,&ri)==0 && !ri.has_rxv);

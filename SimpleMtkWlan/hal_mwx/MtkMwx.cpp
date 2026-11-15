@@ -653,6 +653,8 @@ struct mwx_softc {
 				sc_7927_rx5_batched, sc_7927_rx5_intr,
 				sc_7927_rx5_amsdu;
 	uint64_t		sc_7927_rx5_ns;		/* when the window began */
+	int32_t			sc_7927_rxc_sum[2];	/* 4h.2: chain RSSI sums */
+	uint32_t		sc_7927_rxc_n[2];
 	bool			sc_7927_flat6g;		/* -mtk7927flat6g: 12 dBm at every width */
 	/* phase 4c.10: RX header translation (decap offload) */
 	bool			sc_7927_rx_decap;	/* on unless -mtk7927nodecap */
@@ -4816,6 +4818,7 @@ struct mt7927_rxi {
 	uint8_t		rx_mcs;
 	uint8_t		rx_nss;
 	uint8_t		rx_bw;		/* 0 20, 1 40, 2 80, 3 160 MHz */
+	int8_t		chain_rssi[2];	/* phase 4h.2: dBm per chain, 0 if none */
 };
 
 
@@ -7406,6 +7409,8 @@ mt7927_rx_parse(const uint8_t *p, uint32_t len, uint8_t antenna_mask,
 
 			if (!(antenna_mask & (1U << i)) || rssi >= 0)
 				continue;
+			if (i < 2)
+				ri->chain_rssi[i] = (int8_t)rssi;
 			if (rssi > ri->rssi)
 				ri->rssi = (int8_t)rssi;
 		}
@@ -11219,6 +11224,11 @@ mt7927_rx_rate_note(struct mwx_softc *sc, const struct mt7927_rxi *ri)
 
 	if (!ri->has_rxv)
 		return;
+	for (i = 0; i < 2; i++)
+		if (ri->chain_rssi[i] < 0) {
+			sc->sc_7927_rxc_sum[i] += ri->chain_rssi[i];
+			sc->sc_7927_rxc_n[i]++;
+		}
 	key = ((uint32_t)ri->rx_mode << 16) |
 	    ((uint32_t)(ri->rx_nss & 0xf) << 12) |
 	    ((uint32_t)ri->rx_bw << 8) | ri->rx_mcs;
@@ -11618,10 +11628,36 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 					}
 					ie += 2 + ie[1];
 				}
-				MWX_DEV_LOG(sc, "MT7927 6 GHz: %s \"%s\" %s ch %u rssi %d\n",
-				    f[0] == 0x80 ? "beacon" : "probe response",
-				    ssid[0] ? ssid : "(hidden)", ether_sprintf(f + 16),
-				    ri.chan, ri.rssi);
+				{
+					/*
+					 * Phase 4h.2: what Wi-Fi 7 the AP offers
+					 * (EHT Capabilities ext 108, EHT
+					 * Operation ext 106: width 0-4 = 20..320
+					 * MHz when its information is present).
+					 */
+					const uint8_t *e = f + 36;
+					int ehtcap = 0, ehtw = -1;
+
+					while (e + 2 <= end && e + 2 + e[1] <= end) {
+						if (e[0] == 255 && e[1] >= 1 && e[2] == 108)
+							ehtcap = 1;
+						if (e[0] == 255 && e[1] >= 6 && e[2] == 106) {
+							ehtw = 0x100;
+							if ((e[3] & 1) && e[1] >= 9)
+								ehtw = e[8] & 0x7;
+						}
+						e += 2 + e[1];
+					}
+					MWX_DEV_LOG(sc, "MT7927 6 GHz: %s \"%s\" %s ch %u "
+					    "rssi %d; EHT %s, EHT width %s\n",
+					    f[0] == 0x80 ? "beacon" : "probe response",
+					    ssid[0] ? ssid : "(hidden)",
+					    ether_sprintf(f + 16), ri.chan, ri.rssi,
+					    ehtcap ? "yes" : "no", ehtw < 0 ? "-" :
+					    ehtw == 0x100 ? "as HE" : ehtw == 4 ? "320 MHz" :
+					    ehtw == 3 ? "160 MHz" : ehtw == 2 ? "80 MHz" :
+					    ehtw == 1 ? "40 MHz" : "20 MHz");
+				}
 			}
 			/* phase 4e.2: to the front end, which shows it in macOS */
 			if (ic->ic_event_handler != NULL && ic->ic_6ghz_channels) {
@@ -12092,18 +12128,24 @@ mt7927_hal_poll(struct mwx_softc *sc)
 				MWX_DEV_LOG(sc, "MT7927 rx last %u ms: %u Mbit/s, "
 				    "%u frames, %u interrupts of all kinds (%u.%u "
 				    "frames each), %u batches up (%u.%u each), %u "
-				    "A-MSDU subframes; rx rate (%u sampled, %u "
-				    "other): %s\n", (uint32_t)ms5,
+				    "A-MSDU subframes; chain RSSI %d/%d dBm; rx "
+				    "rate (%u sampled, %u other): %s\n", (uint32_t)ms5,
 				    (uint32_t)(dB * 8 / (ms5 * 1000)), df, di,
 				    di ? df / di : 0, di ? (df * 10 / di) % 10 : 0,
 				    db, db ? dbt / db : 0,
 				    db ? (dbt * 10 / db) % 10 : 0,
 				    sc->sc_7927_rx_amsdu_sub - sc->sc_7927_rx5_amsdu,
+				    sc->sc_7927_rxc_n[0] ? (int)(sc->sc_7927_rxc_sum[0] /
+				    (int32_t)sc->sc_7927_rxc_n[0]) : 0,
+				    sc->sc_7927_rxc_n[1] ? (int)(sc->sc_7927_rxc_sum[1] /
+				    (int32_t)sc->sc_7927_rxc_n[1]) : 0,
 				    sc->sc_7927_rxr_n, sc->sc_7927_rxr_other,
 				    top[0] ? top : "none");
 			memset(sc->sc_7927_rxr_cnt, 0,
 			    sizeof(sc->sc_7927_rxr_cnt));
 			sc->sc_7927_rxr_n = sc->sc_7927_rxr_other = 0;
+			memset(sc->sc_7927_rxc_sum, 0, sizeof(sc->sc_7927_rxc_sum));
+			memset(sc->sc_7927_rxc_n, 0, sizeof(sc->sc_7927_rxc_n));
 			sc->sc_7927_rx5_bytes = sc->sc_7927_rx_bytes;
 			sc->sc_7927_rx5_frames = sc->sc_7927_rx8023;
 			sc->sc_7927_rx5_batches = sc->sc_7927_rx_batches;
