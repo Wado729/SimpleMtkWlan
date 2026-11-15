@@ -10671,6 +10671,25 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 				/* the chip adds the CCMP header and MIC */
 				hwenc = true;
 				sc->sc_7927_tx_hwenc++;
+			} else if (sc->sc_7927_ptk_pending &&
+			    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) ==
+			    IEEE80211_FC0_TYPE_MGT && k != NULL && ni != NULL &&
+			    k == &ni->ni_pairwise_key) {
+				/*
+				 * Phase 4f.2 (review): a protected management
+				 * frame while the new PTK goes to the chip: not
+				 * in software (the chip starts over at PN 1, a
+				 * CCMP nonce reuse); dropped, net80211 resends
+				 * (ADDBA) or the AP asks again (SA Query).
+				 */
+				m_freem(m);
+				if (ni != NULL)
+					ieee80211_release_node(ic, ni);
+				sc->sc_7927_tx_encfail++;
+				MWX_DEV_LOG(sc, "MT7927 protected management "
+				    "frame held back: the PTK is not in the chip "
+				    "yet\n");
+				continue;
 			} else if ((m = ieee80211_encrypt(ic, m, k)) == NULL) {
 				if (ni != NULL)
 					ieee80211_release_node(ic, ni);
@@ -11464,6 +11483,17 @@ mt7927_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	if (ri.decrypted) {
 		struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
 
+		/*
+		 * Phase 4f.2 (review): a management frame counts as decrypted
+		 * only if it was sent protected -- with MFP, an unprotected
+		 * forged deauth must not pass as hardware-decrypted.
+		 */
+		if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) ==
+		    IEEE80211_FC0_TYPE_MGT &&
+		    !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
+			mt7927_rx_csum(sc, m, csum_ok);
+			return 0;
+		}
 		/* no PN to rebuild the header from: trust hardware replay checks */
 		rxi->rxi_flags |= IEEE80211_RXI_HWDEC;
 		wh->i_fc[1] &= ~IEEE80211_FC1_PROTECTED;
@@ -11708,6 +11738,36 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		sc->sc_7927_scan_ticks = 0;
 	}
 	mt7927_join_poll(sc);
+	/*
+	 * Phase 4f.2 (review): SAE frames resent each second, 3 tries, within
+	 * the 3 s join ROC (net80211's own 5 s timer comes after it).
+	 */
+	{
+		struct ieee80211com *ic = &sc->sc_ic;
+		static int sae_state = -1;
+		static unsigned int sae_tries;
+
+		if (ic->ic_opmode == IEEE80211_M_STA &&
+		    ic->ic_state == IEEE80211_S_AUTH && ic->ic_bss != NULL &&
+		    ic->ic_bss->ni_rsnakms == IEEE80211_AKM_SAE &&
+		    (ic->ic_bss->ni_sae.sae_state == SAE_STATE_COMMITTED ||
+		    ic->ic_bss->ni_sae.sae_state == SAE_STATE_CONFIRMED)) {
+			if (sae_state != ic->ic_bss->ni_sae.sae_state) {
+				sae_state = ic->ic_bss->ni_sae.sae_state;
+				sae_tries = 0;
+			} else {
+				MWX_DEV_LOG(sc, "MT7927 SAE %s resend %u to %s\n",
+				    sae_state == SAE_STATE_COMMITTED ?
+				    "commit" : "confirm", sae_tries + 1,
+				    ether_sprintf(ic->ic_bss->ni_macaddr));
+				(void)ieee80211_auth_sae_timeout(ic, ic->ic_bss,
+				    ++sae_tries);
+				if (ic->ic_state != IEEE80211_S_AUTH)
+					sae_state = -1;
+			}
+		} else
+			sae_state = -1;
+	}
 	{
 		struct ifnet *ifp = &sc->sc_ic.ic_if;
 

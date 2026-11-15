@@ -577,8 +577,12 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
      */
     const uint32_t saeAuth = APPLE80211_AUTHTYPE_WPA3_SAE | APPLE80211_AUTHTYPE_WPA3_FT_SAE;
     bool sae = false;
-    if ((join.upperAuth & saeAuth) && !(join.upperAuth & ~(saeAuth | APPLE80211_AUTHTYPE_WPA2_PSK)) &&
-        AirportWCL::isPassphrase(join)) {
+    // WPA3-Personal with the password itself (as before 4f.2, anything else
+    // with SAE bits stays invalid below)
+    const bool wpa3Personal = (join.upperAuth & saeAuth) &&
+        !(join.upperAuth & ~(saeAuth | APPLE80211_AUTHTYPE_WPA2_PSK)) &&
+        AirportWCL::isPassphrase(join);
+    if (wpa3Personal) {
         ieee80211com *jic = fHalService->get80211Controller();
         ieee80211_node *jn = ieee80211_find_node(jic, join.bssid);
         AirportWCL::RSNSummary r = {};
@@ -597,9 +601,18 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
               !sae ? "WPA2-PSK from the password (no MFP in this driver)" :
               preferSAE ? "SAE, or WPA2-PSK if the network has no SAE" :
               "SAE on an SAE-only network, WPA2-PSK where offered");
-        join.upperAuth = APPLE80211_AUTHTYPE_WPA2_PSK;  // validated as personal below
     }
-    auto auth = AirportWCL::classifyLegacyAuth(join);
+    // Validated as WPA2-PSK (classifyLegacyAuth knows no SAE). On a copy:
+    // join itself keeps macOS's request, so a deferred join (private MAC,
+    // resumeWCLJoin) comes back here as WPA3 again (review of 4f.2).
+    AirportWCL::LegacyAuth auth;
+    if (wpa3Personal) {
+        AirportWCL::JoinRequest probe = join;
+        probe.upperAuth = APPLE80211_AUTHTYPE_WPA2_PSK;
+        auth = AirportWCL::classifyLegacyAuth(probe);
+        explicit_bzero(&probe, sizeof(probe));
+    } else
+        auth = AirportWCL::classifyLegacyAuth(join);
     XYLog("WCL join ssid_len=%u bssid=%s chanspec=0x%x auth lower=%u upper=0x%x -> %s, key len=%u type=%u%s, rsn_ie len=%u\n",
           join.ssidLength, ether_sprintf(join.bssid), join.channelSpec, join.lowerAuth, join.upperAuth,
           AirportWCL::legacyAuthName(auth), join.keyLength, join.keyCipher,
@@ -645,9 +658,12 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         if (join.upperAuth & (APPLE80211_AUTHTYPE_WPA | APPLE80211_AUTHTYPE_WPA_PSK))
             wpa.i_protos |= IEEE80211_WPA_PROTO_WPA1;
         if (join.upperAuth & (APPLE80211_AUTHTYPE_WPA2 | APPLE80211_AUTHTYPE_WPA2_PSK |
-                              APPLE80211_AUTHTYPE_SHA256_PSK | APPLE80211_AUTHTYPE_SHA256_8021X))
+                              APPLE80211_AUTHTYPE_SHA256_PSK | APPLE80211_AUTHTYPE_SHA256_8021X) ||
+            wpa3Personal)
             wpa.i_protos |= IEEE80211_WPA_PROTO_WPA2;
-        if (join.upperAuth & (APPLE80211_AUTHTYPE_WPA_PSK | APPLE80211_AUTHTYPE_WPA2_PSK))
+        // WPA3 asked for: WPA2-PSK from the same password where offered
+        if ((join.upperAuth & (APPLE80211_AUTHTYPE_WPA_PSK | APPLE80211_AUTHTYPE_WPA2_PSK)) ||
+            wpa3Personal)
             wpa.i_akms |= IEEE80211_WPA_AKM_PSK;
         if (join.upperAuth & (APPLE80211_AUTHTYPE_WPA | APPLE80211_AUTHTYPE_WPA2))
             wpa.i_akms |= IEEE80211_WPA_AKM_8021X;

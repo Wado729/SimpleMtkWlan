@@ -630,9 +630,11 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
                         }
                     }
                 } else {
-                    m = ieee80211_input_hwdecrypt(ic, ni, m, rxi);
-                    if (m == NULL)
+                    /* NULL (replay, no key) leaves m with us: freed at err */
+                    mbuf_t m2 = ieee80211_input_hwdecrypt(ic, ni, m, rxi);
+                    if (m2 == NULL)
                         goto err;
+                    m = m2;
                 }
                 wh = mtod(m, struct ieee80211_frame *);
             } else if ((wh->i_fc[1] & IEEE80211_FC1_PROTECTED) ||
@@ -697,8 +699,13 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
                          * replay check and IV strip only; a software
                          * decrypt of the plaintext would drop it.
                          */
-                        if (wh->i_fc[1] & IEEE80211_FC1_PROTECTED)
-                            m = ieee80211_input_hwdecrypt(ic, ni, m, rxi);
+                        if (wh->i_fc[1] & IEEE80211_FC1_PROTECTED) {
+                            mbuf_t m2 = ieee80211_input_hwdecrypt(ic, ni,
+                                m, rxi);
+                            if (m2 == NULL)
+                                goto out;   /* frees m */
+                            m = m2;
+                        }
                     } else
                     /* do software decryption */
                     m = ieee80211_decrypt(ic, m, ni);

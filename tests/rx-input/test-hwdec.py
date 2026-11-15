@@ -34,6 +34,7 @@ static const char*ether_sprintf(const uint8_t*a){snprintf(ebuf,sizeof ebuf,"%02x
 struct ieee80211_qosframe{uint8_t b[26];};
 #define IEEE80211_FC0_TYPE_MASK 0x0c
 #define IEEE80211_FC0_TYPE_DATA 0x08
+#define IEEE80211_FC0_TYPE_MGT 0x00
 #define IEEE80211_FC0_SUBTYPE_QOS 0x80
 #define MBUF_CSUM_DID_IP 1
 #define MBUF_CSUM_IP_GOOD 2

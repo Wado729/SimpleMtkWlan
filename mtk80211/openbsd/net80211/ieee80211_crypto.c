@@ -429,9 +429,22 @@ ieee80211_derive_ptk(enum ieee80211_akm akm, const u_int8_t *pmk,
     memcpy(&buf[12], ret ? anonce : snonce, EAPOL_KEY_NONCE_LEN);
     memcpy(&buf[44], ret ? snonce : anonce, EAPOL_KEY_NONCE_LEN);
 
-    kdf = ieee80211_is_sha256_akm(akm) ? ieee80211_kdf : ieee80211_prf;
-    (*kdf)(pmk, IEEE80211_PMK_LEN, (const u_int8_t *)"Pairwise key expansion", 23,
-        buf, sizeof buf, (u_int8_t *)ptk, sizeof(*ptk));
+    /*
+     * Phase 4f.2 (review): the SHA-256 KDF (802.11-2020 12.7.1.6.2) takes
+     * the label without its NUL and mixes the output length in: 384 bits
+     * for a CCMP PTK (KCK 16 + KEK 16 + TK 16), as hostap's sha256_prf.
+     * 23 / 512 made every AKM 6 and AKM 8 (SAE) handshake fail the M2 MIC.
+     * The SHA-1 PRF keeps the NUL (802.11-2020 12.7.1.2).
+     */
+    (void)kdf;
+    if (ieee80211_is_sha256_akm(akm))
+        ieee80211_kdf(pmk, IEEE80211_PMK_LEN,
+            (const u_int8_t *)"Pairwise key expansion", 22,
+            buf, sizeof buf, (u_int8_t *)ptk, MIN(48, sizeof(*ptk)));
+    else
+        ieee80211_prf(pmk, IEEE80211_PMK_LEN,
+            (const u_int8_t *)"Pairwise key expansion", 23,
+            buf, sizeof buf, (u_int8_t *)ptk, sizeof(*ptk));
 }
 
 static void

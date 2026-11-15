@@ -719,6 +719,13 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
             /* install the IGTK */
             switch ((*ic->ic_set_key)(ic, ni, k)) {
                 case 0:
+                    /*
+                     * MFP on from here (phase 4f.2, as Eric-AirportItlwm):
+                     * robust management frames protected both ways.
+                     */
+                    ni->ni_flags |= IEEE80211_NODE_TXMGMTPROT |
+                        IEEE80211_NODE_RXMGMTPROT;
+                    ic->ic_igtk_kid = kid;
                     break;
                 case EBUSY:
                     deferlink = 1;
@@ -1007,9 +1014,13 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
             k->k_mgmt_rsc = LE_READ_6(&igtk[8]);    /* IPN */
             k->k_len = 16;
             memcpy(k->k_key, &igtk[14], k->k_len);
-            /* install the IGTK */
+            /* install the IGTK (group rekey) */
             switch ((*ic->ic_set_key)(ic, ni, k)) {
                 case 0:
+                    ni->ni_flags |= IEEE80211_NODE_TXMGMTPROT |
+                        IEEE80211_NODE_RXMGMTPROT;
+                    ic->ic_igtk_kid = kid;
+                    break;
                 case EBUSY:
                     break;
                 default:

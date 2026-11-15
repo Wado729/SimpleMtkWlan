@@ -1142,6 +1142,12 @@ getCARD_CAPABILITIES(OSObject *object,
             cd->capabilities[6] |= 0x01;
             cd->capabilities[9] |= 0x08 | 0x10;
         }
+        // Phase 4f.2: with MFP the driver does SAE; Apple80211Associate2
+        // filters SAE joins on both bits (as Eric-AirportItlwm sets them).
+        if (fHalService->get80211Controller()->ic_caps & IEEE80211_C_MFP) {
+            cd->capabilities[6] |= 0x01;
+            cd->capabilities[9] |= 0x08;
+        }
     }
     // Phase 4e.7: native WCL is6GSupported reads capability byte 11, bit 6
     // (Ersiter's Eric-AirportItlwm AirportItlwmV2.cpp).

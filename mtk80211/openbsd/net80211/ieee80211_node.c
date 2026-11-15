@@ -1346,6 +1346,12 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs, i
             XYLog("%s: SAE PWE (%s) for %s: %s\n", __FUNCTION__,
                 ni->ni_sae.sae_h2e ? "H2E" : "hunting-and-pecking",
                 ether_sprintf(ni->ni_macaddr), error ? "failed" : "ok");
+            if (error != 0) {
+                /* no commit to send: AUTH would wait for nothing */
+                selbs->ni_fails++;
+                ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+                return;
+            }
         }
         
         if (!force_reauth) {

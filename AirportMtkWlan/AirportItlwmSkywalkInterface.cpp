@@ -344,6 +344,9 @@ getAUTH_TYPE(struct apple80211_authtype_data *ad)
         ic->ic_state == IEEE80211_S_RUN) &&
         ic->ic_bss->ni_rsnakms == IEEE80211_AKM_SAE)
         ad->authtype_upper = APPLE80211_AUTHTYPE_WPA3_SAE;
+    else if (ad->authtype_upper &
+             (APPLE80211_AUTHTYPE_WPA3_SAE | APPLE80211_AUTHTYPE_WPA3_FT_SAE))
+        ad->authtype_upper = APPLE80211_AUTHTYPE_WPA2_PSK;   // WPA3 asked for, WPA2 in use
     return kIOReturnSuccess;
 }
 

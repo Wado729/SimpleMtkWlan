@@ -1676,6 +1676,11 @@ ieee80211_auth_sae(struct ieee80211com *ic, const struct ieee80211_frame *wh,
 		}
 		memcpy(ni->ni_pmkid, ni->ni_sae.sae_pmkid, sizeof(ni->ni_pmkid));
 		ni->ni_flags |= IEEE80211_NODE_PMKID;
+		/* done with the secret scalar and the PWE (PMK kept for M1) */
+		explicit_bzero(ni->ni_sae.sae_rand, sizeof(ni->ni_sae.sae_rand));
+		explicit_bzero(ic->ic_sae_pwe, sizeof(ic->ic_sae_pwe));
+		ic->ic_sae_pwe_valid = 0;
+		ic->ic_xflags &= ~IEEE80211_F_SAE_PWE;
 		XYLog("%s: SAE with %s accepted (%s)\n", __FUNCTION__,
 		    ether_sprintf(ni->ni_macaddr),
 		    ni->ni_sae.sae_h2e ? "H2E" : "hunting-and-pecking");

@@ -367,6 +367,14 @@ inline void clearSAE(ieee80211com *ic) {
     ic->ic_sae_password_len = 0;
     ic->ic_sae_pt_valid = ic->ic_sae_pwe_valid = 0;
     ic->ic_xflags &= ~IEEE80211_F_SAE_PWE;
+    // and what the last join left in the BSS node (review of 4f.2)
+    if (ic->ic_bss) {
+        v = reinterpret_cast<volatile uint8_t *>(&ic->ic_bss->ni_sae);
+        for (size_t i = 0; i < sizeof(ic->ic_bss->ni_sae); ++i) v[i] = 0;
+        v = ic->ic_bss->ni_pmk; for (size_t i = 0; i < sizeof(ic->ic_bss->ni_pmk); ++i) v[i] = 0;
+        v = reinterpret_cast<volatile uint8_t *>(&ic->ic_bss->ni_ptk);
+        for (size_t i = 0; i < sizeof(ic->ic_bss->ni_ptk); ++i) v[i] = 0;
+    }
 }
 
 // Length of the run of complete elements at the start (a truncated or
