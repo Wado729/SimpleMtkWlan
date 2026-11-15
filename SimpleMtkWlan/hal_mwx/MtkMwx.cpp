@@ -687,6 +687,10 @@ struct mwx_softc {
 	uint32_t		sc_7927_wd_probes;
 	uint32_t		sc_7927_wd_rx_mark;
 	uint32_t		sc_7927_wd_window_mark;
+	/* phase 4k: TX status of chosen frames */
+	volatile uint32_t	sc_7927_probe_acks;	/* null probes acked */
+	volatile uint32_t	sc_7927_txs_join_ack, sc_7927_txs_join_nack;
+	volatile uint32_t	sc_7927_txs_leave_ack, sc_7927_txs_leave_nack;
 	uint32_t		sc_7927_rx_hwdec;	/* decrypted by the chip */
 	uint32_t		sc_7927_rx_hwdec_nopn;
 	struct mt7927_bss	sc_7927_bss;
@@ -819,6 +823,7 @@ static void	mt7927_delete_key(struct ieee80211com *, struct ieee80211_node *,
 		    struct ieee80211_key *);
 static void	mt7927_join_poll(struct mwx_softc *);
 static void	mt7927_join_teardown(struct mwx_softc *, const char *);
+static void	mt7927_hal_txs(void *, uint8_t, bool);
 static int	mt7927_ampdu_rx_start(struct ieee80211com *,
 		    struct ieee80211_node *, uint8_t);
 static void	mt7927_ampdu_rx_stop(struct ieee80211com *,
@@ -2953,11 +2958,11 @@ common:
 		    &sw, sizeof(sw));
 		/*
 		 * With keys in the chip the MAC can build A-MSDUs itself
-		 * (MT_TXD3_HW_AMSDU), as Linux mt7925 does. Opt-in with
-		 * -mtk7927amsdu until the TX path is understood.
+		 * (MT_TXD3_HW_AMSDU), as Linux mt7925 does. Phase 4k: on by
+		 * default, as in Linux; -mtk7927noamsdu turns it off.
 		 */
 		sc->sc_7927_amsdu_ok = sc->sc_7927_hwcrypto &&
-		    PE_parse_boot_argn("-mtk7927amsdu", &sw, sizeof(sw));
+		    !PE_parse_boot_argn("-mtk7927noamsdu", &sw, sizeof(sw));
 		if (sc->sc_7927_amsdu_ok)
 			ic->ic_caps |= IEEE80211_C_TX_AMSDU_IN_AMPDU;
 		ic->ic_ampdu_rx_start = mt7927_ampdu_rx_start;
@@ -4736,6 +4741,11 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 #define	MT7927_TXD5_PID(x)		((uint32_t)(x) & 0xff)
 #define	MT7927_TXD5_TX_STATUS_HOST	(1U << 10)
 #define	MT7927_TXS_PID			0x40	/* sampled TX status (< 0x7f) */
+/* phase 4k: frames whose ACK we want to know (mt76's per-skb TX status) */
+#define	MT7927_TXS_PID_JOIN		0x41	/* auth, (re)association request */
+#define	MT7927_TXS_PID_LEAVE		0x42	/* deauth, disassoc */
+#define	MT7927_TXS_PID_PROBE		0x43	/* link watchdog null frame */
+#define	MT7927_TXS_PID_LAST		0x43
 #define	MT7927_PKT_TYPE_TXS		0
 #define	MT7927_TXD3_REM_TX_COUNT(x)	(((uint32_t)(x) & 0x1f) << 11)
 #define	MT7927_TXD3_BA_DISABLE		(1U << 28)
@@ -4975,6 +4985,8 @@ struct mt7927_bringup {
 	void			(*cb_event)(void *, uint8_t, const uint8_t *,
 				    uint32_t);
 	void			(*cb_txroom)(void *);
+	/* phase 4k: ACK of a frame sent with a MT7927_TXS_PID_* (cheap only) */
+	void			(*cb_txs)(void *, uint8_t, bool);
 	volatile bool		tx_blocked;
 	uint32_t		rx_frames;	/* handed to cb_rx */
 	uint32_t		rx_other;	/* data-ring packets not delivered */
@@ -8627,8 +8639,17 @@ mt7927_txs_event(struct mt7927_bringup *b, const uint8_t *p, uint32_t len)
 		uint32_t t0 = mt7927_le32(p + off);
 		uint32_t t3 = mt7927_le32(p + off + 12);
 
-		if (((t0 >> 23) & 3) > 1 || (t3 >> 24) != MT7927_TXS_PID)
+		uint8_t pid = (uint8_t)(t3 >> 24);
+
+		if (((t0 >> 23) & 3) > 1 || pid < MT7927_TXS_PID ||
+		    pid > MT7927_TXS_PID_LAST)
 			continue;
+		if (pid != MT7927_TXS_PID) {
+			/* phase 4k: no ACK / RTS / queue timeout bits: acked */
+			if (b->cb_txs != NULL)
+				b->cb_txs(b->cb_arg, pid, (t0 & (7U << 16)) == 0);
+			continue;
+		}
 		b->txs_count++;
 		if (t0 & (7U << 16))			/* ACK/RTS/queue timeout */
 			b->txs_ack_err++;
@@ -8803,7 +8824,8 @@ mt7927_tx_frame(struct mt7927_bringup *b, const struct mt7927_txinfo *ti,
 	w[5] = 0;						/* PID 0: no TXS */
 	if (ti->txs) {
 		/* as mt7925_mac_write_txwi() for a status request */
-		w[5] = MT7927_TXD5_TX_STATUS_HOST | MT7927_TXD5_PID(MT7927_TXS_PID);
+		w[5] = MT7927_TXD5_TX_STATUS_HOST | MT7927_TXD5_PID(ti->txs_pid ?
+		    ti->txs_pid : MT7927_TXS_PID);
 		w[3] |= MT7927_TXD3_BA_DISABLE;
 		w[3] &= ~MT7927_TXD3_HW_AMSDU;
 	}
@@ -9422,6 +9444,14 @@ mt7927_engine_set_txroom(struct mt7927_bringup *b, void (*fn)(void *))
 	b->cb_txroom = fn;
 }
 
+/* Phase 4k: TX status of frames sent with a MT7927_TXS_PID_* id. */
+void
+mt7927_engine_set_txs(struct mt7927_bringup *b, void (*fn)(void *, uint8_t,
+    bool))
+{
+	b->cb_txs = fn;
+}
+
 /* RX header translation and hardware de-A-MSDU (set before bring-up). */
 void
 mt7927_engine_set_rx_decap(struct mt7927_bringup *b, bool on)
@@ -9629,6 +9659,7 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 	mt7927_engine_set_callbacks(sc->sc_7927, sc, mt7927_hal_rx,
 	    mt7927_hal_event);
 	mt7927_engine_set_txroom(sc->sc_7927, mt7927_hal_txroom);
+	mt7927_engine_set_txs(sc->sc_7927, mt7927_hal_txs);	/* phase 4k */
 	mt7927_engine_set_rxdone(sc->sc_7927, mt7927_hal_rx_done);
 	/* RX header translation + hardware de-A-MSDU like Linux (decap offload) */
 	{
@@ -11124,6 +11155,27 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 			    sc->sc_7927_txbuf[25] == IEEE80211_ACTION_ADDBA_REQ)
 				ti.tid = 2;
 			ti.fixed_rate = true;
+			/*
+			 * Phase 4k: as mac80211 asks a TX status for these
+			 * (IEEE80211_TX_CTL_REQ_TX_STATUS): was it acked?
+			 */
+			switch (wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK) {
+			case IEEE80211_FC0_SUBTYPE_AUTH:
+			case IEEE80211_FC0_SUBTYPE_ASSOC_REQ:
+			case IEEE80211_FC0_SUBTYPE_REASSOC_REQ:
+				if (!ti.multicast) {
+					ti.txs = true;
+					ti.txs_pid = MT7927_TXS_PID_JOIN;
+				}
+				break;
+			case IEEE80211_FC0_SUBTYPE_DEAUTH:
+			case IEEE80211_FC0_SUBTYPE_DISASSOC:
+				if (!ti.multicast) {
+					ti.txs = true;
+					ti.txs_pid = MT7927_TXS_PID_LEAVE;
+				}
+				break;
+			}
 		}
 		rv = mt7927_tx_frame(sc->sc_7927, &ti, sc->sc_7927_txbuf, len);
 		if (ni != NULL)
@@ -12081,12 +12133,87 @@ mt7927_hal_resume(struct mwx_softc *sc)
 	mt7927_hal_start(sc);
 }
 
-/* Phase 4i: frames from our BSS of any kind (beacons, data, management). */
+/*
+ * Phase 4k: TX status of a frame sent with a MT7927_TXS_PID_* id (RX ring
+ * work: the work loop or an MCU waiter's thread). Counters and a log line.
+ */
+static void
+mt7927_hal_txs(void *arg, uint8_t pid, bool acked)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+
+	switch (pid) {
+	case MT7927_TXS_PID_PROBE:
+		if (acked)
+			OSIncrementAtomic((volatile SInt32 *)&sc->sc_7927_probe_acks);
+		MWX_DEV_LOG(sc, "MT7927 link watchdog: null probe %s\n",
+		    acked ? "acked by the AP" : "not acked");
+		break;
+	case MT7927_TXS_PID_JOIN:
+		OSIncrementAtomic((volatile SInt32 *)(acked ?
+		    &sc->sc_7927_txs_join_ack : &sc->sc_7927_txs_join_nack));
+		MWX_DEV_LOG(sc, "MT7927 TX status: authentication/association "
+		    "frame %s\n", acked ? "acked" : "not acked");
+		break;
+	case MT7927_TXS_PID_LEAVE:
+		OSIncrementAtomic((volatile SInt32 *)(acked ?
+		    &sc->sc_7927_txs_leave_ack : &sc->sc_7927_txs_leave_nack));
+		MWX_DEV_LOG(sc, "MT7927 TX status: deauth %s\n",
+		    acked ? "acked" : "not acked");
+		break;
+	}
+}
+
+/*
+ * Phase 4k: a null data frame to the AP with a TX status, as mac80211's
+ * connection monitor probes when the driver reports ACKs
+ * (ieee80211_send_nullfunc()): the AP's ACK says it still hears us.
+ */
+static int
+mt7927_send_null_probe(struct mwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_frame wh;
+	struct mt7927_txinfo ti;
+	int rv;
+
+	if (!sc->sc_7927_joined || ic->ic_bss == NULL ||
+	    sc->sc_7927_txlock == NULL)
+		return ENXIO;
+	memset(&wh, 0, sizeof(wh));
+	wh.i_fc[0] = IEEE80211_FC0_VERSION_0 | IEEE80211_FC0_TYPE_DATA |
+	    IEEE80211_FC0_SUBTYPE_NODATA;
+	wh.i_fc[1] = IEEE80211_FC1_DIR_TODS;
+	IEEE80211_ADDR_COPY(wh.i_addr1, ic->ic_bss->ni_bssid);
+	IEEE80211_ADDR_COPY(wh.i_addr2, ic->ic_myaddr);
+	IEEE80211_ADDR_COPY(wh.i_addr3, ic->ic_bss->ni_bssid);
+	memset(&ti, 0, sizeof(ti));
+	ti.wcid = MT7927_PEER_WCID;
+	ti.omac_idx = sc->sc_vif.omac_idx;
+	ti.band_idx = sc->sc_vif.band_idx;
+	ti.q_idx = 1;					/* BE */
+	ti.hdrlen = sizeof(wh);
+	ti.fixed_rate = true;
+	ti.rate_idx = MT7927_BASIC_RATES_IDX(sc->sc_7927_bss.band);
+	ti.txs = true;
+	ti.txs_pid = MT7927_TXS_PID_PROBE;
+	IOLockLock(sc->sc_7927_txlock);
+	rv = mt7927_tx_frame(sc->sc_7927, &ti, (const uint8_t *)&wh,
+	    sizeof(wh));
+	IOLockUnlock(sc->sc_7927_txlock);
+	return rv;
+}
+
+/*
+ * Phase 4i: signs of the AP: frames from our BSS of any kind (beacons,
+ * data, management) and, phase 4k, ACKs of the watchdog's null probes.
+ */
 static uint32_t
 mt7927_rx_from_bss(struct mwx_softc *sc)
 {
 	return sc->sc_7927_rx_bcn + sc->sc_7927_rx_mcast +
-	    sc->sc_7927_rx_ucast + sc->sc_7927_rx_bss_mgt;
+	    sc->sc_7927_rx_ucast + sc->sc_7927_rx_bss_mgt +
+	    sc->sc_7927_probe_acks;
 }
 
 /*
@@ -12101,6 +12228,8 @@ mt7927_probe_ap(struct mwx_softc *sc)
 
 	MWX_DEV_LOG(sc, "MT7927 link watchdog: probe %u to %s\n",
 	    sc->sc_7927_wd_probes, ether_sprintf(ic->ic_bss->ni_macaddr));
+	/* phase 4k: a null frame whose ACK we see, and a probe request */
+	(void)mt7927_send_null_probe(sc);
 	IEEE80211_SEND_MGMT(ic, ic->ic_bss, IEEE80211_FC0_SUBTYPE_PROBE_REQ, 0);
 	if (ic->ic_state == IEEE80211_S_RUN)
 		ic->ic_mgt_timer = 0;

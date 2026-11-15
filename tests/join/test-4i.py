@@ -58,15 +58,19 @@ struct mt7927_bringup {};
 struct mt7927_bss { uint8_t bssid[6]; };
 struct mwx_softc { ieee80211com sc_ic; bool sc_7927_assoc; uint32_t sc_7927_run_polls, sc_7927_bcn_loss_seen, sc_7927_mib_seen,
   sc_7927_recoveries, sc_7927_last_recovery, sc_7927_poll, sc_7927_rx_bcn, sc_7927_rx_mcast, sc_7927_rx_ucast, sc_7927_rx_bss_mgt,
-  sc_7927_wd_probes, sc_7927_wd_rx_mark, sc_7927_wd_window_mark; int sc_flags; mt7927_bringup *sc_7927; struct { int band_idx; } sc_vif; mt7927_bss sc_7927_bss; };
+  sc_7927_wd_probes, sc_7927_wd_rx_mark, sc_7927_wd_window_mark, sc_7927_probe_acks; int sc_flags; mt7927_bringup *sc_7927; struct { int band_idx; } sc_vif; mt7927_bss sc_7927_bss; };
 static uint32_t E_loss, E_rxt, E_windows;
 static void mt7927_engine_link(mt7927_bringup *, int, uint32_t *loss, uint32_t *dumps, uint32_t *rxt, uint32_t *txt, uint32_t *w) {
   *loss = E_loss; *dumps = 0; *rxt = E_rxt; *txt = 0; *w = E_windows; }
 #define MWX_DEV_LOG(sc, ...) printf(__VA_ARGS__)
 #define MWX_FLAG_SCANNING 0x1
+static int nulls, ack_nulls;
+struct mwx_softc;
+static int mt7927_send_null_probe(struct mwx_softc *);
 ''' + fn(s, "mt7927_rx_from_bss", "static uint32_t") + fn(s, "mt7927_probe_ap", "static void") + \
    "static void mt7927_link_leave(struct mwx_softc *, const char *, uint32_t, uint32_t, uint32_t);\n" + \
    fn(s, "mt7927_link_watchdog", "static void") + fn(s, "mt7927_link_leave", "static void") + r'''
+static int mt7927_send_null_probe(struct mwx_softc *sc) { nulls++; if (ack_nulls) sc->sc_7927_probe_acks++; return 0; }
 int main() {
   ieee80211_node ap{}; ieee80211com ic{}; ic.ic_opmode = IEEE80211_M_STA; ic.ic_bss = &ap; ic.ic_if.if_xname = "mwx0";
   /* off unless the driver asks */
@@ -117,10 +121,17 @@ int main() {
   sc.sc_7927_poll++; mt7927_link_watchdog(&sc); assert(sends_probe == 4 && sc.sc_7927_wd_probes == 3);
   sc.sc_7927_poll++; mt7927_link_watchdog(&sc);
   assert(sends_deauth == 1 && events == 1 && newstates == 1 && sc.sc_ic.ic_state == IEEE80211_S_AUTH && sc.sc_7927_recoveries == 1);
+  assert(nulls == 4);                              /* a null frame with every probe */
+  /* phase 4k: an acked null probe keeps the link (no frames otherwise) */
+  sc.sc_ic.ic_state = IEEE80211_S_RUN; sc.sc_7927_run_polls = 0; sc.sc_7927_last_recovery = 0; mt7927_link_watchdog(&sc);
+  for (int i = 0; i < 40; i++) { sc.sc_7927_poll++; mt7927_link_watchdog(&sc); }
+  ack_nulls = 1; E_windows = 10; sc.sc_7927_poll++; mt7927_link_watchdog(&sc); assert(sends_probe == 5 && nulls == 5);
+  sc.sc_7927_poll++; mt7927_link_watchdog(&sc); assert(sc.sc_7927_wd_probes == 0 && newstates == 1);
+  ack_nulls = 0;
   /* airtime present: nothing */
   sc.sc_ic.ic_state = IEEE80211_S_RUN; sc.sc_7927_run_polls = 0; mt7927_link_watchdog(&sc);
   for (int i = 0; i < 40; i++) { sc.sc_7927_poll++; mt7927_link_watchdog(&sc); }
-  E_rxt = 500; E_windows = 5; sc.sc_7927_poll++; mt7927_link_watchdog(&sc); assert(sends_probe == 4);
+  E_rxt = 500; E_windows = 11; sc.sc_7927_poll++; mt7927_link_watchdog(&sc); assert(sends_probe == 5);
   printf("PASS\n"); return 0;
 }
 '''

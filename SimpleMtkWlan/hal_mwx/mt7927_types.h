@@ -65,6 +65,7 @@ struct mt7927_txinfo {
 	bool		protect;	/* hardware encrypts (key in WTBL) */
 	bool		amsdu;		/* the MAC may pack it into an A-MSDU */
 	bool		txs;		/* ask for a TX status (rate sample) */
+	uint8_t		txs_pid;	/* phase 4k: 0 = MT7927_TXS_PID (sample) */
 };
 
 /* one access category for EDCA_UPDATE (mt7925_mcu_set_tx) */
