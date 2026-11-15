@@ -71,7 +71,7 @@ private:
 
 /*
  * MT7927: the chip runs as a third hardware type of this HAL (MtkMwx.cpp),
- * only with -mtk7927probe. These helpers live in SimpleMtkWlan.cpp, where
+ * unless -mtk7927off. These helpers live in SimpleMtkWlan.cpp, where
  * the VFS and thread headers are available.
  */
 int mt7927_read_file(const char *path, uint8_t **out, size_t *outLen);

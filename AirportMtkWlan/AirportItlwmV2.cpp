@@ -1126,12 +1126,12 @@ getCARD_CAPABILITIES(OSObject *object,
     // WCL uses this capability together with the BSS HE IE for PHY reporting.
     if (caps & IEEE80211_C_HE)
         cd->capabilities[17] |= 0x80;
-    // Experiment (-mtkwpa3caps): say the card does protected management
-    // frames (byte 6 bit 0x01, __getMFPCaps) and SAE (byte 9 bits 0x08 SAE,
-    // 0x10 the SAE key management suite), as AirPort_RTW89 and AirPort-RTW
-    // traced in Sequoia's IO80211 (Apple80211Associate2). macOS then sends
-    // WPA3 joins, and WPA2 ones with the passphrase itself (key type 10).
-    // SAE itself is not done yet: this only shows the join requests.
+    // WPA3 (phase 4j.2: on by default, -mtknowpa3caps turns it off): say
+    // the card does protected management frames (byte 6 bit 0x01,
+    // __getMFPCaps) and SAE (byte 9 bits 0x08 SAE, 0x10 the SAE key
+    // management suite), as AirPort_RTW89 and AirPort-RTW traced in
+    // Sequoia's IO80211 (Apple80211Associate2). Only for a chip whose
+    // driver does MFP (and with it SAE): the MT7927.
     {
         static int wpa3 = -1;
         if (wpa3 < 0) {
@@ -1139,7 +1139,7 @@ getCARD_CAPABILITIES(OSObject *object,
             // phase 4j.2: on by default (WPA3 works); -mtknowpa3caps off
             wpa3 = PE_parse_boot_argn("-mtknowpa3caps", &v, sizeof(v)) ? 0 : 1;
         }
-        if (wpa3) {
+        if (wpa3 && (caps & IEEE80211_C_MFP)) {
             cd->capabilities[6] |= 0x01;
             cd->capabilities[9] |= 0x08 | 0x10;
         }

@@ -9698,8 +9698,14 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 	 * for a US desktop; was "00", the firmware's world default).
 	 */
 	if (PE_parse_boot_argn("mtk7927cc", cc, sizeof(cc) - 1)) {
-		MWX_DEV_LOG(sc, "MT7927 country %s (mtk7927cc)\n", cc);
+		/* review S2: "us" is US; the log shows what the firmware gets */
+		if (cc[0] >= 'a' && cc[0] <= 'z')
+			cc[0] -= 'a' - 'A';
+		if (cc[1] >= 'a' && cc[1] <= 'z')
+			cc[1] -= 'a' - 'A';
 		mt7927_bringup_set_country(sc->sc_7927, cc);
+		MWX_DEV_LOG(sc, "MT7927 country %c%c (mtk7927cc=%s)\n",
+		    sc->sc_7927->alpha2[0], sc->sc_7927->alpha2[1], cc);
 	} else {
 		MWX_DEV_LOG(sc, "MT7927 country US (default; mtk7927cc=XX "
 		    "changes it)\n");
@@ -15754,7 +15760,7 @@ MtkMwx::mwx_match(IOPCIDevice *device)
 
 		/*
 		 * Phase 4j.2: on by default (no boot-arg needed); -mtk7927off
-		 * leaves the card alone. -mtk7927probe is still accepted.
+		 * leaves the card alone (the old -mtk7927probe is not read).
 		 */
 		matched = !PE_parse_boot_argn("-mtk7927off", &on, sizeof(on));
 		MWX_LOG("MT7927 %s%s\n", matched ? "matched" : "not matched",

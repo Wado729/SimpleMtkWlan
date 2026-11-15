@@ -429,8 +429,8 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
         }
     }
     /*
-     * -mtkwcltransition: show PSK/SAE transition networks as they are, so
-     * macOS tries WPA3 on them (to see what its SAE join request carries).
+     * Show PSK/SAE transition networks as they are, so macOS joins them
+     * with WPA3 (phase 4j.2: default; -mtknowcltransition hides SAE).
      */
     static int showTransition = -1;
     if (showTransition < 0) {

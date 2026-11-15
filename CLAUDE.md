@@ -145,4 +145,4 @@ test needs a reboot. On the development machine the EFI partition's disk
 number changes between boots: find the 1.2 GB `EFI` partition with
 `diskutil list` and verify `EFI/OC/OpenCore.efi` exists before writing to it.
 Keep a known-good kext around for rollback. Only one of SimpleMtkWlan.kext /
-AirportMtkWlan.kext may be enabled.
+AirportMT7927Wlan.kext may be enabled.

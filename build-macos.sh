@@ -115,7 +115,8 @@ if [[ "$product" == all || "$product" == AirportMtkWlan ]] && [[ -d "$here/Airpo
 	esac
 	out="$here/build/$config/${AIRPORT_OS:-tahoe}"
 	mkdir -p "$out"
-	build AirportMtkWlan com.flxxxxddd.AirportMtkWlan AirportMtkWlan/WCL/Info.plist \
+	# phase 4j.2: the bundle is AirportMT7927Wlan.kext (product selector unchanged)
+	build AirportMT7927Wlan com.flxxxxddd.AirportMT7927Wlan AirportMtkWlan/WCL/Info.plist \
 		-DAIRPORT -DAIRPORT_WCL "-D__IO80211_TARGET=$target" -DIO80211FAMILY_V2 -- "${common_sources[@]}" \
 		$(cd "$here" && ls AirportMtkWlan/*.cpp AirportMtkWlan/WCL/*.cpp 2>/dev/null)
 fi

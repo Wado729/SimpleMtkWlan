@@ -18,7 +18,7 @@ An experimental macOS kernel extension, based on the OpenBSD `mwx(4)` driver and
 the itlwm-style `net80211` port. It comes in two flavours with the same
 hardware layer:
 
-* **`AirportMtkWlan.kext`** — the card is a real macOS Wi-Fi interface: the
+* **`AirportMT7927Wlan.kext`** — the card is a real macOS Wi-Fi interface: the
   native Wi-Fi menu, System Settings, private Wi-Fi addresses, Keychain
   passwords. Built for **macOS 26 Tahoe** (and Sequoia 15.2+), no OCLP root
   patch, no IOSkywalkFamily downgrade.
@@ -72,15 +72,15 @@ Other MediaTek devices are not supported.
 
 ## Installation
 
-Use **either** `AirportMtkWlan.kext` **or** `SimpleMtkWlan.kext`, never both:
+Use **either** `AirportMT7927Wlan.kext` **or** `SimpleMtkWlan.kext`, never both:
 they match the same card.
 
 ### Native Wi-Fi menu (AirportMtkWlan, Tahoe)
 
 1. Download `AirportMtkWlan-Tahoe-x.y.z-RELEASE.zip` (or `-Sequoia-` for macOS
    15.2+) from [Releases](https://github.com/flxxxxddd/SimpleMtkWlan/releases).
-2. Copy `AirportMtkWlan.kext` to `EFI/OC/Kexts/` and add it to
-   `Kernel → Add` (same entry as below, `BundlePath` `AirportMtkWlan.kext`,
+2. Copy `AirportMT7927Wlan.kext` to `EFI/OC/Kexts/` and add it to
+   `Kernel → Add` (same entry as below, `BundlePath` `AirportMT7927Wlan.kext`,
    `ExecutablePath` `Contents/MacOS/AirportMtkWlan`). Set `MinKernel`
    `25.0.0` / `MaxKernel` `25.99.99` for the Tahoe build (`24.2.0` /
    `24.99.99` for Sequoia): each build only fits that IO80211 version and
@@ -190,7 +190,7 @@ The native Wi-Fi kext is built with a script (not part of the Xcode project):
 ```sh
 ./build-macos.sh Release AirportMtkWlan                        # Tahoe (default)
 AIRPORT_OS=sequoia ./build-macos.sh Release AirportMtkWlan     # Sequoia 15.2+
-# -> build/Release/{tahoe,sequoia}/AirportMtkWlan.kext
+# -> build/Release/{tahoe,sequoia}/AirportMT7927Wlan.kext
 ```
 
 Host tests (extract real driver functions and run them against stubs with
@@ -208,7 +208,7 @@ CI builds Debug and Release on every push and pull request; pushing a tag
 | Path | Contents |
 |---|---|
 | `SimpleMtkWlan/SimpleMtkWlan.cpp` | IOEthernetController front end (SimpleMtkWlan.kext), watchdog |
-| `AirportMtkWlan/` | IO80211 / Skywalk front end (AirportMtkWlan.kext), from AirportItlwm (WCL) |
+| `AirportMtkWlan/` | IO80211 / Skywalk front end (AirportMT7927Wlan.kext), from AirportItlwm (WCL) |
 | `include/Airport/` | IO80211Family / Skywalk headers (`macOS15`, `macOS26` ABI sets) |
 | `SimpleMtkWlan/MtkLog.cpp` | persistent debug log shared by both kexts |
 | `build-macos.sh` | builds AirportMtkWlan (and SimpleMtkWlan) without Xcode project changes |
