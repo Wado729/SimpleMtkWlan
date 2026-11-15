@@ -28,7 +28,8 @@ code = r'''
 #define MT7927_UNI_SET_POWER_LIMIT 0x1f
 static uint32_t mt7927_le32(const uint8_t*p){uint32_t v;memcpy(&v,p,4);return v;}
 ''' + rxi + r'''
-struct mt7927_bringup { char alpha2[2]; };
+struct mwx_softc { bool sc_7927_flat6g; };
+struct mt7927_bringup { char alpha2[2]; mwx_softc *sc; };
 static std::vector<std::vector<uint8_t>> msgs;
 static int mt7927_mcu_send(mt7927_bringup*, int, const void*p, uint32_t n, bool){ msgs.emplace_back((const uint8_t*)p,(const uint8_t*)p+n); return 0; }
 ''' + fn("mt7927_rx_parse", "int") + fn("mt7927_txpower_band", "static int") + r'''
@@ -43,13 +44,13 @@ int main(){
   put(f+32,0x13); put(f+40,0|(2u<<11)); assert(mt7927_rx_parse(f,sizeof f,3,&ri)==0 && ri.rx_mode==2 && ri.rx_mcs==0x13);   /* HT keeps nss in the index */
   put(f+4,0); assert(mt7927_rx_parse(f,sizeof f,3,&ri)==0 && !ri.has_rxv);
   /* 6 GHz power */
-  mt7927_bringup b{{'U','S'}}; assert(mt7927_txpower_band(&b,6)==0);
+  mwx_softc sc{false}; mt7927_bringup b{{'U','S'},&sc}; assert(mt7927_txpower_band(&b,6)==0);
   assert(msgs.size()==37);                                /* 109 channels, 3 per message, last has 109 % 3 = 1 */
   int seen=0, last=0;
   for(auto&m:msgs){ assert(m[13]==3 && m[16]=='U'); int n=m[12]; assert(m.size()==52u+n*450u);
     for(int j=0;j<n;j++){ const uint8_t*k=&m[52+j*450]; uint8_t c=k[0]; const int8_t*sk=(const int8_t*)k+1; seen++;
       if(m[14]) last=c;
-      if(c%4!=1){ for(int x=4;x<449;x++) assert(sk[x]==127); continue; }
+      /* every listed channel, centers of 40/80/160 MHz too (4h review) */
       for(int x=0;x<4;x++) assert(sk[x]==127);            /* no CCK on 6 GHz */
       for(int x=4;x<12;x++) assert(sk[x]==24);            /* OFDM 12 dBm */
       for(int x=12;x<44;x++) assert(sk[x]==127);          /* OFDM wider slots unset, as Linux */
@@ -58,9 +59,13 @@ int main(){
       const int he[7]={4,10,16,24,30,36,42}; for(int r=0;r<7;r++) for(int x=0;x<12;x++) assert(sk[109+12*r+x]==he[r]);
       for(int x=193;x<449;x++) assert(sk[x]==24); } }
   assert(seen==109 && last==233);
+  /* -mtk7927flat6g: 12 dBm everywhere but the unset slots */
+  msgs.clear(); sc.sc_7927_flat6g=true; assert(mt7927_txpower_band(&b,6)==0 && msgs.size()==37);
+  { const int8_t*sk=(const int8_t*)&msgs[23][52+1]; for(int x=4;x<12;x++) assert(sk[x]==24); for(int x=44;x<449;x++) assert(sk[x]==24); }
+  sc.sc_7927_flat6g=false;
   msgs.clear(); assert(mt7927_txpower_band(&b,5)==0);
   { const int8_t*sk=(const int8_t*)&msgs[0][52+1]; assert(msgs[0][13]==2 && sk[4]==40 && sk[44]==40 && sk[109+12*6]==40 && sk[193]==40); }
-  puts("PASS: P-RXV rate parsing (HE/VHT/HT, absent group 3); 6 GHz SET_POWER_LIMIT by width (OFDM/HT/VHT/HE at mt7925 offsets, 127 off-grid, 37 messages, last ch 233); 5 GHz unchanged.");
+  puts("PASS: P-RXV rate parsing (HE/VHT/HT, absent group 3); 6 GHz SET_POWER_LIMIT by width (OFDM/HT/VHT/HE at mt7925 offsets, centers too, -mtk7927flat6g, 37 messages, last ch 233); 5 GHz unchanged.");
 }
 '''
 d = pathlib.Path(tempfile.mkdtemp(prefix="mtk-4h-"))

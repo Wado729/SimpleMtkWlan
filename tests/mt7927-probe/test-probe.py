@@ -66,7 +66,7 @@ struct IOPCIDevice : IORegistryEntry {
   void setProperty(const char *k, const char *v) { sprops[k] = v; }
   void setBusMasterEnable(bool e) { busmaster = e; }
 };
-struct mwx_softc { struct { char dv_xname[16]; } sc_dev; int sc_st; char *sc_memh; size_t sc_mems; bool sc_7927_join6g; };
+struct mwx_softc { struct { char dv_xname[16]; } sc_dev; int sc_st; char *sc_memh; size_t sc_mems; bool sc_7927_join6g; bool sc_7927_flat6g; };
 typedef char *bus_space_handle_t;
 int flr_calls; int mwx_pci_flr(mwx_softc *, IOPCIDevice *) { flr_calls++; return 0; }
 

@@ -652,6 +652,8 @@ struct mwx_softc {
 	uint32_t		sc_7927_rx5_frames, sc_7927_rx5_batches,
 				sc_7927_rx5_batched, sc_7927_rx5_intr,
 				sc_7927_rx5_amsdu;
+	uint64_t		sc_7927_rx5_ns;		/* when the window began */
+	bool			sc_7927_flat6g;		/* -mtk7927flat6g: 12 dBm at every width */
 	/* phase 4c.10: RX header translation (decap offload) */
 	bool			sc_7927_rx_decap;	/* on unless -mtk7927nodecap */
 	struct mt7927_reorder	sc_7927_reorder[8];	/* per TID, BA sessions */
@@ -7395,7 +7397,7 @@ mt7927_rx_parse(const uint8_t *p, uint32_t len, uint8_t antenna_mask,
 			ri->rx_bw = (uint8_t)(v2 & 0x7);
 			ri->rx_nss = (uint8_t)(((v0 >> 7) & 0xf) + 1);
 			ri->rx_mcs = (uint8_t)(v0 & 0x7f);
-			if (ri->rx_mode >= 4)		/* VHT, HE, EHT */
+			if (ri->rx_mode >= 8)		/* HE, EHT (Linux) */
 				ri->rx_mcs &= 0xf;
 		}
 		v3 = mt7927_le32(p + off + 12);
@@ -8829,8 +8831,13 @@ mt7927_txpower_band(struct mt7927_bringup *b, int band)
 		for (j = 0; j < nch; j++, idx++) {
 			uint8_t *sku = tmp + MT7927_TXPWR_HDR + j * MT7927_SKU_LEN;
 			uint8_t c = list[idx];
-			bool known = band == 2 || (band == 6 ? c % 4 == 1 :
-			    (c % 4 == 0 && c <= 144) || (c >= 149 && c % 4 == 1));
+			/*
+			 * 4h review: on 6 GHz every listed channel, the 40/80/
+			 * 160 MHz centers too (the firmware may look a wide
+			 * transmission up by its center; Linux fills every row).
+			 */
+			bool known = band == 2 || band == 6 ||
+			    (c % 4 == 0 && c <= 144) || (c >= 149 && c % 4 == 1);
 			/*
 			 * Phase 4g: 6 GHz at 12 dBm, wireless-regdb's US rule
 			 * (5925-7125, 12 dBm, the narrowest-bandwidth client
@@ -8846,7 +8853,7 @@ mt7927_txpower_band(struct mt7927_bringup *b, int band)
 				memset(sku + 1, pw, 4);		/* cck */
 			memset(sku + 1 + 4, pw, 8);		/* ofdm */
 			memset(sku + 1 + 44, pw, MT7927_SKU_LEN - 1 - 44);
-			if (band == 6 && known) {
+			if (band == 6 && known && !b->sc->sc_7927_flat6g) {
 				/*
 				 * Phase 4h: 6 GHz clients are limited by power
 				 * density (FCC LPI client: -1 dBm/MHz, at most
@@ -9506,6 +9513,8 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 		/* phase 4g: 6 GHz in net80211's table, to join there */
 		sc->sc_7927_join6g = sc->sc_7927_scan6g &&
 		    !PE_parse_boot_argn("-mtk7927no6gjoin", &off, sizeof(off));
+		sc->sc_7927_flat6g = PE_parse_boot_argn("-mtk7927flat6g", &off,
+		    sizeof(off));
 #ifdef AIRPORT_WCL
 		sc->sc_ic.ic_wcl_scan_restart_supported = true;
 #endif
@@ -10264,6 +10273,10 @@ mt7927_join_prepare(struct mwx_softc *sc)
 	mt7927_wtbl_clear(sc->sc_7927, bss.peer_wcid);
 	sc->sc_7927_bss = bss;
 	sc->sc_7927_joined = true;
+	/* phase 4h: the receive diagnostics start a new window */
+	memset(sc->sc_7927_rxr_cnt, 0, sizeof(sc->sc_7927_rxr_cnt));
+	sc->sc_7927_rxr_n = sc->sc_7927_rxr_other = 0;
+	sc->sc_7927_rx5_ns = 0;
 	if ((rv = mt7927_bss_info(sc->sc_7927, &v, &bss, true)) != 0 ||
 	    (rv = mt7927_sta_rec(sc->sc_7927, &v, &bss, true, true, 0, true)) != 0)
 		return rv;
@@ -11206,7 +11219,8 @@ mt7927_rx_rate_note(struct mwx_softc *sc, const struct mt7927_rxi *ri)
 
 	if (!ri->has_rxv)
 		return;
-	key = ((uint32_t)ri->rx_mode << 16) | ((uint32_t)ri->rx_nss << 12) |
+	key = ((uint32_t)ri->rx_mode << 16) |
+	    ((uint32_t)(ri->rx_nss & 0xf) << 12) |
 	    ((uint32_t)ri->rx_bw << 8) | ri->rx_mcs;
 	sc->sc_7927_rxr_n++;
 	for (i = 0; i < 16; i++) {
@@ -12034,11 +12048,17 @@ mt7927_hal_poll(struct mwx_softc *sc)
 			    "HE-ER", "HE-TB", "HE-MU", "?12", "EHT-SU",
 			    "EHT-TB", "EHT-MU" };
 			static const uint16_t bwm[8] = { 20, 40, 80, 160, 320,
-			    0, 0, 0 };
+			    320, 0, 0 };
 			uint32_t in_, is_, fr_, ot_, evs_, to_, df, db, dbt, di;
-			uint64_t dB;
+			uint64_t dB, now5, ms5;
 			char top[160];
 			int o = 0, k;
+
+			absolutetime_to_nanoseconds(mach_absolute_time(), &now5);
+			/* 4h review: the poll skips while the work loop is
+			 * busy, so divide by the real window */
+			ms5 = sc->sc_7927_rx5_ns ?
+			    (now5 - sc->sc_7927_rx5_ns) / 1000000ULL : 0;
 
 			mt7927_engine_counters(sc->sc_7927, &in_, &is_, &fr_,
 			    &ot_, &evs_, &to_);
@@ -12068,13 +12088,13 @@ mt7927_hal_poll(struct mwx_softc *sc)
 				    sc->sc_7927_rxr_n : 0);
 				sc->sc_7927_rxr_cnt[bi] = 0;
 			}
-			if (df > 0)
-				MWX_DEV_LOG(sc, "MT7927 rx last 5 s: %u Mbit/s, "
-				    "%u frames, %u interrupts (%u.%u frames "
-				    "each), %u batches up (%u.%u each), %u "
+			if (df > 0 && ms5 > 0)
+				MWX_DEV_LOG(sc, "MT7927 rx last %u ms: %u Mbit/s, "
+				    "%u frames, %u interrupts of all kinds (%u.%u "
+				    "frames each), %u batches up (%u.%u each), %u "
 				    "A-MSDU subframes; rx rate (%u sampled, %u "
-				    "other): %s\n",
-				    (uint32_t)(dB * 8 / 5000000), df, di,
+				    "other): %s\n", (uint32_t)ms5,
+				    (uint32_t)(dB * 8 / (ms5 * 1000)), df, di,
 				    di ? df / di : 0, di ? (df * 10 / di) % 10 : 0,
 				    db, db ? dbt / db : 0,
 				    db ? (dbt * 10 / db) % 10 : 0,
@@ -12090,6 +12110,7 @@ mt7927_hal_poll(struct mwx_softc *sc)
 			sc->sc_7927_rx5_batched = sc->sc_7927_rx_batched;
 			sc->sc_7927_rx5_intr = in_;
 			sc->sc_7927_rx5_amsdu = sc->sc_7927_rx_amsdu_sub;
+			sc->sc_7927_rx5_ns = now5;
 		}
 		{
 			uint32_t ev, ms, mx, re, fa, dev_, dms, dre;
