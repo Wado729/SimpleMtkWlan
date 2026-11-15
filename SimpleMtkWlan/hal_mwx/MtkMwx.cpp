@@ -626,7 +626,7 @@ struct mwx_softc {
 	uint32_t		sc_7927_tx_hwenc;
 	uint32_t		sc_7927_tx_swenc;
 	/* phase 4c.3: hardware A-MSDU, TX status samples */
-	bool			sc_7927_amsdu_ok;	/* on: -mtk7927amsdu */
+	bool			sc_7927_amsdu_ok;	/* off: -mtk7927noamsdu */
 	/* phase 4d: 802.11ax */
 	bool			sc_7927_he;		/* off: -mtk7927nohe */
 	uint32_t		sc_7927_tx_amsdu;
@@ -691,6 +691,7 @@ struct mwx_softc {
 	volatile uint32_t	sc_7927_probe_acks;	/* null probes acked */
 	volatile uint32_t	sc_7927_txs_join_ack, sc_7927_txs_join_nack;
 	volatile uint32_t	sc_7927_txs_leave_ack, sc_7927_txs_leave_nack;
+	volatile uint8_t	sc_7927_txs_join_st, sc_7927_txs_leave_st;	/* subtype sent */
 	uint32_t		sc_7927_rx_hwdec;	/* decrypted by the chip */
 	uint32_t		sc_7927_rx_hwdec_nopn;
 	struct mt7927_bss	sc_7927_bss;
@@ -2965,6 +2966,9 @@ common:
 		    !PE_parse_boot_argn("-mtk7927noamsdu", &sw, sizeof(sw));
 		if (sc->sc_7927_amsdu_ok)
 			ic->ic_caps |= IEEE80211_C_TX_AMSDU_IN_AMPDU;
+		MWX_DEV_LOG(sc, "MT7927 hardware A-MSDU (TX): %s\n",
+		    sc->sc_7927_amsdu_ok ? "on" : !sc->sc_7927_hwcrypto ?
+		    "off (software crypto)" : "off (-mtk7927noamsdu)");
 		ic->ic_ampdu_rx_start = mt7927_ampdu_rx_start;
 		ic->ic_ampdu_rx_stop = mt7927_ampdu_rx_stop;
 		ic->ic_ampdu_tx_start = mt7927_ampdu_tx_start;
@@ -11166,6 +11170,8 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 				if (!ti.multicast) {
 					ti.txs = true;
 					ti.txs_pid = MT7927_TXS_PID_JOIN;
+					sc->sc_7927_txs_join_st = wh->i_fc[0] &
+					    IEEE80211_FC0_SUBTYPE_MASK;
 				}
 				break;
 			case IEEE80211_FC0_SUBTYPE_DEAUTH:
@@ -11173,6 +11179,8 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 				if (!ti.multicast) {
 					ti.txs = true;
 					ti.txs_pid = MT7927_TXS_PID_LEAVE;
+					sc->sc_7927_txs_leave_st = wh->i_fc[0] &
+					    IEEE80211_FC0_SUBTYPE_MASK;
 				}
 				break;
 			}
@@ -12152,14 +12160,18 @@ mt7927_hal_txs(void *arg, uint8_t pid, bool acked)
 	case MT7927_TXS_PID_JOIN:
 		OSIncrementAtomic((volatile SInt32 *)(acked ?
 		    &sc->sc_7927_txs_join_ack : &sc->sc_7927_txs_join_nack));
-		MWX_DEV_LOG(sc, "MT7927 TX status: authentication/association "
-		    "frame %s\n", acked ? "acked" : "not acked");
+		MWX_DEV_LOG(sc, "MT7927 TX status: %s (last sent) %s\n",
+		    sc->sc_7927_txs_join_st == IEEE80211_FC0_SUBTYPE_AUTH ?
+		    "authentication" : sc->sc_7927_txs_join_st ==
+		    IEEE80211_FC0_SUBTYPE_REASSOC_REQ ? "reassociation request" :
+		    "association request", acked ? "acked" : "not acked");
 		break;
 	case MT7927_TXS_PID_LEAVE:
 		OSIncrementAtomic((volatile SInt32 *)(acked ?
 		    &sc->sc_7927_txs_leave_ack : &sc->sc_7927_txs_leave_nack));
-		MWX_DEV_LOG(sc, "MT7927 TX status: deauth %s\n",
-		    acked ? "acked" : "not acked");
+		MWX_DEV_LOG(sc, "MT7927 TX status: %s %s\n",
+		    sc->sc_7927_txs_leave_st == IEEE80211_FC0_SUBTYPE_DISASSOC ?
+		    "disassoc" : "deauth", acked ? "acked" : "not acked");
 		break;
 	}
 }
@@ -12173,33 +12185,39 @@ static int
 mt7927_send_null_probe(struct mwx_softc *sc)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
-	struct ieee80211_frame wh;
+	struct ieee80211_qosframe wh;
 	struct mt7927_txinfo ti;
+	bool qos;
 	int rv;
 
 	if (!sc->sc_7927_joined || ic->ic_bss == NULL ||
 	    sc->sc_7927_txlock == NULL)
 		return ENXIO;
+	/* review S1: a QoS-Null at priority 7 to a QoS AP, as mac80211 */
+	qos = (ic->ic_bss->ni_flags & IEEE80211_NODE_QOS) != 0;
 	memset(&wh, 0, sizeof(wh));
 	wh.i_fc[0] = IEEE80211_FC0_VERSION_0 | IEEE80211_FC0_TYPE_DATA |
-	    IEEE80211_FC0_SUBTYPE_NODATA;
-	wh.i_fc[1] = IEEE80211_FC1_DIR_TODS;
+	    (qos ? (IEEE80211_FC0_SUBTYPE_QOS | IEEE80211_FC0_SUBTYPE_NODATA) :
+	    IEEE80211_FC0_SUBTYPE_NODATA);
+	wh.i_fc[1] = IEEE80211_FC1_DIR_TODS;		/* PM 0: no power save */
 	IEEE80211_ADDR_COPY(wh.i_addr1, ic->ic_bss->ni_bssid);
 	IEEE80211_ADDR_COPY(wh.i_addr2, ic->ic_myaddr);
 	IEEE80211_ADDR_COPY(wh.i_addr3, ic->ic_bss->ni_bssid);
+	if (qos)
+		wh.i_qos[0] = 7;				/* TID 7, normal ACK */
 	memset(&ti, 0, sizeof(ti));
 	ti.wcid = MT7927_PEER_WCID;
 	ti.omac_idx = sc->sc_vif.omac_idx;
 	ti.band_idx = sc->sc_vif.band_idx;
-	ti.q_idx = 1;					/* BE */
-	ti.hdrlen = sizeof(wh);
+	ti.q_idx = qos ? 3 : 1;				/* VO : BE */
+	ti.tid = qos ? 7 : 0;
+	ti.hdrlen = qos ? sizeof(wh) : sizeof(struct ieee80211_frame);
 	ti.fixed_rate = true;
 	ti.rate_idx = MT7927_BASIC_RATES_IDX(sc->sc_7927_bss.band);
 	ti.txs = true;
 	ti.txs_pid = MT7927_TXS_PID_PROBE;
 	IOLockLock(sc->sc_7927_txlock);
-	rv = mt7927_tx_frame(sc->sc_7927, &ti, (const uint8_t *)&wh,
-	    sizeof(wh));
+	rv = mt7927_tx_frame(sc->sc_7927, &ti, (const uint8_t *)&wh, ti.hdrlen);
 	IOLockUnlock(sc->sc_7927_txlock);
 	return rv;
 }
@@ -12229,7 +12247,13 @@ mt7927_probe_ap(struct mwx_softc *sc)
 	MWX_DEV_LOG(sc, "MT7927 link watchdog: probe %u to %s\n",
 	    sc->sc_7927_wd_probes, ether_sprintf(ic->ic_bss->ni_macaddr));
 	/* phase 4k: a null frame whose ACK we see, and a probe request */
-	(void)mt7927_send_null_probe(sc);
+	{
+		int nrv = mt7927_send_null_probe(sc);
+
+		if (nrv != 0)	/* review nit: not sent is not "not acked" */
+			MWX_DEV_LOG(sc, "MT7927 link watchdog: null probe not "
+			    "sent (%d)\n", nrv);
+	}
 	IEEE80211_SEND_MGMT(ic, ic->ic_bss, IEEE80211_FC0_SUBTYPE_PROBE_REQ, 0);
 	if (ic->ic_state == IEEE80211_S_RUN)
 		ic->ic_mgt_timer = 0;
