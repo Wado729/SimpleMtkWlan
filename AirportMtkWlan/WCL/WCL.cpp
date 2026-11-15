@@ -579,6 +579,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *r
 
 IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
 {
+    wclJoinStartMs = airport_up_time();     // phase 4m: join time in the log
     /*
      * WPA3 (SAE) asked for, with the password itself. Phase 4f.2: offer
      * net80211 both SAE (password + H2E PT) and WPA2-PSK (from the same
@@ -770,7 +771,6 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
     disassocIsVoluntary = false;
     joinTimer->setTimeoutMS(30000);
-    wclJoinStartMs = airport_up_time();
     if (ic->ic_state == IEEE80211_S_SCAN && ic->ic_wcl_scan_idle) {
         // The stack waits for us between scans (ieee80211_end_scan).
         ic->ic_wcl_scan_idle = false;
@@ -783,7 +783,10 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
          */
         ieee80211_node *fn = ieee80211_find_node(ic, joinBSSID);
         uint64_t now = airport_up_time();
-        if (fn != NULL && fn->ni_age_ts != 0 && now - fn->ni_age_ts < 8000) {
+        // review S2: a node with a recorded failure is skipped by
+        // node_choose_bss; those take the scan path, as before
+        if (fn != NULL && fn->ni_age_ts != 0 && now - fn->ni_age_ts < 8000 &&
+            fn->ni_fails == 0) {
             XYLog("WCL join: %s heard %llu ms ago, joining without a new scan\n",
                   ether_sprintf(joinBSSID), now - fn->ni_age_ts);
             ieee80211_end_scan(&ic->ic_if);
