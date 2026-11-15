@@ -693,13 +693,15 @@ struct mwx_softc {
 	volatile uint32_t	sc_7927_txs_leave_ack, sc_7927_txs_leave_nack;
 	volatile uint8_t	sc_7927_txs_join_st, sc_7927_txs_leave_st;	/* subtype sent */
 	/* phase 4l: firmware beacon filter, channel switch */
-	bool			sc_7927_bcnft_off;	/* -mtk7927nobcnft */
+	bool			sc_7927_bcnft_off;	/* on only with -mtk7927bcnft */
 	bool			sc_7927_bcnft_on;	/* set for this association */
 	CTimeout		*sc_7927_csa_to;
 	struct task		sc_7927_csa_task;
 	volatile bool		sc_7927_csa_pending;
 	volatile bool		sc_7927_csa_verify;	/* ask the AP after a switch */
-	volatile bool		sc_7927_csa_leave;	/* switch to another band */
+	volatile bool		sc_7927_csa_leave;	/* switch done by rejoining */
+	bool			sc_7927_csa_verifying;	/* probes are the switch's check */
+	const char		*sc_7927_csa_why;	/* why the switch is a rejoin */
 	uint8_t			sc_7927_csa_chan, sc_7927_csa_band, sc_7927_csa_mode;
 	int8_t			sc_7927_csa_cbw;
 	uint8_t			sc_7927_csa_center;
@@ -1321,6 +1323,8 @@ mwx_stop(struct ifnet *ifp)
 		task_del(sc->sc_nswq, &sc->sc_bgscan_done_task);
 		task_del(sc->sc_nswq, &sc->sc_setkey_task);
 		task_del(sc->sc_nswq, &sc->sc_reset_task);
+		if (sc->sc_hwtype == MWX_HW_MT7927)
+			task_del(sc->sc_nswq, &sc->sc_7927_csa_task);	/* 4l */
 	}
 	task_del(systq, &sc->sc_scan_task);
 	timeout_del(&sc->sc_reset_to);
@@ -2993,7 +2997,12 @@ common:
 		/* phase 4l: channel switch (CSA) and the firmware beacon filter */
 		task_set(&sc->sc_7927_csa_task, mt7927_csa_task, sc, "mt7927_csa");
 		ic->ic_csa_start = mt7927_csa_start;
-		sc->sc_7927_bcnft_off = PE_parse_boot_argn("-mtk7927nobcnft", &sw,
+		/*
+		 * Review M2: opt-in (-mtk7927bcnft) until a hardware run shows
+		 * our AP's beacons still reach the host (WCL keeps the latest
+		 * one for macOS) and associated scans still list networks.
+		 */
+		sc->sc_7927_bcnft_off = !PE_parse_boot_argn("-mtk7927bcnft", &sw,
 		    sizeof(sw));
 	}
 
@@ -10289,6 +10298,7 @@ mt7927_hal_scan_send(struct mwx_softc *sc, const struct mt7927_scan_chan *ch,
 
 #define	MT7927_PEER_WCID	1	/* first station WTBL entry (mt76_wcid_alloc) */
 #define	MT7927_ROC_JOIN_MS	3000
+#define	MT7927_CSA_ROC_MS	4000	/* mt7925_csa_work() */
 
 static uint16_t	mt7927_vht_mcs_and(uint16_t, uint16_t);
 static uint8_t	mt7927_vht_mcs_nss(uint16_t);
@@ -10542,6 +10552,7 @@ mt7927_join_teardown(struct mwx_softc *sc, const char *why)
 	sc->sc_7927_csa_pending = false;
 	sc->sc_7927_csa_verify = false;
 	sc->sc_7927_csa_leave = false;
+	sc->sc_7927_csa_verifying = false;
 	if (sc->sc_7927_bcnft_on) {
 		sc->sc_7927_bcnft_on = false;
 		mt7927_bss_pm_disable(sc->sc_7927, &v);
@@ -10584,6 +10595,9 @@ mt7927_join_prepare(struct mwx_softc *sc)
 		mt7927_join_teardown(sc, "new AP");
 	if (sc->sc_7927_joined) {
 		/* AUTH again on the same AP: keep the records, new ROC. */
+		sc->sc_7927_csa_pending = false;	/* phase 4l (review nit) */
+		sc->sc_7927_csa_verify = false;
+		sc->sc_7927_csa_leave = false;
 		if (sc->sc_7927_hwkeys != 0)
 			mt7927_tx_drain(sc, "rejoining");	/* review S3 */
 		mt7927_vif_fill(sc, &v);
@@ -12428,10 +12442,32 @@ mt7927_csa_task(void *arg)
 		MWX_DEV_LOG(sc, "MT7927 channel switch: not associated any more\n");
 		return;
 	}
-	if (sc->sc_7927_csa_band != sc->sc_7927_bss.band) {
-		MWX_DEV_LOG(sc, "MT7927 channel switch to another band: leaving "
-		    "so macOS joins again\n");
-		sc->sc_7927_csa_leave = true;	/* the watchdog, on the gate */
+	/* review S3: a re-announcement while switching: already there */
+	if (sc->sc_7927_csa_chan == sc->sc_7927_bss.chan &&
+	    sc->sc_7927_csa_band == sc->sc_7927_bss.band)
+		return;
+	sc->sc_7927_csa_switches++;
+	/*
+	 * What is not done in place is done by rejoining on the new channel
+	 * (the watchdog leaves on the gate; macOS joins again): another
+	 * band; a width we do not know (review S1: never guess wide);
+	 * a channel not in our table (review S6).
+	 */
+	idx = sc->sc_7927_csa_band == 3 ?
+	    IEEE80211_6GHZ_CHANIDX(sc->sc_7927_csa_chan) : sc->sc_7927_csa_chan;
+	if (sc->sc_7927_csa_band != sc->sc_7927_bss.band)
+		sc->sc_7927_csa_why = "the AP moved to another band";
+	else if (sc->sc_7927_csa_cbw < 0 && sc->sc_7927_bss.bw != 0)
+		sc->sc_7927_csa_why = "the AP's new channel width is not known";
+	else if (idx >= IEEE80211_CHAN_MAX || ic->ic_channels[idx].ic_flags == 0)
+		sc->sc_7927_csa_why = "the AP's new channel is not in our table";
+	else
+		sc->sc_7927_csa_why = NULL;
+	if (sc->sc_7927_csa_why != NULL) {
+		MWX_DEV_LOG(sc, "MT7927 channel switch #%u to ch %u: %s, leaving so "
+		    "macOS joins again there\n", sc->sc_7927_csa_switches,
+		    sc->sc_7927_csa_chan, sc->sc_7927_csa_why);
+		sc->sc_7927_csa_leave = true;
 		return;
 	}
 	nb = sc->sc_7927_bss;
@@ -12445,22 +12481,33 @@ mt7927_csa_task(void *arg)
 		nb.center_chan = nb.chan;
 	}
 	mt7927_vif_fill(sc, &v);
-	roc = mt7927_roc(sc->sc_7927, &v, nb.chan, nb.band, MT7927_ROC_JOIN_MS);
-	rv = mt7927_bss_rlm(sc->sc_7927, &v, &nb);
-	if (roc == 0)
-		mt7927_roc_abort(sc->sc_7927, &v);
-	sc->sc_7927_csa_switches++;
-	if (rv == 0) {
-		sc->sc_7927_bss.chan = nb.chan;
-		sc->sc_7927_bss.bw = nb.bw;
-		sc->sc_7927_bss.center_chan = nb.center_chan;
-		idx = nb.band == 3 ? IEEE80211_6GHZ_CHANIDX(nb.chan) : nb.chan;
-		if (idx < IEEE80211_CHAN_MAX && ic->ic_channels[idx].ic_flags != 0)
-			ic->ic_bss->ni_chan = &ic->ic_channels[idx];
+	roc = mt7927_roc(sc->sc_7927, &v, nb.chan, nb.band, MT7927_CSA_ROC_MS);
+	if (roc != 0) {
+		/* review S5: as mt7925_csa_work(): no ROC, no switch */
+		MWX_DEV_LOG(sc, "MT7927 channel switch #%u to ch %u: no ROC (%d), "
+		    "leaving so macOS joins again there\n",
+		    sc->sc_7927_csa_switches, nb.chan, roc);
+		sc->sc_7927_csa_why = "no ROC on the new channel";
+		sc->sc_7927_csa_leave = true;
+		return;
 	}
-	MWX_DEV_LOG(sc, "MT7927 channel switch #%u: ch %u center %u bw %u, ROC %d, "
-	    "BSS channel %d; asking the AP there\n", sc->sc_7927_csa_switches,
-	    nb.chan, nb.center_chan, nb.bw, roc, rv);
+	rv = mt7927_bss_rlm(sc->sc_7927, &v, &nb);
+	mt7927_roc_abort(sc->sc_7927, &v);
+	if (rv != 0) {
+		MWX_DEV_LOG(sc, "MT7927 channel switch #%u to ch %u: BSS channel "
+		    "update failed (%d), leaving\n", sc->sc_7927_csa_switches,
+		    nb.chan, rv);
+		sc->sc_7927_csa_why = "the firmware refused the new channel";
+		sc->sc_7927_csa_leave = true;
+		return;
+	}
+	sc->sc_7927_bss.chan = nb.chan;
+	sc->sc_7927_bss.bw = nb.bw;
+	sc->sc_7927_bss.center_chan = nb.center_chan;
+	ic->ic_bss->ni_chan = &ic->ic_channels[idx];
+	MWX_DEV_LOG(sc, "MT7927 channel switch #%u: now ch %u center %u bw %u; "
+	    "asking the AP there\n", sc->sc_7927_csa_switches, nb.chan,
+	    nb.center_chan, nb.bw);
 	sc->sc_7927_csa_verify = true;		/* the watchdog's next tick */
 }
 
@@ -12603,6 +12650,7 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 	    ic->ic_bss == NULL || !ic->ic_bss->ni_port_valid) {
 		sc->sc_7927_run_polls = 0;
 		sc->sc_7927_wd_probes = 0;
+		sc->sc_7927_csa_verifying = false;
 		return;
 	}
 	sc->sc_7927_run_polls++;
@@ -12614,11 +12662,13 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 	if (sc->sc_7927_csa_leave) {
 		sc->sc_7927_csa_leave = false;
 		sc->sc_7927_last_recovery = 0;	/* not throttled */
-		mt7927_link_leave(sc, "the AP moved to another band", 0, 0, 0);
+		mt7927_link_leave(sc, sc->sc_7927_csa_why != NULL ?
+		    sc->sc_7927_csa_why : "channel switch", 0, 0, 0);
 		return;
 	}
 	if (sc->sc_7927_csa_verify && sc->sc_7927_wd_probes == 0) {
 		sc->sc_7927_csa_verify = false;
+		sc->sc_7927_csa_verifying = true;
 		sc->sc_7927_wd_probes = 1;
 		sc->sc_7927_wd_rx_mark = mt7927_rx_from_bss(sc);
 		mt7927_probe_ap(sc);
@@ -12634,12 +12684,22 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 			MWX_DEV_LOG(sc, "MT7927 link watchdog: the AP answered "
 			    "probe %u, staying\n", sc->sc_7927_wd_probes);
 			sc->sc_7927_wd_probes = 0;
+			sc->sc_7927_csa_verifying = false;
 		} else if (sc->sc_7927_wd_probes < 3) {
 			sc->sc_7927_wd_probes++;
 			mt7927_probe_ap(sc);
 			return;
 		} else {
 			sc->sc_7927_wd_probes = 0;
+			if (sc->sc_7927_csa_verifying) {
+				/* review S4: not throttled, and named */
+				sc->sc_7927_csa_verifying = false;
+				sc->sc_7927_last_recovery = 0;
+				mt7927_link_leave(sc, "no answer from the AP on its "
+				    "new channel after the switch", 0,
+				    sc->sc_7927_bcn_loss_seen, 0);
+				return;
+			}
 			mt7927_link_leave(sc, "no frame from the AP for 30 s and "
 			    "no answer to 3 probes", 0, sc->sc_7927_bcn_loss_seen,
 			    0);
@@ -16163,6 +16223,8 @@ MtkMwx::detach(IOPCIDevice *device)
     timeout_del(&com->sc_reset_to);
     if (com->sc_hwtype == MWX_HW_MT7927 && com->sc_7927_reorder_to != NULL)
         timeout_del(&com->sc_7927_reorder_to);
+    if (com->sc_hwtype == MWX_HW_MT7927 && com->sc_7927_csa_to != NULL)
+        timeout_del(&com->sc_7927_csa_to);	/* phase 4l */
     /* Keep interrupts alive while in-flight MCU requests finish. */
     taskq_quiesce(com->sc_nswq);
     if (taskQueueOwned) taskq_quiesce(systq);
@@ -16170,6 +16232,8 @@ MtkMwx::detach(IOPCIDevice *device)
     timeout_free(&com->sc_reset_to);
     if (com->sc_hwtype == MWX_HW_MT7927 && com->sc_7927_reorder_to != NULL)
         timeout_free(&com->sc_7927_reorder_to);
+    if (com->sc_hwtype == MWX_HW_MT7927 && com->sc_7927_csa_to != NULL)
+        timeout_free(&com->sc_7927_csa_to);
     /* No interrupt callback may access buffers during their destruction. */
     if (com->sc_ih) {
         pci_intr_disestablish(pci->pa_pc, com->sc_ih);

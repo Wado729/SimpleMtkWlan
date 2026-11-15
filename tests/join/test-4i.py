@@ -58,7 +58,7 @@ struct mt7927_bringup {};
 struct mt7927_bss { uint8_t bssid[6]; };
 struct mwx_softc { ieee80211com sc_ic; bool sc_7927_assoc; uint32_t sc_7927_run_polls, sc_7927_bcn_loss_seen, sc_7927_mib_seen,
   sc_7927_recoveries, sc_7927_last_recovery, sc_7927_poll, sc_7927_rx_bcn, sc_7927_rx_mcast, sc_7927_rx_ucast, sc_7927_rx_bss_mgt,
-  sc_7927_wd_probes, sc_7927_wd_rx_mark, sc_7927_wd_window_mark, sc_7927_probe_acks; int sc_flags; bool sc_7927_csa_leave, sc_7927_csa_verify, sc_7927_bcnft_on; mt7927_bringup *sc_7927; struct { int band_idx; } sc_vif; mt7927_bss sc_7927_bss; };
+  sc_7927_wd_probes, sc_7927_wd_rx_mark, sc_7927_wd_window_mark, sc_7927_probe_acks; int sc_flags; bool sc_7927_csa_leave, sc_7927_csa_verify, sc_7927_bcnft_on, sc_7927_csa_verifying; const char *sc_7927_csa_why; mt7927_bringup *sc_7927; struct { int band_idx; } sc_vif; mt7927_bss sc_7927_bss; };
 static uint32_t E_loss, E_rxt, E_windows;
 static void mt7927_engine_link(mt7927_bringup *, int, uint32_t *loss, uint32_t *dumps, uint32_t *rxt, uint32_t *txt, uint32_t *w) {
   *loss = E_loss; *dumps = 0; *rxt = E_rxt; *txt = 0; *w = E_windows; }

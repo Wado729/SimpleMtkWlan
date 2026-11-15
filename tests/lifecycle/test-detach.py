@@ -20,7 +20,7 @@ struct ifnet { int if_flags=0; };
 struct IC { ifnet ic_if; };
 enum mwx_hw_type{MWX_HW_MT7921,MWX_HW_MT7922,MWX_HW_MT7927};
 struct IOLock;
-struct Soft { IC sc_ic; bool sc_detaching=false,sc_net_attached=false; void *sc_reset_to=nullptr,*sc_7927_reorder_to=nullptr,*sc_nswq=nullptr,*sc_ih=nullptr; int sc_memh=0,sc_st=0,sc_mems=0;
+struct Soft { IC sc_ic; bool sc_detaching=false,sc_net_attached=false; void *sc_reset_to=nullptr,*sc_7927_reorder_to=nullptr,*sc_7927_csa_to=nullptr,*sc_nswq=nullptr,*sc_ih=nullptr; int sc_memh=0,sc_st=0,sc_mems=0;
   mwx_hw_type sc_hwtype=MWX_HW_MT7921; void *sc_7927=nullptr; IOLock *sc_7927_lock=nullptr;
   uint8_t *sc_7927_fw_patch=nullptr,*sc_7927_fw_ram=nullptr; size_t sc_7927_fw_plen=0,sc_7927_fw_rlen=0; };
 struct PCI { int pa_pc=0; };

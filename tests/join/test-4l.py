@@ -10,9 +10,13 @@ Extracts mt7927_csa_center() and mt7927_csa_start() from MtkMwx.cpp:
 import pathlib, subprocess, sys, tempfile
 root = pathlib.Path(__file__).resolve().parents[2]
 s = (root / "SimpleMtkWlan/hal_mwx/MtkMwx.cpp").read_text()
-def fn(sig, rtype):
-    i = s.index(rtype + "\n" + sig + "(")
-    return s[i:s.index("\n}\n", i) + 3]
+n = (root / "mtk80211/openbsd/net80211/ieee80211_input.c").read_text()
+def fn(sig, rtype, src=None):
+    src = s if src is None else src
+    i = src.index(rtype + "\n" + sig + "(")
+    return src[i:src.index("\n}\n", i) + 3]
+# review M1: the beacon path matches our AP by BSSID (ni is the scan node)
+assert "IEEE80211_ADDR_EQ(wh->i_addr3, ic->ic_bss->ni_bssid)" in n
 code = r'''
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +29,16 @@ struct mwx_softc { ieee80211com sc_ic; bool sc_7927_assoc; CTimeout *sc_7927_csa
 static int armed = -1, logs;
 static int timeout_add_msec(CTimeout **, int ms) { armed = ms; return 1; }
 #define MWX_DEV_LOG(sc, ...) (logs++, printf(__VA_ARGS__))
+/* net80211 side */
+enum { IEEE80211_M_STA = 1, IEEE80211_S_RUN = 4 };
+#define IEEE80211_ELEMID_WIDE_BW_CHANNEL_SWITCH 194
+#define IEEE80211_ELEMID_CHANNEL_SWITCH_WRAPPER 196
+struct n80211 { int ic_opmode, ic_state; void (*ic_csa_start)(n80211 *, uint8_t, uint8_t, uint8_t, uint8_t, int8_t, uint8_t); };
+#define ieee80211com n80211
+static int c_chan, c_band, c_count, c_mode, c_cbw, c_ccfs0, c_calls;
+static void hook(n80211 *, uint8_t ch, uint8_t b, uint8_t cnt, uint8_t m, int8_t w, uint8_t c0) { c_chan = ch; c_band = b; c_count = cnt; c_mode = m; c_cbw = w; c_ccfs0 = c0; c_calls++; }
+''' + fn('ieee80211_find_wbcs', 'static const uint8_t *', n) + fn('ieee80211_sta_csa', 'static void', n) + '''
+#undef ieee80211com
 ''' + fn("mt7927_csa_center", "static uint8_t") + fn("mt7927_csa_start", "static void") + r'''
 int main() {
   /* 6 GHz */
@@ -32,7 +46,6 @@ int main() {
   assert(mt7927_csa_center(3, 37, 2) == 39 && mt7927_csa_center(3, 1, 1) == 3 && mt7927_csa_center(3, 5, 1) == 3);
   assert(mt7927_csa_center(3, 69, 0) == 69 && mt7927_csa_center(3, 70, 2) == 0);
   assert(mt7927_csa_center(3, 229, 3) == 0);            /* 225-253 is no 160 MHz block */
-  assert(mt7927_csa_center(3, 221, 2) == 215 || mt7927_csa_center(3, 221, 2) == 0 || true);
   assert(mt7927_csa_center(3, 213, 2) == 215);
   /* 5 GHz */
   assert(mt7927_csa_center(2, 36, 1) == 38 && mt7927_csa_center(2, 40, 1) == 38 && mt7927_csa_center(2, 44, 1) == 46);
@@ -52,6 +65,20 @@ int main() {
   mt7927_csa_start(&sc.sc_ic, 165, 0, 9, 1, -1, 0); assert(armed == 921 && logs == 1);   /* re-timed, no new log */
   armed = -1; mt7927_csa_start(&sc.sc_ic, 165, 0, 0, 1, -1, 0); assert(armed == -1);     /* already timed */
   mt7927_csa_start(&sc.sc_ic, 37, 2, 0, 0, 2, 42); assert(armed == 1 && sc.sc_7927_csa_band == 2 && sc.sc_7927_csa_center == 42 && logs == 2);
+  /* net80211 parse: band and width from the operating class and WBCS */
+  n80211 ic{IEEE80211_M_STA, IEEE80211_S_RUN, hook};
+  ieee80211_sta_csa(&ic, 1, 134, 165, 10, nullptr); assert(c_calls == 1 && c_band == 3 && c_cbw == 3 && c_chan == 165);
+  ieee80211_sta_csa(&ic, 0, 133, 37, 5, nullptr); assert(c_band == 3 && c_cbw == 2);
+  ieee80211_sta_csa(&ic, 0, 0, 44, 5, nullptr); assert(c_band == 0 && c_cbw == -1);          /* CSA: width unknown */
+  ieee80211_sta_csa(&ic, 0, 128, 36, 5, nullptr); assert(c_band == 2 && c_cbw == 2);
+  ieee80211_sta_csa(&ic, 0, 116, 36, 5, nullptr); assert(c_band == 2 && c_cbw == 1);
+  ieee80211_sta_csa(&ic, 0, 115, 36, 5, nullptr); assert(c_band == 2 && c_cbw == 0);
+  { const uint8_t w[] = {194, 3, 1, 42, 50}; ieee80211_sta_csa(&ic, 0, 0, 36, 5, w); assert(c_cbw == 3 && c_ccfs0 == 50); }
+  { const uint8_t w[] = {194, 3, 1, 42, 0}; ieee80211_sta_csa(&ic, 0, 0, 36, 5, w); assert(c_cbw == 2 && c_ccfs0 == 42); }
+  { const uint8_t w[] = {194, 3, 0, 0, 0}; ieee80211_sta_csa(&ic, 0, 134, 165, 5, w); assert(c_cbw == 1 && c_ccfs0 == 0); } /* 20/40 never wider */
+  { const uint8_t w[] = {194, 3, 0, 0, 0}; ieee80211_sta_csa(&ic, 0, 0, 36, 5, w); assert(c_cbw == 0); }
+  { const uint8_t e[] = {37, 3, 1, 9, 5, 196, 5, 194, 3, 2, 50, 0}; const uint8_t *w = ieee80211_find_wbcs(e, e + sizeof e); assert(w == e + 7); }
+  ic.ic_state = 3; int k = c_calls; ieee80211_sta_csa(&ic, 0, 0, 36, 5, nullptr); assert(c_calls == k);   /* not in RUN */
   printf("PASS\n"); return 0;
 }
 '''

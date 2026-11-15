@@ -1730,12 +1730,27 @@ ieee80211_sta_csa(struct ieee80211com *ic, uint8_t mode, uint8_t opclass,
 	if (ic->ic_csa_start == NULL || ic->ic_opmode != IEEE80211_M_STA ||
 	    ic->ic_state != IEEE80211_S_RUN || chan == 0)
 		return;
+	/*
+	 * Global operating classes (IEEE 802.11 Annex E-4): band and, for
+	 * the 5/6 GHz wide classes, the width (review S1).
+	 */
 	if (opclass >= 81 && opclass <= 84)
 		band = 1;
-	else if (opclass >= 115 && opclass <= 130)
+	else if (opclass >= 115 && opclass <= 130) {
 		band = 2;
-	else if (opclass >= 131 && opclass <= 137)
+		if (opclass == 128 || opclass == 130)
+			cbw = 2;
+		else if (opclass == 129)
+			cbw = 3;
+		else if (opclass <= 127)
+			cbw = (opclass == 116 || opclass == 117 || opclass == 119 ||
+			    opclass == 120 || opclass == 122 || opclass == 123 ||
+			    opclass == 126 || opclass == 127) ? 1 : 0;
+	} else if (opclass >= 131 && opclass <= 137) {
 		band = 3;
+		cbw = opclass == 131 || opclass == 136 ? 0 : opclass == 132 ? 1 :
+		    opclass == 133 || opclass == 135 ? 2 : 3;	/* 137 (320): 160 */
+	}
 	if (wbcs != NULL && wbcs[1] >= 3) {
 		/* new width: 0 20/40, 1 80 (160 when ccfs1 is 8 away), 2 160 */
 		uint8_t w = wbcs[2], c0 = wbcs[3], c1 = wbcs[4];
@@ -1748,8 +1763,12 @@ ieee80211_sta_csa(struct ieee80211com *ic, uint8_t mode, uint8_t opclass,
 			cbw = 2;
 		else if (w == 2)
 			cbw = 3;
-		else
+		else {
+			cbw = cbw > 1 ? 1 : cbw;	/* 20/40: never wider */
+			if (cbw < 0)
+				cbw = 0;
 			ccfs0 = 0;
+		}
 	}
 	(*ic->ic_csa_start)(ic, chan, band, count, mode, cbw, ccfs0);
 }
@@ -1783,7 +1802,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     const u_int8_t *tstamp, *ssid, *rates, *xrates, *edcaie, *wmmie;
     const u_int8_t *rsnie, *wpaie, *htcaps, *htop;
     const u_int8_t *rsnxe = NULL;    /* RSN Extension (SAE H2E) */
-    const uint8_t *csa, *xcsa = NULL, *ies;
+    const uint8_t *csa, *xcsa = NULL, *csa_ies;
     const uint8_t *vhtcap;
     const uint8_t *vhtopmode;
     const uint8_t *hecap;
@@ -1827,7 +1846,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     tstamp  = frm; frm += 8;
     bintval = LE_READ_2(frm); frm += 2;
     capinfo = LE_READ_2(frm); frm += 2;
-    ies = frm;                                  /* phase 4l */
+    csa_ies = frm;                              /* phase 4l */
     
     ssid = rates = xrates = edcaie = wmmie = rsnie = wpaie = csa = vhtcap = vhtopmode = hecap = heopmode = NULL;
     htcaps = htop = NULL;
@@ -2070,9 +2089,11 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         int updateprot = 0;
 
         /* phase 4l: our AP is about to change channel */
-        if (ni == ic->ic_bss && (csa != NULL ||
-            (xcsa != NULL && xcsa[1] >= 4))) {
-            const uint8_t *wbcs = ieee80211_find_wbcs(ies, efrm);
+        /* review M1: ni is the scan-table node, not ic_bss: match the BSSID */
+        if (ic->ic_bss != NULL &&
+            IEEE80211_ADDR_EQ(wh->i_addr3, ic->ic_bss->ni_bssid) &&
+            (csa != NULL || (xcsa != NULL && xcsa[1] >= 4))) {
+            const uint8_t *wbcs = ieee80211_find_wbcs(csa_ies, efrm);
 
             if (xcsa != NULL && xcsa[1] >= 4)
                 ieee80211_sta_csa(ic, xcsa[2], xcsa[3], xcsa[4], xcsa[5],
