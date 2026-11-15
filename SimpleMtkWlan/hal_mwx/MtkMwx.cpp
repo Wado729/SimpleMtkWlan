@@ -12128,7 +12128,8 @@ mt7927_hal_poll(struct mwx_softc *sc)
 				MWX_DEV_LOG(sc, "MT7927 rx last %u ms: %u Mbit/s, "
 				    "%u frames, %u interrupts of all kinds (%u.%u "
 				    "frames each), %u batches up (%u.%u each), %u "
-				    "A-MSDU subframes; chain RSSI %d/%d dBm; rx "
+				    "A-MSDU subframes; chain RSSI %d/%d dBm (%u/%u "
+				    "frames); rx "
 				    "rate (%u sampled, %u other): %s\n", (uint32_t)ms5,
 				    (uint32_t)(dB * 8 / (ms5 * 1000)), df, di,
 				    di ? df / di : 0, di ? (df * 10 / di) % 10 : 0,
@@ -12139,6 +12140,7 @@ mt7927_hal_poll(struct mwx_softc *sc)
 				    (int32_t)sc->sc_7927_rxc_n[0]) : 0,
 				    sc->sc_7927_rxc_n[1] ? (int)(sc->sc_7927_rxc_sum[1] /
 				    (int32_t)sc->sc_7927_rxc_n[1]) : 0,
+				    sc->sc_7927_rxc_n[0], sc->sc_7927_rxc_n[1],
 				    sc->sc_7927_rxr_n, sc->sc_7927_rxr_other,
 				    top[0] ? top : "none");
 			memset(sc->sc_7927_rxr_cnt, 0,
