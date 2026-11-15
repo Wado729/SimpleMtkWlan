@@ -4924,6 +4924,7 @@ struct mt7927_bringup {
 	volatile uint32_t	mcu_sw_seen;
 	/* phase 4j: NAPI-like polling while frames keep coming */
 	uint32_t		poll_count;	/* timer polls, not interrupts */
+	volatile bool		polling;	/* timer armed, interrupt left off */
 	bool			poll_off;	/* -mtk7927nopoll */
 
 	uint8_t			seq;
@@ -5859,7 +5860,7 @@ mt7927_tx(struct mt7927_bringup *b, struct mt7927_ring *r, const void *data,
 /* ---- Interrupt handler (mt792x_irq_handler + tasklet top half) ---- */
 
 static int
-mt7927_service(struct mt7927_bringup *b, bool poll)
+mt7927_irq_service(struct mt7927_bringup *b, bool poll)
 {
 	struct mwx_softc *sc = b->sc;
 	uint32_t sta, sw;
@@ -5889,7 +5890,7 @@ mt7927_service(struct mt7927_bringup *b, bool poll)
 static int
 mt7927_intr(void *arg)
 {
-	return mt7927_service((struct mt7927_bringup *)arg, false);
+	return mt7927_irq_service((struct mt7927_bringup *)arg, false);
 }
 
 
@@ -6122,7 +6123,8 @@ mt7927_service(struct mt7927_bringup *b)
 		mt7927_drain(b, &b->rx[MT7927_RX_MCU], false, false);
 		mt7927_svc_unlock(b);
 	}
-	if (b->dma_on)
+	/* phase 4j (review S1): in poll mode the timer turns it back on */
+	if (b->dma_on && !(b->running && b->polling))
 		mt7927_raw_wr(b->sc, MT_WFDMA0_HOST_INT_ENA, b->irq_mask);
 }
 
@@ -6230,8 +6232,12 @@ mt7927_isr_running(struct mt7927_bringup *b)
 		 * One interrupt per frame (~25k/s at 400 Mbit/s) delayed other
 		 * devices' interrupts: mouse lag and screen flicker.
 		 */
-		if (work == 0 || !mt7927_poll_arm(b))
+		if (work != 0 && mt7927_poll_arm(b)) {
+			b->polling = true;
+		} else {
+			b->polling = false;
 			mt7927_raw_wr(sc, MT_WFDMA0_HOST_INT_ENA, b->irq_mask);
+		}
 	}
 }
 
@@ -9078,7 +9084,9 @@ mt7927_poll_fired(OSObject *owner, IOTimerEventSource *)
 		return;
 	/* armed only while running; a late one must not touch INT_ENA */
 	if (b->running && b->dma_on)
-		(void)mt7927_service(b, true);
+		(void)mt7927_irq_service(b, true);
+	else
+		b->polling = false;
 }
 
 static int
@@ -9119,9 +9127,10 @@ mt7927_irq_setup(struct mt7927_bringup *b)
 	}
 	if (os->poll != NULL)
 		os->poll->enable();
-	MWX_DEV_LOG(sc, "MT7927 RX/TX polling under load: %s\n",
+	b->polling = false;
+	MWX_DEV_LOG(sc, "MT7927 RX/TX polling under load: %s, %u us\n",
 	    os->poll == NULL ? "no timer" : b->poll_off ? "off (boot-arg)" :
-	    "on, 250 us");
+	    "on", MT7927_POLL_US);
 	return 0;
 }
 
@@ -12393,14 +12402,14 @@ mt7927_hal_poll(struct mwx_softc *sc)
 			}
 			if (df > 0 && ms5 > 0)
 				MWX_DEV_LOG(sc, "MT7927 rx last %u ms: %u Mbit/s, "
-				    "%u frames, %u interrupts of all kinds (%u.%u "
-				    "frames each) + %u timer polls, %u batches up (%u.%u each), %u "
+				    "%u frames, %u interrupts of all kinds + %u timer "
+				    "polls (%u.%u frames each), %u batches up (%u.%u each), %u "
 				    "A-MSDU subframes; chain RSSI %d/%d dBm (%u/%u "
 				    "frames); rx "
 				    "rate (%u sampled, %u other): %s\n", (uint32_t)ms5,
 				    (uint32_t)(dB * 8 / (ms5 * 1000)), df, di,
-				    di ? df / di : 0, di ? (df * 10 / di) % 10 : 0,
-				    dp, db, db ? dbt / db : 0,
+				    dp, di + dp ? df / (di + dp) : 0,
+				    di + dp ? (df * 10 / (di + dp)) % 10 : 0, db, db ? dbt / db : 0,
 				    db ? (dbt * 10 / db) % 10 : 0,
 				    sc->sc_7927_rx_amsdu_sub - sc->sc_7927_rx5_amsdu,
 				    sc->sc_7927_rxc_n[0] ? (int)(sc->sc_7927_rxc_sum[0] /
