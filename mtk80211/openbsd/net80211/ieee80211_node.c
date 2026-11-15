@@ -1255,6 +1255,8 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs, i
     struct ieee80211_node *ni;
     uint32_t assoc_fail = 0;
     
+    /* phase 4i: a new join; any earlier leave is over */
+    ic->ic_leave_pending = 0;
     /* Reinitialize media mode and channels if needed. */
     mode = ieee80211_chan2mode(ic, selbs->ni_chan);
     if (mode != ic->ic_curmode)

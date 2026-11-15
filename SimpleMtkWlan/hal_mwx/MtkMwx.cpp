@@ -1279,6 +1279,7 @@ mwx_stop(struct ifnet *ifp)
 	 */
 	if (was_running && ic->ic_state == IEEE80211_S_RUN &&
 	    ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL &&
+	    !ic->ic_leave_pending &&
 	    ((ic->ic_flags & IEEE80211_F_RSNON) ||
 	    !(ic->ic_bss->ni_flags & IEEE80211_NODE_TXMGMTPROT))) {
 		/*
@@ -10431,8 +10432,12 @@ mt7927_newstate(struct mwx_softc *sc, enum ieee80211_state ostate,
 	switch (nstate) {
 	case IEEE80211_S_SCAN:
 		if (ostate == IEEE80211_S_SCAN &&
-		    (sc->sc_flags & MWX_FLAG_SCANNING))
+		    (sc->sc_flags & MWX_FLAG_SCANNING)) {
+			/* re-review S2: net80211 is not told; end a leave here */
+			ic->ic_leave_pending = 0;
+			ic->ic_xflags &= ~IEEE80211_F_TX_MGMT_ONLY;
 			return;
+		}
 		rv = mwx_scan(sc);
 		break;
 	case IEEE80211_S_AUTH:

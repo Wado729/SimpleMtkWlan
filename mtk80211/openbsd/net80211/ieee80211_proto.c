@@ -1881,7 +1881,13 @@ ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 	if (ic->ic_assoc_retry && ostate == IEEE80211_S_ASSOC &&
 	    nstate != IEEE80211_S_ASSOC)
 		timeout_del(&ic->ic_assoc_to);
-	ic->ic_leave_pending = 0;
+	/*
+	 * The leave's own transition ends it (re-review S1: an older task
+	 * ending first must not); so does joining a BSS (node_join_bss), in
+	 * case a join's AUTH replaced the leave's queued SCAN.
+	 */
+	if (nstate <= IEEE80211_S_SCAN)
+		ic->ic_leave_pending = 0;
 	ieee80211_set_link_state(ic, LINK_STATE_DOWN);
 	ic->ic_xflags &= ~IEEE80211_F_TX_MGMT_ONLY;
 	switch (nstate) {
