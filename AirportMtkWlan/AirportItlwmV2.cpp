@@ -1136,7 +1136,8 @@ getCARD_CAPABILITIES(OSObject *object,
         static int wpa3 = -1;
         if (wpa3 < 0) {
             int v = 0;
-            wpa3 = PE_parse_boot_argn("-mtkwpa3caps", &v, sizeof(v)) ? 1 : 0;
+            // phase 4j.2: on by default (WPA3 works); -mtknowpa3caps off
+            wpa3 = PE_parse_boot_argn("-mtknowpa3caps", &v, sizeof(v)) ? 0 : 1;
         }
         if (wpa3) {
             cd->capabilities[6] |= 0x01;

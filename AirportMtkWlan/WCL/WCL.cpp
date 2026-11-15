@@ -435,7 +435,8 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     static int showTransition = -1;
     if (showTransition < 0) {
         int v = 0;
-        showTransition = PE_parse_boot_argn("-mtkwcltransition", &v, sizeof(v)) ? 1 : 0;
+        // phase 4j.2: on by default; -mtknowcltransition turns it off
+        showTransition = PE_parse_boot_argn("-mtknowcltransition", &v, sizeof(v)) ? 0 : 1;
     }
     metadata->ieLength = showTransition ? uint32_t(length) :
         uint32_t(AirportWCL::selectWPA2TransitionMode(

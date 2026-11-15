@@ -9693,10 +9693,17 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 	timeout_set(&sc->sc_7927_reorder_to, mt7927_reorder_timeo, sc);
 	MWX_DEV_LOG(sc, "MT7927 RX header translation %s\n",
 	    sc->sc_7927_rx_decap ? "on" : "off (-mtk7927nodecap)");
-	mt7927_bringup_set_country(sc->sc_7927, NULL);	/* "00" */
+	/*
+	 * Phase 4j.2: US unless mtk7927cc=XX says otherwise (this build is
+	 * for a US desktop; was "00", the firmware's world default).
+	 */
 	if (PE_parse_boot_argn("mtk7927cc", cc, sizeof(cc) - 1)) {
 		MWX_DEV_LOG(sc, "MT7927 country %s (mtk7927cc)\n", cc);
 		mt7927_bringup_set_country(sc->sc_7927, cc);
+	} else {
+		MWX_DEV_LOG(sc, "MT7927 country US (default; mtk7927cc=XX "
+		    "changes it)\n");
+		mt7927_bringup_set_country(sc->sc_7927, "US");
 	}
 	/* One interface: bss 0, own MAC 0, band 0 (2.4 GHz), last WTBL entry. */
 	sc->sc_vif.idx = 0;
@@ -15745,11 +15752,13 @@ MtkMwx::mwx_match(IOPCIDevice *device)
 	if (vendor == PCI_VENDOR_MEDIATEK && product == 0x7927) {
 		int on = 0;
 
-		/* MT7927 work in progress: only on request. */
-		matched = PE_parse_boot_argn("-mtk7927probe", &on, sizeof(on));
-		MWX_LOG("MT7927 %s (-mtk7927probe %s)\n",
-		    matched ? "matched" : "not matched",
-		    matched ? "set" : "not set");
+		/*
+		 * Phase 4j.2: on by default (no boot-arg needed); -mtk7927off
+		 * leaves the card alone. -mtk7927probe is still accepted.
+		 */
+		matched = !PE_parse_boot_argn("-mtk7927off", &on, sizeof(on));
+		MWX_LOG("MT7927 %s%s\n", matched ? "matched" : "not matched",
+		    matched ? "" : " (-mtk7927off)");
 	}
 	MWX_LOG("probe vendor=0x%04x product=0x%04x matched=%d\n",
 	    vendor, product, matched);
