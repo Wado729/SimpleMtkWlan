@@ -16,6 +16,9 @@
 #include <net80211/ieee80211_priv.h>
 #include <crypto/sha1.h>
 
+/* phase 4m: when the current join request came in (ms of uptime), for the log */
+static uint64_t wclJoinStartMs;
+
 extern IOCommandGate *_fCommandGate;
 
 struct AirportItlwmSkywalkInterface::CountryUpdate {
@@ -767,10 +770,25 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
     disassocIsVoluntary = false;
     joinTimer->setTimeoutMS(30000);
+    wclJoinStartMs = airport_up_time();
     if (ic->ic_state == IEEE80211_S_SCAN && ic->ic_wcl_scan_idle) {
         // The stack waits for us between scans (ieee80211_end_scan).
         ic->ic_wcl_scan_idle = false;
-        ieee80211_next_scan(&ic->ic_if);
+        /*
+         * Phase 4m: macOS joins the BSSID it picked from the scan it just
+         * made; a real Mac then joins at once. If we heard that AP in the
+         * last few seconds, choose it from what we have (ieee80211_end_scan)
+         * instead of sweeping every channel first. Not found or not
+         * matching: end_scan scans again, as before.
+         */
+        ieee80211_node *fn = ieee80211_find_node(ic, joinBSSID);
+        uint64_t now = airport_up_time();
+        if (fn != NULL && fn->ni_age_ts != 0 && now - fn->ni_age_ts < 8000) {
+            XYLog("WCL join: %s heard %llu ms ago, joining without a new scan\n",
+                  ether_sprintf(joinBSSID), now - fn->ni_age_ts);
+            ieee80211_end_scan(&ic->ic_if);
+        } else
+            ieee80211_next_scan(&ic->ic_if);
     }
     if (ic->ic_state != IEEE80211_S_SCAN && ic->ic_newstate(ic, IEEE80211_S_SCAN, -1)) {
         joinPending = false;
@@ -805,6 +823,9 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
 {
     if (!joinPending)
         return;
+    XYLog("WCL join %s after %llu ms (status %u reason %u)\n",
+          status ? "failed" : "done", airport_up_time() - wclJoinStartMs,
+          status, reason);
     AirportWCL::ConnectionEvent event = {};
     event.status = status;
     event.reason = reason;
