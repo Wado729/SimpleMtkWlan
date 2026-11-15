@@ -1714,6 +1714,65 @@ ieee80211_save_ie_tlv(const u_int8_t *frm, u_int8_t **ie, uint32_t *accept_len, 
  * [tlv] HT Capabilities (802.11n)
  * [tlv] HT Operation (802.11n)
  */
+/*
+ * Phase 4l: a channel switch announced by our AP (mac80211
+ * ieee80211_parse_ch_switch_ie(), simplified). opclass 0: no operating
+ * class (CSA element), the current band. wbcs: a Wide Bandwidth Channel
+ * Switch element (ID 194) or NULL.
+ */
+static void
+ieee80211_sta_csa(struct ieee80211com *ic, uint8_t mode, uint8_t opclass,
+    uint8_t chan, uint8_t count, const uint8_t *wbcs)
+{
+	uint8_t band = 0, ccfs0 = 0;
+	int8_t cbw = -1;
+
+	if (ic->ic_csa_start == NULL || ic->ic_opmode != IEEE80211_M_STA ||
+	    ic->ic_state != IEEE80211_S_RUN || chan == 0)
+		return;
+	if (opclass >= 81 && opclass <= 84)
+		band = 1;
+	else if (opclass >= 115 && opclass <= 130)
+		band = 2;
+	else if (opclass >= 131 && opclass <= 137)
+		band = 3;
+	if (wbcs != NULL && wbcs[1] >= 3) {
+		/* new width: 0 20/40, 1 80 (160 when ccfs1 is 8 away), 2 160 */
+		uint8_t w = wbcs[2], c0 = wbcs[3], c1 = wbcs[4];
+
+		ccfs0 = c0;
+		if (w == 1 && c1 != 0 && (c1 == c0 + 8 || c0 == c1 + 8)) {
+			cbw = 3;
+			ccfs0 = c1;
+		} else if (w == 1 || w == 3)
+			cbw = 2;
+		else if (w == 2)
+			cbw = 3;
+		else
+			ccfs0 = 0;
+	}
+	(*ic->ic_csa_start)(ic, chan, band, count, mode, cbw, ccfs0);
+}
+
+/* Phase 4l: the Wide Bandwidth Channel Switch element in elements, if any. */
+static const uint8_t *
+ieee80211_find_wbcs(const uint8_t *frm, const uint8_t *efrm)
+{
+	while (frm + 2 <= efrm && frm + 2 + frm[1] <= efrm) {
+		if (frm[0] == IEEE80211_ELEMID_WIDE_BW_CHANNEL_SWITCH)
+			return frm;
+		if (frm[0] == IEEE80211_ELEMID_CHANNEL_SWITCH_WRAPPER) {
+			const uint8_t *w = ieee80211_find_wbcs(frm + 2,
+			    frm + 2 + frm[1]);
+
+			if (w != NULL)
+				return w;
+		}
+		frm += 2 + frm[1];
+	}
+	return NULL;
+}
+
 void
 ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
                           struct ieee80211_node *rni, struct ieee80211_rxinfo *rxi, int isprobe)
@@ -1724,7 +1783,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     const u_int8_t *tstamp, *ssid, *rates, *xrates, *edcaie, *wmmie;
     const u_int8_t *rsnie, *wpaie, *htcaps, *htop;
     const u_int8_t *rsnxe = NULL;    /* RSN Extension (SAE H2E) */
-    const uint8_t *csa;
+    const uint8_t *csa, *xcsa = NULL, *ies;
     const uint8_t *vhtcap;
     const uint8_t *vhtopmode;
     const uint8_t *hecap;
@@ -1768,6 +1827,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     tstamp  = frm; frm += 8;
     bintval = LE_READ_2(frm); frm += 2;
     capinfo = LE_READ_2(frm); frm += 2;
+    ies = frm;                                  /* phase 4l */
     
     ssid = rates = xrates = edcaie = wmmie = rsnie = wpaie = csa = vhtcap = vhtopmode = hecap = heopmode = NULL;
     htcaps = htop = NULL;
@@ -1792,6 +1852,9 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
                 break;
             case IEEE80211_ELEMID_CSA:
                 csa = frm;
+                break;
+            case IEEE80211_ELEMID_XCSA:         /* phase 4l */
+                xcsa = frm;
                 break;
             case IEEE80211_ELEMID_RATES:
                 rates = frm;
@@ -2005,6 +2068,18 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         ic->ic_state == IEEE80211_S_RUN &&
         ni->ni_state == IEEE80211_STA_BSS) {
         int updateprot = 0;
+
+        /* phase 4l: our AP is about to change channel */
+        if (ni == ic->ic_bss && (csa != NULL ||
+            (xcsa != NULL && xcsa[1] >= 4))) {
+            const uint8_t *wbcs = ieee80211_find_wbcs(ies, efrm);
+
+            if (xcsa != NULL && xcsa[1] >= 4)
+                ieee80211_sta_csa(ic, xcsa[2], xcsa[3], xcsa[4], xcsa[5],
+                    wbcs);
+            else
+                ieee80211_sta_csa(ic, csa[2], 0, csa[3], csa[4], wbcs);
+        }
         /*
          * Check if protection mode has changed since last beacon.
          */
@@ -3645,6 +3720,36 @@ ieee80211_recv_action(struct ieee80211com *ic, mbuf_t m,
                     ieee80211_recv_sa_query_resp(ic, m, ni);
                     break;
 #endif
+            }
+            break;
+        /*
+         * Phase 4l: channel switch action frames from our AP: Spectrum
+         * Management "Channel Switch Announcement" (a CSA element) and the
+         * Public "Extended Channel Switch Announcement" (mode, operating
+         * class, channel, count, then elements).
+         */
+        case IEEE80211_CATEG_SPECTRUM:
+        case IEEE80211_CATEG_PUB:
+            if (frm[1] == 4 && ni == ic->ic_bss && ic->ic_bss != NULL &&
+                IEEE80211_ADDR_EQ(wh->i_addr2, ic->ic_bss->ni_bssid)) {
+                const u_int8_t *efrm = mtod(m, u_int8_t *) + mbuf_len(m);
+
+                if (frm[0] == IEEE80211_CATEG_PUB) {
+                    if (frm + 6 <= efrm)
+                        ieee80211_sta_csa(ic, frm[2], frm[3], frm[4],
+                            frm[5], ieee80211_find_wbcs(frm + 6, efrm));
+                } else {
+                    const u_int8_t *e = frm + 2;
+
+                    while (e + 2 <= efrm && e + 2 + e[1] <= efrm) {
+                        if (e[0] == IEEE80211_ELEMID_CSA && e[1] >= 3) {
+                            ieee80211_sta_csa(ic, e[2], 0, e[3], e[4],
+                                ieee80211_find_wbcs(frm + 2, efrm));
+                            break;
+                        }
+                        e += 2 + e[1];
+                    }
+                }
             }
             break;
         default:

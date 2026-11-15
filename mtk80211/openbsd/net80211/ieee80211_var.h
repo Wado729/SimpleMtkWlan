@@ -504,6 +504,16 @@ struct ieee80211com {
 	uint8_t			ic_assoc_reassoc;
 	/* phase 4i: a voluntary leave (deauth sent) until newstate runs */
 	uint8_t			ic_leave_pending;
+	/*
+	 * Phase 4l: our AP announces a channel switch (CSA/ECSA element in a
+	 * beacon or probe response, or a channel switch action frame), as
+	 * mac80211 hands it to drv_channel_switch(). band: 1 2.4, 2 5,
+	 * 3 6 GHz, 0 the current one; cbw: CMD_CBW_* or -1 unknown (keep the
+	 * width); ccfs0 the new center if known. RX context (work loop).
+	 */
+	void			(*ic_csa_start)(struct ieee80211com *, uint8_t chan,
+				    uint8_t band, uint8_t count, uint8_t mode,
+				    int8_t cbw, uint8_t ccfs0);
 	u_int8_t		ic_myaddr[IEEE80211_ADDR_LEN];
 	struct ieee80211_rateset ic_sup_rates[IEEE80211_MODE_MAX];
 	struct ieee80211_channel ic_channels[IEEE80211_CHAN_MAX+1];

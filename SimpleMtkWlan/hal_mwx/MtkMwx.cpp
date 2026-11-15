@@ -692,6 +692,18 @@ struct mwx_softc {
 	volatile uint32_t	sc_7927_txs_join_ack, sc_7927_txs_join_nack;
 	volatile uint32_t	sc_7927_txs_leave_ack, sc_7927_txs_leave_nack;
 	volatile uint8_t	sc_7927_txs_join_st, sc_7927_txs_leave_st;	/* subtype sent */
+	/* phase 4l: firmware beacon filter, channel switch */
+	bool			sc_7927_bcnft_off;	/* -mtk7927nobcnft */
+	bool			sc_7927_bcnft_on;	/* set for this association */
+	CTimeout		*sc_7927_csa_to;
+	struct task		sc_7927_csa_task;
+	volatile bool		sc_7927_csa_pending;
+	volatile bool		sc_7927_csa_verify;	/* ask the AP after a switch */
+	volatile bool		sc_7927_csa_leave;	/* switch to another band */
+	uint8_t			sc_7927_csa_chan, sc_7927_csa_band, sc_7927_csa_mode;
+	int8_t			sc_7927_csa_cbw;
+	uint8_t			sc_7927_csa_center;
+	uint32_t		sc_7927_csa_switches;
 	uint32_t		sc_7927_rx_hwdec;	/* decrypted by the chip */
 	uint32_t		sc_7927_rx_hwdec_nopn;
 	struct mt7927_bss	sc_7927_bss;
@@ -825,6 +837,10 @@ static void	mt7927_delete_key(struct ieee80211com *, struct ieee80211_node *,
 static void	mt7927_join_poll(struct mwx_softc *);
 static void	mt7927_join_teardown(struct mwx_softc *, const char *);
 static void	mt7927_hal_txs(void *, uint8_t, bool);
+static void	mt7927_csa_start(struct ieee80211com *, uint8_t, uint8_t, uint8_t,
+		    uint8_t, int8_t, uint8_t);
+static void	mt7927_csa_timeo(void *);
+static void	mt7927_csa_task(void *);
 static int	mt7927_ampdu_rx_start(struct ieee80211com *,
 		    struct ieee80211_node *, uint8_t);
 static void	mt7927_ampdu_rx_stop(struct ieee80211com *,
@@ -2974,6 +2990,11 @@ common:
 		ic->ic_ampdu_tx_start = mt7927_ampdu_tx_start;
 		ic->ic_ampdu_tx_stop = mt7927_ampdu_tx_stop;
 		task_set(&sc->sc_7927_ba_task, mt7927_ba_task, sc, "mt7927_ba");
+		/* phase 4l: channel switch (CSA) and the firmware beacon filter */
+		task_set(&sc->sc_7927_csa_task, mt7927_csa_task, sc, "mt7927_csa");
+		ic->ic_csa_start = mt7927_csa_start;
+		sc->sc_7927_bcnft_off = PE_parse_boot_argn("-mtk7927nobcnft", &sw,
+		    sizeof(sw));
 	}
 
 	/* Override 802.11 state transition machine. */
@@ -4691,6 +4712,11 @@ mwx_wfsys_reset(struct mwx_softc *sc)
 #define	MT7927_BSS_TAG_SEC		16
 #define	MT7927_BSS_TAG_IFS_TIME		23
 #define	MT7927_BSS_TAG_PS		21	/* UNI_BSS_INFO_PS */
+#define	MT7927_BSS_TAG_BCNFT		22	/* UNI_BSS_INFO_BCNFT (phase 4l) */
+#define	MT7927_BSS_TAG_PM_DISABLE	27	/* UNI_BSS_INFO_PM_DISABLE */
+#define	MT7927_RFCR_DROP_OTHER_BEACON	(1U << 11)	/* MT_WF_RFCR_DROP_OTHER_BEACON */
+#define	MT7927_FIF_BIT_SET		(1U << 0)
+#define	MT7927_FIF_BIT_CLR		(1U << 1)
 #define	MT7927_BSS_TAG_MLD		26
 #define	MT7927_BSS_TAG_BSS_COLOR	4	/* UNI_BSS_INFO_BSS_COLOR */
 #define	MT7927_BSS_TAG_HE_BASIC		5	/* UNI_BSS_INFO_HE_BASIC */
@@ -7776,6 +7802,33 @@ mt7927_set_rxfilter(struct mt7927_bringup *b, uint8_t band_idx, uint32_t fif)
 	return rv;
 }
 
+/* Phase 4l: mt7925_mcu_set_rxfilter(dev, 0, bit_op, bit_map). */
+int
+mt7927_set_rxfilter_bits(struct mt7927_bringup *b, uint8_t band_idx,
+    uint8_t bit_op, uint32_t bit_map)
+{
+	struct {
+		uint8_t		band_idx, rsv1[3];
+		uint16_t	tag, len;
+		uint8_t		mode, rsv2[3];
+		uint32_t	fif, bit_map;
+		uint8_t		bit_op, pad[51];
+	} __packed req;
+	int rv;
+
+	memset(&req, 0, sizeof(req));
+	req.band_idx = band_idx;
+	req.tag = htole16(MT7927_UNI_BAND_CONFIG_RX_FILTER);
+	req.len = htole16(sizeof(req) - 4);
+	req.mode = 1;					/* fif 0: bitmap update */
+	req.bit_map = htole32(bit_map);
+	req.bit_op = bit_op;
+	mt7927_op_lock(b);
+	rv = mt7927_mcu_send(b, MT7927_UNI_BAND_CONFIG, &req, sizeof(req), true);
+	mt7927_op_unlock(b);
+	return rv;
+}
+
 /*
  * mt7925_mcu_hw_scan(): UNI SCAN_REQ with REQ, SSID, BSSID, CHANNEL and MISC
  * TLVs. Passive (no probe requests, so no probe IEs) unless an SSID is
@@ -8313,6 +8366,85 @@ mt7927_bss_ps(struct mt7927_bringup *b, const struct mt7927_vif *v,
 	rv = mt7927_uni_send_status(b, MCU_UNI_CMD_BSS_INFO_UPDATE, &m, &status);
 	MWX_DEV_LOG(b->sc, "MT7927 power save state %u (0 = awake) -> %d "
 	    "(fw status 0x%x)\n", ps_state, rv, status);
+	return rv;
+}
+
+/*
+ * Phase 4l: mt7925_mcu_uni_bss_bcnft(): the firmware follows the AP's
+ * beacons itself (interval, DTIM), passes changed ones up and reports a
+ * real beacon loss. Linux sends it at every association
+ * (mt7925_mcu_set_beacon_filter(), BSS_CHANGED_ASSOC), power save or not.
+ */
+int
+mt7927_bss_bcnft(struct mt7927_bringup *b, const struct mt7927_vif *v,
+    uint16_t bcn_int, uint8_t dtim)
+{
+	struct mt7927_msg m;
+	uint8_t hdr[4] = { v->idx, 0, 0, 0 };
+	uint32_t status;
+	uint8_t *t;
+	int rv;
+
+	mt7927_msg_init(&m, hdr, sizeof(hdr));
+	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_BCNFT, 12);
+	mt7927_put16(t + 4, bcn_int);
+	t[6] = dtim;
+	m.buf[2] = m.buf[3] = 0;			/* pad in mt7925's header */
+	rv = mt7927_uni_send_status(b, MCU_UNI_CMD_BSS_INFO_UPDATE, &m, &status);
+	MWX_DEV_LOG(b->sc, "MT7927 beacon filter: interval %u TU, DTIM %u -> %d "
+	    "(fw status 0x%x)\n", bcn_int, dtim, rv, status);
+	return rv;
+}
+
+/* Phase 4l: mt7925_mcu_set_bss_pm(.., false): beacon filter off again. */
+int
+mt7927_bss_pm_disable(struct mt7927_bringup *b, const struct mt7927_vif *v)
+{
+	struct mt7927_msg m;
+	uint8_t hdr[4] = { v->idx, 0, 0, 0 };
+	uint32_t status;
+	int rv;
+
+	mt7927_msg_init(&m, hdr, sizeof(hdr));
+	(void)mt7927_msg_tlv(&m, MT7927_BSS_TAG_PM_DISABLE, 4);
+	m.buf[2] = m.buf[3] = 0;
+	rv = mt7927_uni_send_status(b, MCU_UNI_CMD_BSS_INFO_UPDATE, &m, &status);
+	MWX_DEV_LOG(b->sc, "MT7927 beacon filter off -> %d (fw status 0x%x)\n",
+	    rv, status);
+	return rv;
+}
+
+/*
+ * Phase 4l: mt7925_mcu_set_chctx(): BSS_INFO_UPDATE with only the RLM TLV,
+ * the BSS's operating channel after a channel switch.
+ */
+int
+mt7927_bss_rlm(struct mt7927_bringup *b, const struct mt7927_vif *v,
+    const struct mt7927_bss *bss)
+{
+	struct mt7927_msg m;
+	uint8_t hdr[4] = { v->idx, 0, 0, 0 };
+	uint8_t center = bss->center_chan ? bss->center_chan : bss->chan;
+	uint32_t status;
+	uint8_t *t;
+	int rv;
+
+	mt7927_msg_init(&m, hdr, sizeof(hdr));
+	/* as mt7927_bss_info()'s RLM TLV (mt7925_mcu_bss_rlm_tlv()) */
+	t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_RLM, 16);
+	t[4] = bss->chan;
+	t[5] = center;
+	t[7] = bss->bw;
+	t[8] = 2;
+	t[9] = 2;
+	t[10] = bss->bw ? 4 : 0;
+	t[11] = bss->chan < center ? 1 : bss->chan > center ? 3 : 0;
+	t[12] = bss->band;
+	m.buf[2] = m.buf[3] = 0;
+	rv = mt7927_uni_send_status(b, MCU_UNI_CMD_BSS_INFO_UPDATE, &m, &status);
+	MWX_DEV_LOG(b->sc, "MT7927 BSS channel -> ch %u center %u bw %u band %u: "
+	    "%d (fw status 0x%x)\n", bss->chan, center, bss->bw, bss->band, rv,
+	    status);
 	return rv;
 }
 
@@ -9691,6 +9823,7 @@ mt7927_hal_attach(struct mwx_softc *sc, struct pci_attach_args *pa)
 	}
 	mt7927_engine_set_rx_decap(sc->sc_7927, sc->sc_7927_rx_decap);
 	timeout_set(&sc->sc_7927_reorder_to, mt7927_reorder_timeo, sc);
+	timeout_set(&sc->sc_7927_csa_to, mt7927_csa_timeo, sc);	/* phase 4l */
 	MWX_DEV_LOG(sc, "MT7927 RX header translation %s\n",
 	    sc->sc_7927_rx_decap ? "on" : "off (-mtk7927nodecap)");
 	/*
@@ -10403,6 +10536,18 @@ mt7927_join_teardown(struct mwx_softc *sc, const char *why)
 		return;
 	mt7927_tx_drain(sc, "leaving");
 	mt7927_vif_fill(sc, &v);
+	/* phase 4l: no switch pending past the BSS; beacon filter off */
+	if (sc->sc_7927_csa_to != NULL)
+		timeout_del(&sc->sc_7927_csa_to);
+	sc->sc_7927_csa_pending = false;
+	sc->sc_7927_csa_verify = false;
+	sc->sc_7927_csa_leave = false;
+	if (sc->sc_7927_bcnft_on) {
+		sc->sc_7927_bcnft_on = false;
+		mt7927_bss_pm_disable(sc->sc_7927, &v);
+		(void)mt7927_set_rxfilter_bits(sc->sc_7927, 0,
+		    MT7927_FIF_BIT_CLR, MT7927_RFCR_DROP_OTHER_BEACON);
+	}
 	mt7927_roc_abort(sc->sc_7927, &v);
 	mt7927_sta_rec(sc->sc_7927, &v, &sc->sc_7927_bss, true, false, 0, false);
 	sc->sc_7927_bss.cipher = 0;
@@ -10552,6 +10697,20 @@ mt7927_join_assoc(struct mwx_softc *sc)
 		mt7927_set_edca(sc->sc_7927, &v, e);
 		/* BSS_CHANGED_PS with power save off (mt7925_mcu_uni_bss_ps) */
 		mt7927_bss_ps(sc->sc_7927, &v, 0);
+		/*
+		 * Phase 4l: BSS_CHANGED_ASSOC -> mt7925_mcu_set_beacon_filter
+		 * (true): the firmware follows the beacons (changed ones and a
+		 * real loss come up), other BSSes' beacons are dropped.
+		 */
+		if (!sc->sc_7927_bcnft_off &&
+		    mt7927_bss_bcnft(sc->sc_7927, &v, sc->sc_7927_bss.bcn_int,
+		    sc->sc_7927_bss.dtim) == 0) {
+			sc->sc_7927_bcnft_on = true;
+			MWX_DEV_LOG(sc, "MT7927 RX filter: other BSSes' beacons "
+			    "dropped -> %d\n", mt7927_set_rxfilter_bits(
+			    sc->sc_7927, 0, MT7927_FIF_BIT_SET,	/* phy band 0, as mt7925 */
+			    MT7927_RFCR_DROP_OTHER_BEACON));
+		}
 	}
 	return rv;
 }
@@ -12155,6 +12314,157 @@ mt7927_hal_resume(struct mwx_softc *sc)
 }
 
 /*
+ * Phase 4l: the center channel of a cbw-wide channel (CMD_CBW_*: 0 20,
+ * 1 40, 2 80, 3 160 MHz) with primary chan, from the 5 GHz (36-64, 100-144,
+ * 149-177) and 6 GHz (1-233) channelizations; 0 if there is none.
+ */
+static uint8_t
+mt7927_csa_center(uint8_t band, uint8_t chan, uint8_t cbw)
+{
+	unsigned base, idx, span;
+
+	if (cbw == 0)
+		return chan;
+	if (cbw > 3)
+		return 0;
+	if (band == 3) {
+		if (chan < 1 || chan > 233 || (chan - 1) % 4 != 0)
+			return 0;
+		base = 1;
+	} else if (band == 2) {
+		if (chan >= 149 && chan <= 177)
+			base = 149;
+		else if (chan >= 36 && chan <= 144)
+			base = 36;
+		else
+			return 0;
+		if ((chan - base) % 4 != 0)
+			return 0;
+	} else
+		return 0;		/* 2.4 GHz: stay at 20 MHz */
+	idx = (chan - base) / 4;
+	span = 1U << cbw;	/* 20 MHz channels per block: 2, 4, 8 */
+	base += (idx / span) * span * 4;
+	/* 5 GHz 160 MHz blocks: 36-64, 100-128, 149-177 only */
+	if (band == 2 && cbw == 3 && base != 36 && base != 100 && base != 149)
+		return 0;
+	if (band == 3 && base + (span - 1) * 4 > 233)
+		return 0;
+	return (uint8_t)(base + (span - 1) * 2);
+}
+
+/*
+ * Phase 4l: our AP announced a channel switch (net80211, RX context on
+ * the work loop). As mt7925_channel_switch(): switch after count beacon
+ * intervals; later beacons with the same target re-time it
+ * (mt7925_channel_switch_rx_beacon()).
+ */
+static void
+mt7927_csa_start(struct ieee80211com *ic, uint8_t chan, uint8_t band,
+    uint8_t count, uint8_t mode, int8_t cbw, uint8_t ccfs0)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+	uint32_t ms;
+	bool same;
+
+	if (!sc->sc_7927_assoc || sc->sc_7927_csa_to == NULL)
+		return;
+	if (band == 0)
+		band = sc->sc_7927_bss.band;
+	if (chan == sc->sc_7927_bss.chan && band == sc->sc_7927_bss.band)
+		return;
+	same = sc->sc_7927_csa_pending && chan == sc->sc_7927_csa_chan &&
+	    band == sc->sc_7927_csa_band;
+	ms = (uint32_t)count * sc->sc_7927_bss.bcn_int * 1024 / 1000;
+	if (same && count == 0)
+		return;			/* already timed */
+	if (!same)
+		MWX_DEV_LOG(sc, "MT7927 channel switch announced by the AP: ch %u "
+		    "-> %u (%s GHz)%s%s in %u beacons (%u ms), mode %u\n",
+		    sc->sc_7927_bss.chan, chan, band == 1 ? "2.4" : band == 3 ?
+		    "6" : "5", cbw >= 0 ? ", new width given" : "",
+		    ccfs0 ? ", new center given" : "", count, ms, mode);
+	sc->sc_7927_csa_chan = chan;
+	sc->sc_7927_csa_band = band;
+	sc->sc_7927_csa_mode = mode;
+	sc->sc_7927_csa_cbw = cbw;
+	sc->sc_7927_csa_center = ccfs0;
+	sc->sc_7927_csa_pending = true;
+	timeout_add_msec(&sc->sc_7927_csa_to, ms ? (int)ms : 1);
+}
+
+/* Phase 4l: switch time (command gate): the work goes to the newstate queue. */
+static void
+mt7927_csa_timeo(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+
+	if (sc->sc_7927_csa_pending && sc->sc_nswq != NULL)
+		task_add(sc->sc_nswq, &sc->sc_7927_csa_task);
+}
+
+/*
+ * Phase 4l: mt7925_csa_work(): a join ROC on the new channel, the BSS's
+ * channel (mt7925_mcu_set_chctx()), the ROC back; then the link watchdog
+ * asks the AP on the new channel, and leaves if it does not answer, so
+ * macOS rejoins (mac80211: no beacon after the switch, connection lost).
+ * A switch to another band is not done in place: we leave.
+ */
+static void
+mt7927_csa_task(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct mt7927_vif v;
+	struct mt7927_bss nb;
+	unsigned idx;
+	int rv, roc;
+
+	if (!sc->sc_7927_csa_pending)
+		return;
+	sc->sc_7927_csa_pending = false;
+	if (!sc->sc_7927_joined || !sc->sc_7927_assoc ||
+	    ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL) {
+		MWX_DEV_LOG(sc, "MT7927 channel switch: not associated any more\n");
+		return;
+	}
+	if (sc->sc_7927_csa_band != sc->sc_7927_bss.band) {
+		MWX_DEV_LOG(sc, "MT7927 channel switch to another band: leaving "
+		    "so macOS joins again\n");
+		sc->sc_7927_csa_leave = true;	/* the watchdog, on the gate */
+		return;
+	}
+	nb = sc->sc_7927_bss;
+	nb.chan = sc->sc_7927_csa_chan;
+	if (sc->sc_7927_csa_cbw >= 0)
+		nb.bw = (uint8_t)sc->sc_7927_csa_cbw;
+	nb.center_chan = sc->sc_7927_csa_center ? sc->sc_7927_csa_center :
+	    mt7927_csa_center(nb.band, nb.chan, nb.bw);
+	if (nb.center_chan == 0) {
+		nb.bw = 0;
+		nb.center_chan = nb.chan;
+	}
+	mt7927_vif_fill(sc, &v);
+	roc = mt7927_roc(sc->sc_7927, &v, nb.chan, nb.band, MT7927_ROC_JOIN_MS);
+	rv = mt7927_bss_rlm(sc->sc_7927, &v, &nb);
+	if (roc == 0)
+		mt7927_roc_abort(sc->sc_7927, &v);
+	sc->sc_7927_csa_switches++;
+	if (rv == 0) {
+		sc->sc_7927_bss.chan = nb.chan;
+		sc->sc_7927_bss.bw = nb.bw;
+		sc->sc_7927_bss.center_chan = nb.center_chan;
+		idx = nb.band == 3 ? IEEE80211_6GHZ_CHANIDX(nb.chan) : nb.chan;
+		if (idx < IEEE80211_CHAN_MAX && ic->ic_channels[idx].ic_flags != 0)
+			ic->ic_bss->ni_chan = &ic->ic_channels[idx];
+	}
+	MWX_DEV_LOG(sc, "MT7927 channel switch #%u: ch %u center %u bw %u, ROC %d, "
+	    "BSS channel %d; asking the AP there\n", sc->sc_7927_csa_switches,
+	    nb.chan, nb.center_chan, nb.bw, roc, rv);
+	sc->sc_7927_csa_verify = true;		/* the watchdog's next tick */
+}
+
+/*
  * Phase 4k: TX status of a frame sent with a MT7927_TXS_PID_* id (RX ring
  * work: the work loop or an MCU waiter's thread). Counters and a log line.
  */
@@ -12300,6 +12610,20 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 	 * Phase 4i: probing the AP (below). Any frame from it since the probe
 	 * went out (a probe response, data, a changed beacon) and we stay.
 	 */
+	/* phase 4l: channel switch follow-ups */
+	if (sc->sc_7927_csa_leave) {
+		sc->sc_7927_csa_leave = false;
+		sc->sc_7927_last_recovery = 0;	/* not throttled */
+		mt7927_link_leave(sc, "the AP moved to another band", 0, 0, 0);
+		return;
+	}
+	if (sc->sc_7927_csa_verify && sc->sc_7927_wd_probes == 0) {
+		sc->sc_7927_csa_verify = false;
+		sc->sc_7927_wd_probes = 1;
+		sc->sc_7927_wd_rx_mark = mt7927_rx_from_bss(sc);
+		mt7927_probe_ap(sc);
+		return;
+	}
 	/* review S5: off channel, probes and answers would be lost */
 	if (sc->sc_7927_wd_probes != 0 && (sc->sc_flags & MWX_FLAG_SCANNING))
 		return;
@@ -12339,6 +12663,19 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 		 * traffic flowed; leaving on it cost a needless rejoin.
 		 */
 		sc->sc_7927_bcn_loss_seen = loss;
+		/*
+		 * Phase 4l: with the beacon filter set up (BCNFT) the event
+		 * is real (Linux: connection lost): ask the AP at once.
+		 */
+		if (sc->sc_7927_bcnft_on && sc->sc_7927_wd_probes == 0 &&
+		    !(sc->sc_flags & MWX_FLAG_SCANNING)) {
+			MWX_DEV_LOG(sc, "MT7927 link watchdog: firmware beacon "
+			    "loss event (%u so far), asking the AP\n", loss);
+			sc->sc_7927_wd_probes = 1;
+			sc->sc_7927_wd_rx_mark = mt7927_rx_from_bss(sc);
+			mt7927_probe_ap(sc);
+			return;
+		}
 		MWX_DEV_LOG(sc, "MT7927 link watchdog: firmware beacon loss "
 		    "event (%u so far), not acted on; rx airtime %u us\n", loss,
 		    rxt);
