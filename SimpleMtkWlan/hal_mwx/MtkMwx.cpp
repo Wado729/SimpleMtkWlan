@@ -643,6 +643,15 @@ struct mwx_softc {
 	uint32_t		sc_7927_rxml_frames;	/* 802.11 frames in it */
 	uint32_t		sc_7927_rx_batches, sc_7927_rx_batched;
 	uint32_t		sc_7927_rx_csum;	/* frames with chip-checked checksums */
+	/* phase 4h: receive-speed diagnostics, per 5 s */
+	uint32_t		sc_7927_rxr_key[16], sc_7927_rxr_cnt[16];
+	uint32_t		sc_7927_rxr_n, sc_7927_rxr_other;
+	uint64_t		sc_7927_rx_bytes;
+	uint32_t		sc_7927_rx_amsdu_sub;
+	uint64_t		sc_7927_rx5_bytes;
+	uint32_t		sc_7927_rx5_frames, sc_7927_rx5_batches,
+				sc_7927_rx5_batched, sc_7927_rx5_intr,
+				sc_7927_rx5_amsdu;
 	/* phase 4c.10: RX header translation (decap offload) */
 	bool			sc_7927_rx_decap;	/* on unless -mtk7927nodecap */
 	struct mt7927_reorder	sc_7927_reorder[8];	/* per TID, BA sessions */
@@ -4799,6 +4808,12 @@ struct mt7927_rxi {
 	uint16_t	fc;
 	uint16_t	seq_ctrl;
 	uint16_t	qos_ctl;
+	/* phase 4h: the rate the frame came at (P-RXV, group 3) */
+	bool		has_rxv;
+	uint8_t		rx_mode;	/* MT_PHY_TYPE_*: 4 VHT, 8 HE SU, 13 EHT SU */
+	uint8_t		rx_mcs;
+	uint8_t		rx_nss;
+	uint8_t		rx_bw;		/* 0 20, 1 40, 2 80, 3 160 MHz */
 };
 
 
@@ -7369,6 +7384,20 @@ mt7927_rx_parse(const uint8_t *p, uint32_t len, uint8_t antenna_mask,
 
 		if (off + 16 > len)
 			return MT7927_RX_SHORT;
+		{
+			/* phase 4h: MT_PRXV_TX_RATE/NSTS in v0, TX_MODE/
+			 * FRAME_MODE in v2 (mt76_connac3_mac.h) */
+			uint32_t v0 = mt7927_le32(p + off);
+			uint32_t v2 = mt7927_le32(p + off + 8);
+
+			ri->has_rxv = true;
+			ri->rx_mode = (uint8_t)((v2 >> 11) & 0xf);
+			ri->rx_bw = (uint8_t)(v2 & 0x7);
+			ri->rx_nss = (uint8_t)(((v0 >> 7) & 0xf) + 1);
+			ri->rx_mcs = (uint8_t)(v0 & 0x7f);
+			if (ri->rx_mode >= 4)		/* VHT, HE, EHT */
+				ri->rx_mcs &= 0xf;
+		}
 		v3 = mt7927_le32(p + off + 12);
 		for (i = 0; i < 4; i++) {
 			int rssi = ((int)((v3 >> (8 * i)) & 0xff) - 220) / 2;
@@ -8805,7 +8834,8 @@ mt7927_txpower_band(struct mt7927_bringup *b, int band)
 			/*
 			 * Phase 4g: 6 GHz at 12 dBm, wireless-regdb's US rule
 			 * (5925-7125, 12 dBm, the narrowest-bandwidth client
-			 * figure); the firmware's own country limits still apply.
+			 * figure); the firmware's own country limits still
+			 * apply. Phase 4h: wider widths below.
 			 */
 			int8_t pw = !known ? 127 : band == 6 ? 24 : 40;
 
@@ -8816,6 +8846,30 @@ mt7927_txpower_band(struct mt7927_bringup *b, int band)
 				memset(sku + 1, pw, 4);		/* cck */
 			memset(sku + 1 + 4, pw, 8);		/* ofdm */
 			memset(sku + 1 + 44, pw, MT7927_SKU_LEN - 1 - 44);
+			if (band == 6 && known) {
+				/*
+				 * Phase 4h: 6 GHz clients are limited by power
+				 * density (FCC LPI client: -1 dBm/MHz, at most
+				 * 24 dBm), not one figure: 12 dBm at 20 MHz,
+				 * 15/18/21 dBm at 40/80/160 MHz, less for the
+				 * small HE RUs. mt7925_mcu_build_sku()'s layout
+				 * (half-dB): HT 20/40 at 44, VHT 20..160 at 61
+				 * (12 each), HE RU26..RU2x996 at 109 (12 each);
+				 * EHT stays at the 20 MHz figure.
+				 */
+				static const int8_t vht[4] = { 24, 30, 36, 42 };
+				static const int8_t he[7] = { 4, 10, 16, 24, 30,
+				    36, 42 };
+				int r;
+
+				memset(sku + 1 + 44, 24, 8);	/* HT20 */
+				memset(sku + 1 + 52, 30, 8);	/* HT40 */
+				sku[1 + 60] = 24;
+				for (r = 0; r < 4; r++)
+					memset(sku + 1 + 61 + 12 * r, vht[r], 12);
+				for (r = 0; r < 7; r++)
+					memset(sku + 1 + 109 + 12 * r, he[r], 12);
+			}
 		}
 		rv = mt7927_mcu_send(b, MT7927_UNI_SET_POWER_LIMIT, tmp, mlen,
 		    true);
@@ -11143,6 +11197,33 @@ mt7927_rx_amsdu_flush(struct mwx_softc *sc)
  * (RXD4 first/middle/last), which are gathered into one unit like
  * mt76_rx_release_amsdu() before reordering.
  */
+/* phase 4h: count the rates data frames from the AP come at */
+static void
+mt7927_rx_rate_note(struct mwx_softc *sc, const struct mt7927_rxi *ri)
+{
+	uint32_t key;
+	int i, fr = -1;
+
+	if (!ri->has_rxv)
+		return;
+	key = ((uint32_t)ri->rx_mode << 16) | ((uint32_t)ri->rx_nss << 12) |
+	    ((uint32_t)ri->rx_bw << 8) | ri->rx_mcs;
+	sc->sc_7927_rxr_n++;
+	for (i = 0; i < 16; i++) {
+		if (sc->sc_7927_rxr_cnt[i] && sc->sc_7927_rxr_key[i] == key) {
+			sc->sc_7927_rxr_cnt[i]++;
+			return;
+		}
+		if (!sc->sc_7927_rxr_cnt[i] && fr < 0)
+			fr = i;
+	}
+	if (fr >= 0) {
+		sc->sc_7927_rxr_key[fr] = key;
+		sc->sc_7927_rxr_cnt[fr] = 1;
+	} else
+		sc->sc_7927_rxr_other++;
+}
+
 static void
 mt7927_rx_8023(struct mwx_softc *sc, const uint8_t *p, uint32_t len)
 {
@@ -11212,8 +11293,12 @@ mt7927_rx_8023(struct mwx_softc *sc, const uint8_t *p, uint32_t len)
 		sc->sc_7927_rx_mcast++;
 	} else {
 		sc->sc_7927_rx_ucast++;
+		mt7927_rx_rate_note(sc, &ri);
 	}
 	sc->sc_7927_rx8023++;
+	sc->sc_7927_rx_bytes += dlen;
+	if (ri.amsdu)
+		sc->sc_7927_rx_amsdu_sub++;
 	/* what ieee80211_input() keeps up to date for the AP */
 	ni->ni_inact = 0;
 	if (ri.rssi < 0 && ri.rssi > -127)
@@ -11938,6 +12023,74 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		    sc->sc_7927_depth_ring, sc->sc_7927_tx_held,
 		    sc->sc_7927_recoveries);
 		sc->sc_7927_depth_tok = sc->sc_7927_depth_ring = 0;
+		{
+			/*
+			 * Phase 4h: receive speed in the last 5 s - payload
+			 * Mbit/s, frames per interrupt and per batch up the
+			 * stack, A-MSDU subframes, and the AP's rates to us.
+			 */
+			static const char *const mn[16] = { "CCK", "OFDM",
+			    "HT", "HT-GF", "VHT", "?5", "?6", "?7", "HE-SU",
+			    "HE-ER", "HE-TB", "HE-MU", "?12", "EHT-SU",
+			    "EHT-TB", "EHT-MU" };
+			static const uint16_t bwm[8] = { 20, 40, 80, 160, 320,
+			    0, 0, 0 };
+			uint32_t in_, is_, fr_, ot_, evs_, to_, df, db, dbt, di;
+			uint64_t dB;
+			char top[160];
+			int o = 0, k;
+
+			mt7927_engine_counters(sc->sc_7927, &in_, &is_, &fr_,
+			    &ot_, &evs_, &to_);
+			dB = sc->sc_7927_rx_bytes - sc->sc_7927_rx5_bytes;
+			df = sc->sc_7927_rx8023 - sc->sc_7927_rx5_frames;
+			db = sc->sc_7927_rx_batches - sc->sc_7927_rx5_batches;
+			dbt = sc->sc_7927_rx_batched - sc->sc_7927_rx5_batched;
+			di = in_ - sc->sc_7927_rx5_intr;
+			top[0] = 0;
+			for (k = 0; k < 3; k++) {
+				uint32_t best = 0, bk = 0;
+				int i, bi = -1;
+
+				for (i = 0; i < 16; i++)
+					if (sc->sc_7927_rxr_cnt[i] > best) {
+						best = sc->sc_7927_rxr_cnt[i];
+						bk = sc->sc_7927_rxr_key[i];
+						bi = i;
+					}
+				if (bi < 0 || o >= (int)sizeof(top) - 48)
+					break;
+				o += snprintf(top + o, sizeof(top) - o,
+				    "%s%s %uss mcs %u %u MHz %u%%", k ? ", " : "",
+				    mn[(bk >> 16) & 0xf], (bk >> 12) & 0xf,
+				    bk & 0xff, bwm[(bk >> 8) & 0x7],
+				    sc->sc_7927_rxr_n ? best * 100 /
+				    sc->sc_7927_rxr_n : 0);
+				sc->sc_7927_rxr_cnt[bi] = 0;
+			}
+			if (df > 0)
+				MWX_DEV_LOG(sc, "MT7927 rx last 5 s: %u Mbit/s, "
+				    "%u frames, %u interrupts (%u.%u frames "
+				    "each), %u batches up (%u.%u each), %u "
+				    "A-MSDU subframes; rx rate (%u sampled, %u "
+				    "other): %s\n",
+				    (uint32_t)(dB * 8 / 5000000), df, di,
+				    di ? df / di : 0, di ? (df * 10 / di) % 10 : 0,
+				    db, db ? dbt / db : 0,
+				    db ? (dbt * 10 / db) % 10 : 0,
+				    sc->sc_7927_rx_amsdu_sub - sc->sc_7927_rx5_amsdu,
+				    sc->sc_7927_rxr_n, sc->sc_7927_rxr_other,
+				    top[0] ? top : "none");
+			memset(sc->sc_7927_rxr_cnt, 0,
+			    sizeof(sc->sc_7927_rxr_cnt));
+			sc->sc_7927_rxr_n = sc->sc_7927_rxr_other = 0;
+			sc->sc_7927_rx5_bytes = sc->sc_7927_rx_bytes;
+			sc->sc_7927_rx5_frames = sc->sc_7927_rx8023;
+			sc->sc_7927_rx5_batches = sc->sc_7927_rx_batches;
+			sc->sc_7927_rx5_batched = sc->sc_7927_rx_batched;
+			sc->sc_7927_rx5_intr = in_;
+			sc->sc_7927_rx5_amsdu = sc->sc_7927_rx_amsdu_sub;
+		}
 		{
 			uint32_t ev, ms, mx, re, fa, dev_, dms, dre;
 
