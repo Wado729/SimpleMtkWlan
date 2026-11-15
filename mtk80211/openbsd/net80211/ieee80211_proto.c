@@ -431,6 +431,87 @@ ieee80211_keyrun(struct ieee80211com *ic, u_int8_t *macaddr)
 #endif	/* IEEE80211_STA_ONLY */
 }
 
+/*
+ * Phase 4i: (Re)Association Request retransmission, as mac80211 does
+ * (IEEE80211_ASSOC_MAX_TRIES, ieee80211_do_assoc()). net80211 sent the
+ * request once and then waited its whole 5 s management timer; a lost
+ * frame, or a PMF AP still holding an old association of ours (it answers
+ * status 30 with a comeback time and SA-queries the old one first), cost
+ * a rescan and macOS a second join.
+ */
+#define IEEE80211_ASSOC_MAX_TRIES	3
+#define IEEE80211_ASSOC_RETRY_MS	500
+#define IEEE80211_ASSOC_COMEBACK_MAX_MS	2000
+
+/* After a (Re)Association Request: try again in ms unless answered first. */
+void
+ieee80211_assoc_arm(struct ieee80211com *ic, int ms)
+{
+	if (!ic->ic_assoc_retry || ic->ic_opmode != IEEE80211_M_STA)
+		return;
+	timeout_add_msec(&ic->ic_assoc_to, ms);
+}
+
+void
+ieee80211_assoc_timeout(void *arg)
+{
+	struct ieee80211com *ic = (struct ieee80211com *)arg;
+	struct ieee80211_node *ni = ic->ic_bss;
+
+	if (ic->ic_opmode != IEEE80211_M_STA ||
+	    ic->ic_state != IEEE80211_S_ASSOC || ni == NULL)
+		return;
+	if (ic->ic_assoc_tries >= IEEE80211_ASSOC_MAX_TRIES) {
+		/* net80211's management timer rescans */
+		XYLog("%s: no association with %s after %u tries\n",
+		    ic->ic_if.if_xname, ether_sprintf(ni->ni_macaddr),
+		    ic->ic_assoc_tries);
+		return;
+	}
+	ic->ic_assoc_tries++;
+	XYLog("%s: %sassociation request try %u to %s\n", ic->ic_if.if_xname,
+	    ic->ic_assoc_reassoc ? "re" : "", ic->ic_assoc_tries,
+	    ether_sprintf(ni->ni_macaddr));
+	if (IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_ASSOC_REQ,
+	    ic->ic_assoc_reassoc) == 0)
+		ieee80211_assoc_arm(ic, IEEE80211_ASSOC_RETRY_MS);
+}
+
+/* The first request of an association: count tries from here. */
+static void
+ieee80211_assoc_begin(struct ieee80211com *ic, int reassoc)
+{
+	ic->ic_assoc_tries = 1;
+	ic->ic_assoc_reassoc = (uint8_t)reassoc;
+	ieee80211_assoc_arm(ic, IEEE80211_ASSOC_RETRY_MS);
+}
+
+/*
+ * Status 30 (association rejected temporarily) in a (Re)Association
+ * Response: try again after the Timeout Interval element's comeback time
+ * (in TUs; 1 s if absent), as mac80211 does. Called from
+ * ieee80211_recv_assoc_resp(); tu 0 means no element.
+ */
+void
+ieee80211_assoc_comeback(struct ieee80211com *ic, uint32_t tu)
+{
+	uint32_t ms = tu != 0 ? (uint32_t)(((uint64_t)tu * 1024) / 1000) : 1000;
+
+	if (ms < 10)
+		ms = 10;
+	if (ms > IEEE80211_ASSOC_COMEBACK_MAX_MS)
+		ms = IEEE80211_ASSOC_COMEBACK_MAX_MS;
+	if (ic->ic_assoc_tries >= IEEE80211_ASSOC_MAX_TRIES) {
+		XYLog("%s: association rejected temporarily (status 30), "
+		    "comeback %u TU, no tries left\n", ic->ic_if.if_xname, tu);
+		return;
+	}
+	XYLog("%s: association rejected temporarily (status 30), comeback "
+	    "%u TU, try %u of %u in %u ms\n", ic->ic_if.if_xname, tu,
+	    ic->ic_assoc_tries + 1, IEEE80211_ASSOC_MAX_TRIES, ms);
+	ieee80211_assoc_arm(ic, (int)ms);
+}
+
 #ifndef IEEE80211_STA_ONLY
 /*
  * Initiate a group key handshake with a node.
@@ -1790,6 +1871,10 @@ ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 		    ieee80211_state_name[ostate], ieee80211_state_name[nstate]);
 	ic->ic_state = nstate;			/* state transition */
 	ni = ic->ic_bss;			/* NB: no reference held */
+	/* phase 4i: no retransmission once out of ASSOC */
+	if (ic->ic_assoc_retry && ostate == IEEE80211_S_ASSOC &&
+	    nstate != IEEE80211_S_ASSOC)
+		timeout_del(&ic->ic_assoc_to);
 	ieee80211_set_link_state(ic, LINK_STATE_DOWN);
 	ic->ic_xflags &= ~IEEE80211_F_TX_MGMT_ONLY;
 	switch (nstate) {
@@ -1996,12 +2081,14 @@ justcleanup:
 		case IEEE80211_S_AUTH:
 			IEEE80211_SEND_MGMT(ic, ni,
 			    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0);
+			ieee80211_assoc_begin(ic, 0);
 			break;
 		case IEEE80211_S_RUN:
 			ieee80211_stop_ampdu_tx(ic, ni, mgt);
 			ieee80211_ba_del(ni);
 			IEEE80211_SEND_MGMT(ic, ni,
 			    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 1);
+			ieee80211_assoc_begin(ic, 1);
 			break;
 		}
 		break;

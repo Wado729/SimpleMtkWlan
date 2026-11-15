@@ -196,6 +196,9 @@ extern	int ieee80211_keyrun(struct ieee80211com *, u_int8_t *);
 extern	void ieee80211_setkeys(struct ieee80211com *);
 extern	void ieee80211_setkeysdone(struct ieee80211com *);
 extern	void ieee80211_sa_query_timeout(void *);
+extern	void ieee80211_assoc_timeout(void *);
+extern	void ieee80211_assoc_arm(struct ieee80211com *, int);
+extern	void ieee80211_assoc_comeback(struct ieee80211com *, uint32_t);
 extern	void ieee80211_sa_query_request(struct ieee80211com *,
 	    struct ieee80211_node *);
 extern  void ieee80211_ht_negotiate_chw(struct ieee80211com *,

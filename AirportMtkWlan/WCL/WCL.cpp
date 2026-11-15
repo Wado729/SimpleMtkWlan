@@ -189,7 +189,7 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
         case 0: return self->beginWCLScan(static_cast<apple80211ScanRequest *>(a2));
         case 1: return self->beginWCLJoin(static_cast<apple80211AssocCandidates *>(a2));
         case 2: return self->abortWCLJoin();
-        case 3: return self->leaveWCLNetwork();
+        case 3: return self->leaveWCLNetwork("macOS disassociate");
         case 6: return self->copyWCLExtendedBss(a2);
         case 7:
             if (!a2 || !self->wclBssValid || !self->wclAssociatedBeacons)
@@ -651,7 +651,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }
     if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
-        leaveWCLNetwork();
+        leaveWCLNetwork("new join");
     ieee80211_disable_rsn(ic);
     ieee80211_disable_wep(ic);
     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
@@ -831,17 +831,36 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
     auto self = OSDynamicCast(AirportItlwmSkywalkInterface, owner);
     if (self && !self->wclStopping) {
         self->finishWCLJoin(1, 1004, kIOReturnTimeout);
-        self->leaveWCLNetwork();
+        self->leaveWCLNetwork("join timeout");
     }
 }
 
-IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
+IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork(const char *why)
 {
     ieee80211com *ic = fHalService->get80211Controller();
-    XYLog("WCL leave: state %d joinPending %d assoc %d firstBeacon %d bssValid %d "
-        "join beacons %u assoc beacons %u port %d\n", ic->ic_state, joinPending,
+    XYLog("WCL leave (%s): state %d joinPending %d assoc %d firstBeacon %d bssValid %d "
+        "join beacons %u assoc beacons %u port %d\n", why, ic->ic_state, joinPending,
         assocNotified, firstBeaconNotified, wclBssValid, wclJoinBeacons,
         wclAssociatedBeacons, portAuthorized);
+    /*
+     * Phase 4i: tell the AP we are leaving, as mac80211 does on every
+     * disconnect. net80211's RUN -> SCAN sends nothing, so the AP kept our
+     * session; with PMF (WPA3, all of 6 GHz) it then answered the next
+     * association with status 30 and SA-queried the stale one first: the
+     * "first join fails" pattern. Sent here, before RSN is turned off below,
+     * so in RUN it goes out protected with the PTK (ieee80211_get_txkey()
+     * needs IEEE80211_F_RSNON); the HAL lets it leave the chip before the
+     * station entry goes.
+     */
+    if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL &&
+        (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_ASSOC)) {
+        int rv = IEEE80211_SEND_MGMT(ic, ic->ic_bss,
+            IEEE80211_FC0_SUBTYPE_DEAUTH, IEEE80211_REASON_AUTH_LEAVE);
+        XYLog("WCL leave: deauth to %s (%s) -> %d\n",
+            ether_sprintf(ic->ic_bss->ni_macaddr),
+            (ic->ic_bss->ni_flags & IEEE80211_NODE_TXMGMTPROT) ?
+            "protected" : "not protected", rv);
+    }
     portAuthorized = false;
     updateWCLLinkQuality(true);
     joinPending = false;
@@ -869,7 +888,7 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
 
 IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
 {
-    leaveWCLNetwork();
+    leaveWCLNetwork("join abort");
     instance->postMessage(this, AirportWCL::JoinAbortComplete, nullptr, 0, true);
     return kIOReturnSuccess;
 }

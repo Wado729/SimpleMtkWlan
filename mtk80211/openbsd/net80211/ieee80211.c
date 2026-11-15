@@ -278,6 +278,7 @@ ieee80211_ifattach(struct _ifnet *ifp, IOEthernetController *controller)
     ieee80211_set_link_state(ic, LINK_STATE_DOWN);
     
     timeout_set(&ic->ic_bgscan_timeout, ieee80211_bgscan_timeout, ifp);
+    timeout_set(&ic->ic_assoc_to, ieee80211_assoc_timeout, ic);
 }
 
 void
@@ -288,6 +289,8 @@ ieee80211_ifdetach(struct _ifnet *ifp)
     
     timeout_del(&ic->ic_bgscan_timeout);
     timeout_free(&ic->ic_bgscan_timeout);
+    timeout_del(&ic->ic_assoc_to);
+    timeout_free(&ic->ic_assoc_to);
     ieee80211_proto_detach(ifp);
     ieee80211_crypto_detach(ifp);
     ieee80211_node_detach(ifp);

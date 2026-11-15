@@ -2794,14 +2794,29 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     }
     
     if (status != IEEE80211_STATUS_SUCCESS) {
-        if (ifp->if_flags & IFF_DEBUG)
-            XYLog("%s: %sassociation failed (status %d)"
-                  " for %s\n", ifp->if_xname,
-                  reassoc ?  "re" : "",
-                  status, ether_sprintf((u_int8_t *)wh->i_addr3));
+        uint32_t comeback_tu = 0;
+
+        /* phase 4i: always logged (no key material in it) */
+        XYLog("%s: %sassociation failed (status %d) for %s\n",
+              ifp->if_xname, reassoc ?  "re" : "",
+              status, ether_sprintf((u_int8_t *)wh->i_addr3));
         if (ni != ic->ic_bss)
             ni->ni_fails++;
         ic->ic_stats.is_rx_auth_fail++;
+        if (status == IEEE80211_STATUS_TRY_AGAIN_LATER) {
+            /* AID, then the Timeout Interval element (type 3: comeback) */
+            const u_int8_t *e = frm + 2;
+
+            while (e + 2 <= efrm && e + 2 + e[1] <= efrm) {
+                if (e[0] == IEEE80211_ELEMID_TIE && e[1] >= 5 &&
+                    e[2] == 3) {
+                    comeback_tu = LE_READ_4(e + 3);
+                    break;
+                }
+                e += 2 + e[1];
+            }
+            ieee80211_assoc_comeback(ic, comeback_tu);
+        }
         return;
     }
     associd = LE_READ_2(frm); frm += 2;

@@ -682,6 +682,11 @@ struct mwx_softc {
 	uint32_t		sc_7927_rx_bcn;		/* beacons from our BSS */
 	uint32_t		sc_7927_rx_mcast;	/* group-addressed data */
 	uint32_t		sc_7927_rx_ucast;	/* unicast data */
+	uint32_t		sc_7927_rx_bss_mgt;	/* other management */
+	/* phase 4i: link watchdog probes the AP before leaving */
+	uint32_t		sc_7927_wd_probes;
+	uint32_t		sc_7927_wd_rx_mark;
+	uint32_t		sc_7927_wd_window_mark;
 	uint32_t		sc_7927_rx_hwdec;	/* decrypted by the chip */
 	uint32_t		sc_7927_rx_hwdec_nopn;
 	struct mt7927_bss	sc_7927_bss;
@@ -1273,7 +1278,13 @@ mwx_stop(struct ifnet *ifp)
 	 * keeps our session and ignores the first association after reboot.
 	 */
 	if (was_running && ic->ic_state == IEEE80211_S_RUN &&
-	    ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL) {
+	    ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL &&
+	    ((ic->ic_flags & IEEE80211_F_RSNON) ||
+	    !(ic->ic_bss->ni_flags & IEEE80211_NODE_TXMGMTPROT))) {
+		/*
+		 * Phase 4i: not once RSN is off (macOS left first and sent
+		 * the deauth then): a protected frame would get a group key.
+		 */
 		int drv = IEEE80211_SEND_MGMT(ic, ic->ic_bss,
 		    IEEE80211_FC0_SUBTYPE_DEAUTH, IEEE80211_REASON_AUTH_LEAVE);
 		mwx_start(ifp);
@@ -2222,6 +2233,8 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 			sc->sc_7927_rx_mcast++;
 		else if (t == IEEE80211_FC0_TYPE_DATA)
 			sc->sc_7927_rx_ucast++;
+		else if (t == IEEE80211_FC0_TYPE_MGT)
+			sc->sc_7927_rx_bss_mgt++;
 	}
 	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_CTL) {
 		mwx_rx_ctl_cnt++;
@@ -2861,6 +2874,11 @@ common:
 		 */
 		if (!PE_parse_boot_argn("-mtk7927nomfp", &off, sizeof(off)))
 			ic->ic_caps |= IEEE80211_C_MFP;
+		/*
+		 * Phase 4i: net80211 retransmits the (Re)Association Request
+		 * and honors an AP's comeback time (status 30), as mac80211.
+		 */
+		ic->ic_assoc_retry = 1;
 		/*
 		 * RX Block Ack windows up to 256 MPDUs, as mt792x sets
 		 * max_rx_aggregation_subframes (IEEE80211_MAX_AMPDU_BUF_HE):
@@ -9459,6 +9477,7 @@ mwx_reg_addr(struct mwx_softc *sc, uint32_t reg)
  * ---------------------------------------------------------------------------
  */
 void mtk_dbg_publish();
+extern "C" void mtk_dbg_snapshot(const char *why);
 
 #define	MT7927_FW_PATCH_PATH \
 	"/Library/Firmware/mediatek/mt7927/WIFI_MT6639_PATCH_MCU_2_1_hdr.bin"
@@ -10207,6 +10226,25 @@ mt7927_join_teardown(struct mwx_softc *sc, const char *why)
 
 	if (!sc->sc_7927_joined)
 		return;
+	/*
+	 * Phase 4i: let queued frames (the deauth sent on leaving, protected
+	 * with the PTK in the chip) leave before the station entry and its
+	 * key go, as mac80211 flushes the queues before removing the station.
+	 */
+	{
+		uint32_t inflight = 0, ring = 0, waited = 0;
+
+		mt7927_engine_tx_depth(sc->sc_7927, &inflight, &ring);
+		while ((inflight != 0 || ring != 0) && waited < 100) {
+			delay(5 * 1000);
+			waited += 5;
+			mt7927_engine_tx_depth(sc->sc_7927, &inflight, &ring);
+		}
+		if (waited != 0)
+			MWX_DEV_LOG(sc, "MT7927 leaving: waited %u ms for the "
+			    "TX queue (%u in the chip, %u not fetched)\n", waited,
+			    inflight, ring);
+	}
 	mt7927_vif_fill(sc, &v);
 	mt7927_roc_abort(sc->sc_7927, &v);
 	mt7927_sta_rec(sc->sc_7927, &v, &sc->sc_7927_bss, true, false, 0, false);
@@ -10369,6 +10407,17 @@ mt7927_newstate(struct mwx_softc *sc, enum ieee80211_state ostate,
 
 	MWX_DEV_LOG(sc, "newstate task %s -> %s arg=%d\n",
 	    ieee80211_state_name[ostate], ieee80211_state_name[nstate], arg);
+	/* phase 4i: keep the log before every disconnect ("MtkDropLog") */
+	if (ostate == IEEE80211_S_RUN && nstate < IEEE80211_S_RUN &&
+	    ic->ic_opmode == IEEE80211_M_STA) {
+		char why[96];
+
+		snprintf(why, sizeof(why), "RUN -> %s (arg %d) from %s",
+		    ieee80211_state_name[nstate], arg,
+		    ether_sprintf(sc->sc_7927_bss.bssid));
+		mtk_dbg_snapshot(why);
+		mtk_dbg_publish();
+	}
 	if (nstate < IEEE80211_S_AUTH)
 		mt7927_join_teardown(sc, ieee80211_state_name[nstate]);
 
@@ -11899,6 +11948,34 @@ mt7927_hal_resume(struct mwx_softc *sc)
 	mt7927_hal_start(sc);
 }
 
+/* Phase 4i: frames from our BSS of any kind (beacons, data, management). */
+static uint32_t
+mt7927_rx_from_bss(struct mwx_softc *sc)
+{
+	return sc->sc_7927_rx_bcn + sc->sc_7927_rx_mcast +
+	    sc->sc_7927_rx_ucast + sc->sc_7927_rx_bss_mgt;
+}
+
+/*
+ * Phase 4i: a probe request straight to the AP (mac80211's connection
+ * monitor without TX status). net80211 arms its management timer for a
+ * probe request, which in RUN would rescan 5 s later: not wanted here.
+ */
+static void
+mt7927_probe_ap(struct mwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+
+	MWX_DEV_LOG(sc, "MT7927 link watchdog: probe %u to %s\n",
+	    sc->sc_7927_wd_probes, ether_sprintf(ic->ic_bss->ni_macaddr));
+	IEEE80211_SEND_MGMT(ic, ic->ic_bss, IEEE80211_FC0_SUBTYPE_PROBE_REQ, 0);
+	if (ic->ic_state == IEEE80211_S_RUN)
+		ic->ic_mgt_timer = 0;
+}
+
+static void	mt7927_link_leave(struct mwx_softc *, const char *, uint32_t,
+		    uint32_t, uint32_t);
+
 /*
  * The radio stopped hearing the AP: a firmware beacon-loss event (Linux:
  * mt7925_mcu_connection_loss_event()), or no receive airtime at all in a
@@ -11916,15 +11993,40 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 	if (!sc->sc_7927_assoc || ic->ic_state != IEEE80211_S_RUN ||
 	    ic->ic_bss == NULL || !ic->ic_bss->ni_port_valid) {
 		sc->sc_7927_run_polls = 0;
+		sc->sc_7927_wd_probes = 0;
 		return;
 	}
 	sc->sc_7927_run_polls++;
+	/*
+	 * Phase 4i: probing the AP (below). Any frame from it since the probe
+	 * went out (a probe response, data, a changed beacon) and we stay.
+	 */
+	if (sc->sc_7927_wd_probes != 0) {
+		uint32_t heard = mt7927_rx_from_bss(sc);
+
+		if (heard != sc->sc_7927_wd_rx_mark) {
+			MWX_DEV_LOG(sc, "MT7927 link watchdog: the AP answered "
+			    "probe %u, staying\n", sc->sc_7927_wd_probes);
+			sc->sc_7927_wd_probes = 0;
+		} else if (sc->sc_7927_wd_probes < 3) {
+			sc->sc_7927_wd_probes++;
+			mt7927_probe_ap(sc);
+			return;
+		} else {
+			sc->sc_7927_wd_probes = 0;
+			mt7927_link_leave(sc, "no frame from the AP for 30 s and "
+			    "no answer to 3 probes", 0, sc->sc_7927_bcn_loss_seen,
+			    0);
+			return;
+		}
+	}
 	mt7927_engine_link(sc->sc_7927, sc->sc_vif.band_idx, &loss, &dumps,
 	    &rxt, &txt, &windows);
 	if (sc->sc_7927_run_polls == 1) {
 		/* baseline at association: count only what happens from now */
 		sc->sc_7927_bcn_loss_seen = loss;
 		sc->sc_7927_mib_seen = windows;
+		sc->sc_7927_wd_window_mark = mt7927_rx_from_bss(sc);
 		return;
 	}
 	if (loss != sc->sc_7927_bcn_loss_seen) {
@@ -11940,13 +12042,46 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 		    rxt);
 	}
 	if (windows != sc->sc_7927_mib_seen) {
+		uint32_t heard = mt7927_rx_from_bss(sc);
+
 		sc->sc_7927_mib_seen = windows;
-		/* a whole 30 s window inside this association, no RX airtime */
-		if (sc->sc_7927_run_polls > 35 && rxt == 0)
-			why = "no receive airtime for 30 s";
+		/*
+		 * A whole 30 s window inside this association, no RX airtime.
+		 * Phase 4i: on a quiet 6 GHz channel (the AP alone, beacons
+		 * filtered by the firmware) that alone is no proof; frames
+		 * from the AP in the window are, and the AP is asked
+		 * (mac80211: a probe request when the connection looks lost)
+		 * before we leave.
+		 */
+		if (sc->sc_7927_run_polls > 35 && rxt == 0) {
+			if (heard != sc->sc_7927_wd_window_mark)
+				MWX_DEV_LOG(sc, "MT7927 link watchdog: no receive "
+				    "airtime for 30 s but %u frames from the AP, "
+				    "staying\n", heard - sc->sc_7927_wd_window_mark);
+			else
+				why = "no receive airtime for 30 s";
+		}
+		sc->sc_7927_wd_window_mark = heard;
 	}
 	if (why == NULL)
 		return;
+	if (sc->sc_7927_wd_probes == 0) {
+		sc->sc_7927_wd_probes = 1;
+		sc->sc_7927_wd_rx_mark = mt7927_rx_from_bss(sc);
+		MWX_DEV_LOG(sc, "MT7927 link watchdog: %s (tx airtime %u us), "
+		    "asking the AP\n", why, txt);
+		mt7927_probe_ap(sc);
+		return;
+	}
+}
+
+/* Leave after the AP stopped answering (link watchdog). */
+static void
+mt7927_link_leave(struct mwx_softc *sc, const char *why, uint32_t txt,
+    uint32_t loss, uint32_t dumps)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+
 	if (sc->sc_7927_last_recovery != 0 &&
 	    sc->sc_7927_poll - sc->sc_7927_last_recovery < 60) {
 		MWX_DEV_LOG(sc, "MT7927 link watchdog: %s (tx airtime %u us), "
@@ -11961,6 +12096,9 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 	    "(recovery #%u)\n", why, txt, loss, dumps,
 	    ether_sprintf(sc->sc_7927_bss.bssid), sc->sc_7927_recoveries);
 	sc->sc_7927_run_polls = 0;
+	/* phase 4i: tell the AP too, in case it still hears us (mac80211) */
+	IEEE80211_SEND_MGMT(ic, ic->ic_bss, IEEE80211_FC0_SUBTYPE_DEAUTH,
+	    IEEE80211_REASON_ASSOC_EXPIRE);
 	/* ieee80211_recv_deauth() for a STA */
 	ic->ic_deauth_reason = IEEE80211_REASON_ASSOC_EXPIRE;
 	if (ic->ic_event_handler != NULL)

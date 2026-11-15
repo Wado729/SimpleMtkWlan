@@ -440,7 +440,7 @@ private:
     IOReturn startWCLJoin(AirportWCL::JoinRequest &);
     void resumeWCLJoin();
     IOReturn abortWCLJoin();
-    IOReturn leaveWCLNetwork();
+    IOReturn leaveWCLNetwork(const char *why = "macOS");
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);

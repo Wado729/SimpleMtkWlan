@@ -59,6 +59,78 @@ extern "C" void mtk_dbg_log(const char *fmt, ...)
     mtkDbgUnlock();
 }
 
+/*
+ * Phase 4i: the ring above covers only minutes, so the log before each
+ * disconnect (RUN left) is also copied here: the last MTK_DROP_SLOT bytes,
+ * the newest MTK_DROP_SLOTS of them, published as "MtkDropLog".
+ */
+#define MTK_DROP_SLOT  (16 * 1024)
+#define MTK_DROP_SLOTS 4
+static char gMtkDropBuf[MTK_DROP_SLOTS][MTK_DROP_SLOT];
+static size_t gMtkDropLen[MTK_DROP_SLOTS];
+static unsigned gMtkDropCount;
+
+void mtk_dbg_snapshot(const char *why)
+{
+    unsigned slot;
+    size_t hdr, take, from;
+    char *dst;
+    uint64_t ns;
+
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    mtkDbgLock();
+    slot = gMtkDropCount % MTK_DROP_SLOTS;
+    dst = gMtkDropBuf[slot];
+    hdr = (size_t)snprintf(dst, 160, "===== disconnect #%u at [%llu.%03llu]: %s =====\n",
+        gMtkDropCount + 1, ns / 1000000000ULL, (ns / 1000000ULL) % 1000ULL, why);
+    if (hdr >= 160)
+        hdr = 159;
+    take = gMtkDbgLen;
+    if (take > MTK_DROP_SLOT - hdr - 1)
+        take = MTK_DROP_SLOT - hdr - 1;
+    from = gMtkDbgLen - take;
+    /* start at a line */
+    while (from < gMtkDbgLen && from > 0 && gMtkDbgBuf[from - 1] != '\n') {
+        from++;
+        take--;
+    }
+    memcpy(dst + hdr, gMtkDbgBuf + from, take);
+    gMtkDropLen[slot] = hdr + take;
+    dst[gMtkDropLen[slot]] = 0;
+    gMtkDropCount++;
+    mtkDbgUnlock();
+}
+
+static void mtk_drop_publish(IOService *nub)
+{
+    const size_t size = MTK_DROP_SLOTS * MTK_DROP_SLOT + 1;
+    char *copy;
+    size_t len = 0;
+    unsigned i, n, first;
+
+    if (gMtkDropCount == 0)
+        return;
+    copy = (char *)IOMalloc(size);
+    if (copy == NULL)
+        return;
+    mtkDbgLock();
+    n = gMtkDropCount < MTK_DROP_SLOTS ? gMtkDropCount : MTK_DROP_SLOTS;
+    first = gMtkDropCount - n;
+    for (i = 0; i < n; i++) {
+        unsigned slot = (first + i) % MTK_DROP_SLOTS;
+        memcpy(copy + len, gMtkDropBuf[slot], gMtkDropLen[slot]);
+        len += gMtkDropLen[slot];
+    }
+    mtkDbgUnlock();
+    copy[len] = 0;
+    OSString *str = OSString::withCString(copy);
+    IOFree(copy, size);
+    if (str != NULL) {
+        nub->setProperty("MtkDropLog", str);
+        str->release();
+    }
+}
+
 void mtk_dbg_publish()
 {
     IOService *nub = gMtkDbgNub;
@@ -81,6 +153,7 @@ void mtk_dbg_publish()
         nub->setProperty("MtkDebugLog", str);
         str->release();
     }
+    mtk_drop_publish(nub);
 }
 
 void mtk_dbg_set_nub(IOService *nub)

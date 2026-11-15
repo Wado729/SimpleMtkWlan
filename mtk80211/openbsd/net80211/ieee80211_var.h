@@ -493,6 +493,15 @@ struct ieee80211com {
     void            (*ic_event_handler)(struct ieee80211com *, int, void *);
 	CTimeout*		ic_bgscan_timeout;
 	uint32_t		ic_bgscan_fail;
+	/*
+	 * Phase 4i: (Re)Association Request retransmission and the AP's
+	 * association comeback time (status 30), as mac80211 does. Used when
+	 * the driver sets ic_assoc_retry (MT7927).
+	 */
+	CTimeout*		ic_assoc_to;
+	uint8_t			ic_assoc_retry;
+	uint8_t			ic_assoc_tries;
+	uint8_t			ic_assoc_reassoc;
 	u_int8_t		ic_myaddr[IEEE80211_ADDR_LEN];
 	struct ieee80211_rateset ic_sup_rates[IEEE80211_MODE_MAX];
 	struct ieee80211_channel ic_channels[IEEE80211_CHAN_MAX+1];
