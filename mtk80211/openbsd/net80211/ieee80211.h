@@ -626,6 +626,7 @@ enum {
     IEEE80211_ELEMID_FILS_INDICATION = 240,
     IEEE80211_ELEMID_DILS           = 241,
     IEEE80211_ELEMID_FRAGMENT       = 242,
+    IEEE80211_ELEMID_RSNXE          = 244,	/* RSN Extension (WPA3 H2E) */
     IEEE80211_ELEMID_EXTENSION      = 255,
 };
 
@@ -971,6 +972,7 @@ enum ieee80211_edca_ac {
  */
 #define IEEE80211_AUTH_ALG_OPEN			0x0000
 #define IEEE80211_AUTH_ALG_SHARED		0x0001
+#define IEEE80211_AUTH_ALG_SAE			0x0003	/* WPA3-Personal */
 #define IEEE80211_AUTH_ALG_LEAP			0x0080
 
 /*
@@ -1072,7 +1074,10 @@ enum {
 	IEEE80211_STATUS_BAD_AKMP		= 43,
 	IEEE80211_STATUS_RSN_IE_VER_UNSUP	= 44,
 
-	IEEE80211_STATUS_CIPHER_REJ_POLICY	= 46
+	IEEE80211_STATUS_CIPHER_REJ_POLICY	= 46,
+	IEEE80211_STATUS_ANTI_CLOGGING_TOKEN_REQ = 76,	/* SAE */
+	IEEE80211_STATUS_UNKNOWN_PASSWORD_ID	= 123,	/* SAE */
+	IEEE80211_STATUS_H2E			= 126	/* SAE hash-to-element */
 };
 
 #define	IEEE80211_WEP_KEYLEN			5	/* 40bit */
@@ -1207,6 +1212,7 @@ struct ieee80211_eapol_key {
 
 	u_int8_t	info[2];
 #define EAPOL_KEY_VERSION_MASK	0x7
+#define EAPOL_KEY_DESC_USE_AKM	0		/* the AKM decides (SAE) */
 #define EAPOL_KEY_DESC_V1	1
 #define EAPOL_KEY_DESC_V2	2
 #define EAPOL_KEY_DESC_V3	3		/* 11r */
@@ -1254,6 +1260,31 @@ struct ieee80211_ptk {
 #define IEEE80211_STATUS_BAD_FC_GROUP	77	/* finite cyclic group not supported */
 #endif
 #define IEEE80211_SAE_HNP_COMPAT	1	/* hunting-and-pecking for non-H2E APs */
+#define IEEE80211_EID_EXT_ANTI_CLOGGING_TOKEN 93
+
+/* RSN Extension element (RSNXE): capabilities in the low octet */
+#define IEEE80211_RSNXECAP_LENGTH_MASK	0x0f
+#define IEEE80211_RSNXECAP_H2E		0x20	/* SAE hash-to-element */
+#define IEEE80211_RSNXE_MAXLEN		8
+
+static __inline u_int8_t *
+ieee80211_add_rsnxe_h2e(u_int8_t *frm)
+{
+	*frm++ = IEEE80211_ELEMID_RSNXE;
+	*frm++ = 1;
+	*frm++ = IEEE80211_RSNXECAP_H2E;	/* field length 0: one octet */
+	return frm;
+}
+
+/*
+ * Hunting-and-pecking (no H2E) is not allowed on 6 GHz; elsewhere it is
+ * what WPA3 APs without H2E use.
+ */
+static __inline int
+ieee80211_sae_hnp_allowed(int h2e, u_int16_t freq)
+{
+	return !h2e && freq != 0 && freq < 5925;
+}
 #define IEEE80211_SMKID_LEN	16
 
 /*

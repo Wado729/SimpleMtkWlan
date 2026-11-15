@@ -352,6 +352,8 @@ ieee80211_ioctl_setwpaparms(struct ieee80211com *ic,
 		ic->ic_rsnakms |= IEEE80211_AKM_PSK;
 	if (wpa->i_akms & IEEE80211_WPA_AKM_SHA256_PSK)
 		ic->ic_rsnakms |= IEEE80211_AKM_SHA256_PSK;
+	if (wpa->i_akms & IEEE80211_WPA_AKM_SAE)
+		ic->ic_rsnakms |= IEEE80211_AKM_SAE;
 	if (wpa->i_akms & IEEE80211_WPA_AKM_8021X)
 		ic->ic_rsnakms |= IEEE80211_AKM_8021X;
 	if (wpa->i_akms & IEEE80211_WPA_AKM_SHA256_8021X)

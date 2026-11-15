@@ -2819,6 +2819,15 @@ common:
 		if (sc->sc_7927_he)
 			ic->ic_caps |= IEEE80211_C_HE;
 		/*
+		 * Phase 4f.2: management frame protection (WPA3 needs it).
+		 * net80211 uses it only with SAE or an AP that requires it;
+		 * unicast protected frames are en/decrypted by the chip with
+		 * the PTK (mgmt_prot set in STA_REC_KEY_V3), BIP in software.
+		 * -mtk7927nomfp turns it (and with it SAE) off.
+		 */
+		if (!PE_parse_boot_argn("-mtk7927nomfp", &off, sizeof(off)))
+			ic->ic_caps |= IEEE80211_C_MFP;
+		/*
 		 * RX Block Ack windows up to 256 MPDUs, as mt792x sets
 		 * max_rx_aggregation_subframes (IEEE80211_MAX_AMPDU_BUF_HE):
 		 * longer A-MPDUs between Block Acks, both ways (TX: the AP's ADDBA
@@ -15654,7 +15663,13 @@ MtkMwx::debugPoll()
 				    ic->ic_state == IEEE80211_S_AUTH ?
 				    "AUTH" : "ASSOC", retries,
 				    ether_sprintf(ic->ic_bss->ni_macaddr));
-				if (ic->ic_state == IEEE80211_S_AUTH)
+				/* SAE: the confirm (seq 2) once the AP's commit is in */
+				if (ic->ic_state == IEEE80211_S_AUTH &&
+				    ic->ic_bss->ni_sae.sae_state ==
+				    SAE_STATE_CONFIRMED)
+					IEEE80211_SEND_MGMT(ic, ic->ic_bss,
+					    IEEE80211_FC0_SUBTYPE_AUTH, 2);
+				else if (ic->ic_state == IEEE80211_S_AUTH)
 					IEEE80211_SEND_MGMT(ic, ic->ic_bss,
 					    IEEE80211_FC0_SUBTYPE_AUTH, 1);
 				else

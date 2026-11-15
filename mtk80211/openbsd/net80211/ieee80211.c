@@ -931,6 +931,10 @@ ieee80211_watchdog(struct _ifnet *ifp)
             if (ni)
                 ni->ni_fails++;
             /* Try more times to join, some drivers will timeout when doing auth/assoc */
+            /* SAE: resend the last commit/confirm (3 tries), not a rejoin */
+            if (ic->ic_state == IEEE80211_S_AUTH && ni &&
+                ieee80211_auth_sae_timeout(ic, ic->ic_bss, ni->ni_fails))
+                goto done;
             if (ic->ic_state == IEEE80211_S_AUTH && ni && ni->ni_fails < 3) {
                 ieee80211_node_join_bss(ic, ni);
                 goto done;

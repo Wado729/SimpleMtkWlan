@@ -332,6 +332,38 @@ struct ieee80211_rx_ba {
  * state.  This is done by overriding the ic_node_* methods in
  * the ieee80211com structure.
  */
+/* SAE (WPA3-Personal) exchange with one AP, as in OpenBSD/Eric-AirportItlwm */
+#define SAE_STATE_NOTHING		0x00
+#define SAE_EVENT_COMMIT_SENT		0x01
+#define SAE_EVENT_PEER_COMMIT_RECEIVED	0x02
+#define SAE_EVENT_CONFIRM_SENT		0x04
+#define SAE_EVENT_PEER_CONFIRM_RECEIVED	0x08
+#define SAE_STATE_COMMITTED	SAE_EVENT_COMMIT_SENT
+#define SAE_STATE_CONFIRMED	(SAE_EVENT_COMMIT_SENT | SAE_EVENT_CONFIRM_SENT | \
+	SAE_EVENT_PEER_COMMIT_RECEIVED)
+#define SAE_STATE_ACCEPTED	(SAE_EVENT_COMMIT_SENT | SAE_EVENT_CONFIRM_SENT | \
+	SAE_EVENT_PEER_COMMIT_RECEIVED | SAE_EVENT_PEER_CONFIRM_RECEIVED)
+
+struct ieee80211_sae {
+	uint8_t sae_scalar[IEEE80211_SAE_MAX_ECC_PRIME_LEN];
+	uint8_t sae_element_x[IEEE80211_SAE_MAX_ECC_PRIME_LEN];
+	uint8_t sae_element_y[IEEE80211_SAE_MAX_ECC_PRIME_LEN];
+	uint8_t sae_rand[IEEE80211_SAE_MAX_ECC_PRIME_LEN];
+	uint8_t sae_peer_scalar[IEEE80211_SAE_MAX_ECC_PRIME_LEN];
+	uint8_t sae_peer_element_x[IEEE80211_SAE_MAX_ECC_PRIME_LEN];
+	uint8_t sae_peer_element_y[IEEE80211_SAE_MAX_ECC_PRIME_LEN];
+	uint8_t sae_kck[IEEE80211_SAE_MAX_ECC_PRIME_LEN];
+	uint8_t sae_pmk[IEEE80211_PMK_LEN];
+	uint8_t sae_pmkid[IEEE80211_PMKID_LEN];
+	uint8_t sae_token[IEEE80211_SAE_TOKEN_MAX_LEN];
+	size_t sae_token_len;
+	int sae_state;
+	int sae_h2e;		/* PWE derived with hash-to-element */
+	uint8_t sae_ownaddr[IEEE80211_ADDR_LEN];
+	uint16_t sae_send_confirm;
+	uint16_t sae_peer_send_confirm;
+};
+
 struct ieee80211_node {
 	RB_ENTRY(ieee80211_node)	ni_node;
 
@@ -400,6 +432,10 @@ struct ieee80211_node {
 	u_int64_t		ni_reqreplaycnt;
 	u_int8_t		ni_reqreplaycnt_ok;
 	u_int8_t		*ni_rsnie;
+	u_int8_t		ni_rsnxecaps;	/* RSNXE capabilities (H2E) */
+	u_int8_t		ni_rsnxe[2 + IEEE80211_RSNXE_MAXLEN];
+	u_int8_t		ni_rsnxe_len;
+	struct ieee80211_sae	ni_sae;
     u_int8_t        *ni_rsnie_tlv;
     uint32_t        ni_rsnie_tlv_len;
 	struct ieee80211_key	ni_pairwise_key;
@@ -663,6 +699,8 @@ ieee80211_node_supports_sgi(struct ieee80211_node *ni)
 }
 
 struct ieee80211com;
+int	ieee80211_node_allow_wpa3(struct ieee80211com *,
+	    const struct ieee80211_node *);
 
 typedef void ieee80211_iter_func(void *, struct ieee80211_node *);
 

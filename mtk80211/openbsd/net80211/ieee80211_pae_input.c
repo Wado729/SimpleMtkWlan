@@ -148,10 +148,13 @@ ieee80211_eapol_key_input(struct ieee80211com *ic, mbuf_t m,
     
     /* discard EAPOL-Key frames with an unknown descriptor version */
     desc = info & EAPOL_KEY_VERSION_MASK;
-    if (desc < EAPOL_KEY_DESC_V1 || desc > EAPOL_KEY_DESC_V3)
+    if (ni->ni_rsnakms == IEEE80211_AKM_SAE) {
+        /* SAE: descriptor version 0, the AKM defines the algorithms */
+        if (desc != EAPOL_KEY_DESC_USE_AKM)
+            goto done;
+    } else if (desc < EAPOL_KEY_DESC_V1 || desc > EAPOL_KEY_DESC_V3)
         goto done;
-    
-    if (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
+    else if (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
         if (desc != EAPOL_KEY_DESC_V3)
             goto done;
     } else if (ni->ni_rsncipher == IEEE80211_CIPHER_CCMP ||
@@ -273,6 +276,11 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
             return;
         }
         memcpy(ni->ni_pmk, pmk->pmk_key, IEEE80211_PMK_LEN);
+    } else if (ni->ni_rsnakms == IEEE80211_AKM_SAE) {
+        /* the PMK the SAE exchange produced (never the passphrase PSK) */
+        if (ni->ni_sae.sae_state != SAE_STATE_ACCEPTED)
+            return;
+        memcpy(ni->ni_pmk, ni->ni_sae.sae_pmk, IEEE80211_PMK_LEN);
     } else    /* use pre-shared key */
         memcpy(ni->ni_pmk, ic->ic_psk, IEEE80211_PMK_LEN);
     ni->ni_flags |= IEEE80211_NODE_PMK;
@@ -405,6 +413,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
     struct ieee80211_key *k;
     const u_int8_t *frm, *efrm;
     const u_int8_t *rsnie1, *rsnie2, *gtk, *igtk;
+    const u_int8_t *rsnxe = NULL;
     u_int16_t info, reason = 0;
     int keylen, deferlink = 0;
     
@@ -481,6 +490,10 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
                     rsnie2 = frm;
                 /* ignore others if more than two RSN IEs */
                 break;
+            case IEEE80211_ELEMID_RSNXE:
+                if (rsnxe == NULL)
+                    rsnxe = frm;
+                break;
             case IEEE80211_ELEMID_VENDOR:
                 if (frm[1] < 4)
                     break;
@@ -512,6 +525,26 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
     if (rsnie1 == NULL) {
         DPRINTF(("missing RSN IE\n"));
         return;
+    }
+    if (ni->ni_rsnakms == IEEE80211_AKM_SAE) {
+        /* WPA3 uses MFP: the AP must give us the IGTK */
+        if (igtk == NULL) {
+            XYLog("%s: SAE: no IGTK in message 3\n", __FUNCTION__);
+            reason = IEEE80211_REASON_AUTH_LEAVE;
+            goto deauth;
+        }
+        /*
+         * H2E downgrade protection: the RSNXE in the MIC-protected M3
+         * must be the one the AP sent before association (802.11-2020
+         * 12.7.6.4).
+         */
+        if (ni->ni_sae.sae_h2e && (rsnxe == NULL ||
+            (size_t)rsnxe[1] + 2 != ni->ni_rsnxe_len ||
+            memcmp(rsnxe, ni->ni_rsnxe, ni->ni_rsnxe_len) != 0)) {
+            XYLog("%s: SAE: RSNXE in message 3 differs\n", __FUNCTION__);
+            reason = IEEE80211_REASON_AUTH_LEAVE;
+            goto deauth;
+        }
     }
     /* key data must be encrypted if GTK is included */
     if (gtk != NULL && !(info & EAPOL_KEY_ENCRYPTED)) {

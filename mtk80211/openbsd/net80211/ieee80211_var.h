@@ -58,7 +58,19 @@
  * Definitions for IEEE 802.11 drivers.
  */
 
-#define explicit_bzero bzero
+/*
+ * A wipe the compiler cannot drop as a dead store (phase 4f.2: SAE secrets
+ * on the stack); plain bzero may be removed before a return.
+ */
+static inline void
+explicit_bzero_mtk(void *p, size_t n)
+{
+	volatile unsigned char *v = (volatile unsigned char *)p;
+
+	while (n--)
+		*v++ = 0;
+}
+#define explicit_bzero explicit_bzero_mtk
 #define nitems(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 
@@ -481,6 +493,14 @@ struct ieee80211com {
 	u_int8_t		ic_scan_count;	/* count scans */
 	u_int32_t		ic_flags;	/* state flags */
 	u_int32_t		ic_xflags;	/* more flags */
+	/* SAE (WPA3-Personal): password, H2E PT and the PWE for this BSS */
+	u_int8_t		ic_sae_pt[IEEE80211_SAE_MAX_ECC_PRIME_LEN * 2];
+	u_int8_t		ic_sae_pwe[IEEE80211_SAE_MAX_ECC_PRIME_LEN * 2];
+	u_int8_t		ic_sae_password[63];
+	size_t			ic_sae_password_len;
+	int			ic_sae_pt_valid;
+	int			ic_sae_pwe_valid;
+	int			ic_sae_prefer;	/* SAE also where the AP offers PSK */
     
 	u_int32_t		ic_userflags;	/* yet more flags */
 	u_int32_t		ic_caps;	/* capabilities */
@@ -671,6 +691,7 @@ struct ieee80211_ess {
 
 /* ic_xflags */
 #define	IEEE80211_F_TX_MGMT_ONLY 0x00000001	/* leave data frames on ifq */
+#define	IEEE80211_F_SAE_PWE	 0x00000002	/* STATUS: SAE PWE set */
 
 /* ic_caps */
 #define	IEEE80211_C_WEP		0x00000001	/* CAPABILITY: WEP available */

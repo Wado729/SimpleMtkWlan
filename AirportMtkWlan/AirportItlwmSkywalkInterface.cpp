@@ -338,6 +338,12 @@ getAUTH_TYPE(struct apple80211_authtype_data *ad)
     ad->version = APPLE80211_VERSION;
     ad->authtype_lower = current_authtype_lower;
     ad->authtype_upper = current_authtype_upper;
+    // Phase 4f.2: what this join actually uses (SAE or WPA2-PSK)
+    ieee80211com *ic = fHalService ? fHalService->get80211Controller() : nullptr;
+    if (ic && ic->ic_bss && (ic->ic_state == IEEE80211_S_ASSOC ||
+        ic->ic_state == IEEE80211_S_RUN) &&
+        ic->ic_bss->ni_rsnakms == IEEE80211_AKM_SAE)
+        ad->authtype_upper = APPLE80211_AUTHTYPE_WPA3_SAE;
     return kIOReturnSuccess;
 }
 

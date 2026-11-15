@@ -685,10 +685,21 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
                     subtype == IEEE80211_FC0_SUBTYPE_DEAUTH ||
                     subtype == IEEE80211_FC0_SUBTYPE_ACTION) {
                     if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
-                        !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
+                        !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED) &&
+                        !(rxi->rxi_flags & IEEE80211_RXI_HWDEC)) {
                         /* unicast mgmt not encrypted */
                         goto out;
                     }
+                    if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+                        (rxi->rxi_flags & IEEE80211_RXI_HWDEC)) {
+                        /*
+                         * Decrypted by the hardware (phase 4f.2, MT7927):
+                         * replay check and IV strip only; a software
+                         * decrypt of the plaintext would drop it.
+                         */
+                        if (wh->i_fc[1] & IEEE80211_FC1_PROTECTED)
+                            m = ieee80211_input_hwdecrypt(ic, ni, m, rxi);
+                    } else
                     /* do software decryption */
                     m = ieee80211_decrypt(ic, m, ni);
                     if (m == NULL) {
@@ -1503,6 +1514,8 @@ ieee80211_parse_rsn_akm(const u_int8_t selector[4])
                 return IEEE80211_AKM_SHA256_8021X;
             case 6:    /* PSK with SHA256 KDF */
                 return IEEE80211_AKM_SHA256_PSK;
+            case 8:    /* SAE */
+                return IEEE80211_AKM_SAE;
         }
     }
     return IEEE80211_AKM_NONE;    /* ignore unknown AKMs */
@@ -1703,6 +1716,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     const u_int8_t *frm, *efrm;
     const u_int8_t *tstamp, *ssid, *rates, *xrates, *edcaie, *wmmie;
     const u_int8_t *rsnie, *wpaie, *htcaps, *htop;
+    const u_int8_t *rsnxe = NULL;    /* RSN Extension (SAE H2E) */
     const uint8_t *csa;
     const uint8_t *vhtcap;
     const uint8_t *vhtopmode;
@@ -1796,6 +1810,9 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
                 break;
             case IEEE80211_ELEMID_RSN:
                 rsnie = frm;
+                break;
+            case IEEE80211_ELEMID_RSNXE:
+                rsnxe = frm;
                 break;
             case IEEE80211_ELEMID_EDCAPARMS:
                 edcaie = frm;
@@ -2078,6 +2095,15 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         ni->ni_rsngroupcipher = (enum ieee80211_cipher)0;
         ni->ni_rsngroupmgmtcipher = (enum ieee80211_cipher)0;
         ni->ni_rsncaps = 0;
+        /* RSNXE: kept as sent, for H2E and the M3 check (802.11-2020 12.7.6.4) */
+        ni->ni_rsnxecaps = 0;
+        ni->ni_rsnxe_len = 0;
+        if (rsnxe != NULL && rsnxe[1] >= 1 &&
+            rsnxe[1] <= IEEE80211_RSNXE_MAXLEN) {
+            memcpy(ni->ni_rsnxe, rsnxe, 2 + rsnxe[1]);
+            ni->ni_rsnxe_len = 2 + rsnxe[1];
+            ni->ni_rsnxecaps = rsnxe[2];
+        }
         
         if (rsnie != NULL &&
             ieee80211_parse_rsn(ic, rsnie, &rsn) == 0) {
@@ -2313,6 +2339,13 @@ ieee80211_recv_auth(struct ieee80211com *ic, mbuf_t m,
     status = LE_READ_2(frm); frm += 2;
     DPRINTF(("auth %d seq %d from %s\n", algo, seq,
              ether_sprintf((u_int8_t *)wh->i_addr2)));
+    
+    /* SAE (WPA3-Personal): commit / confirm exchange */
+    if (algo == IEEE80211_AUTH_ALG_SAE) {
+        ieee80211_auth_sae(ic, wh, frm, mbuf_len(m) - sizeof(*wh) - 6,
+                           ni, rxi, seq, status);
+        return;
+    }
     
     /* only "open" auth mode is supported */
     if (algo != IEEE80211_AUTH_ALG_OPEN) {

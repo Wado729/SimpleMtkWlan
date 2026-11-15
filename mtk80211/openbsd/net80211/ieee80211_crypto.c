@@ -513,6 +513,7 @@ ieee80211_eapol_key_mic(struct ieee80211_eapol_key *key, const u_int8_t *kck)
         /* truncate HMAC-SHA1 to its 128 MSBs */
         memcpy(key->mic, digest, EAPOL_KEY_MIC_LEN);
         break;
+    case EAPOL_KEY_DESC_USE_AKM:	/* SAE (AKM 8): AES-128-CMAC, AES key wrap */
     case EAPOL_KEY_DESC_V3:
         AES_CMAC_Init(&ctx.cmac);
         AES_CMAC_SetKey(&ctx.cmac, kck);
@@ -579,6 +580,7 @@ ieee80211_eapol_key_encrypt(struct ieee80211com *ic,
         rc4_crypt(&ctx.rc4, data, data, len);
         break;
     case EAPOL_KEY_DESC_V2:
+    case EAPOL_KEY_DESC_USE_AKM:	/* SAE (AKM 8): AES-128-CMAC, AES key wrap */
     case EAPOL_KEY_DESC_V3:
         if (len < 16 || (len & 7) != 0) {
             /* insert padding */
@@ -632,6 +634,7 @@ ieee80211_eapol_key_decrypt(struct ieee80211_eapol_key *key,
         rc4_crypt(&ctx.rc4, data, data, len);
         return 0;
     case EAPOL_KEY_DESC_V2:
+    case EAPOL_KEY_DESC_USE_AKM:	/* SAE (AKM 8): AES-128-CMAC, AES key wrap */
     case EAPOL_KEY_DESC_V3:
         /* Key Data Length must be a multiple of 8 */
         if (len < 16 + 8 || (len & 7) != 0)
@@ -652,6 +655,10 @@ ieee80211_pmksa_add(struct ieee80211com *ic, enum ieee80211_akm akm,
     const u_int8_t *macaddr, const u_int8_t *key, u_int32_t lifetime)
 {
 	struct ieee80211_pmk *pmk;
+
+	/* SAE PMKIDs come from the commit scalars, not from the PMK */
+	if (akm == IEEE80211_AKM_SAE)
+		return NULL;
 
 	/* check if an entry already exists for this (STA,AKMP) */
 	TAILQ_FOREACH(pmk, &ic->ic_pmksa, pmk_next) {

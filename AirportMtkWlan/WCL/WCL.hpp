@@ -358,6 +358,17 @@ inline bool validIEs(const uint8_t *data, size_t length) {
     return true;
 }
 
+// Forget the SAE password, H2E PT and PWE (with the PSK, phase 4f.2).
+inline void clearSAE(ieee80211com *ic) {
+    volatile uint8_t *v;
+    v = ic->ic_sae_password; for (size_t i = 0; i < sizeof(ic->ic_sae_password); ++i) v[i] = 0;
+    v = ic->ic_sae_pt; for (size_t i = 0; i < sizeof(ic->ic_sae_pt); ++i) v[i] = 0;
+    v = ic->ic_sae_pwe; for (size_t i = 0; i < sizeof(ic->ic_sae_pwe); ++i) v[i] = 0;
+    ic->ic_sae_password_len = 0;
+    ic->ic_sae_pt_valid = ic->ic_sae_pwe_valid = 0;
+    ic->ic_xflags &= ~IEEE80211_F_SAE_PWE;
+}
+
 // Length of the run of complete elements at the start (a truncated or
 // malformed trailing element is dropped instead of the whole frame).
 inline size_t validIEPrefix(const uint8_t *data, size_t length) {

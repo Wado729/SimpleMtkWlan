@@ -179,6 +179,12 @@ extern	void ieee80211_reset_erp(struct ieee80211com *);
 extern	void ieee80211_set_shortslottime(struct ieee80211com *, int);
 extern	void ieee80211_auth_open_confirm(struct ieee80211com *,
 	    struct ieee80211_node *, uint16_t);
+int	ieee80211_auth_sae_timeout(struct ieee80211com *, struct ieee80211_node *,
+	    unsigned int);
+extern	void ieee80211_auth_sae(struct ieee80211com *,
+	    const struct ieee80211_frame *, const uint8_t *, size_t,
+	    struct ieee80211_node *, struct ieee80211_rxinfo *, u_int16_t,
+	    u_int16_t);
 extern	void ieee80211_auth_open(struct ieee80211com *,
 	    const struct ieee80211_frame *, struct ieee80211_node *,
 	    struct ieee80211_rxinfo *rs, u_int16_t, u_int16_t);
