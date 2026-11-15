@@ -12446,6 +12446,9 @@ mt7927_csa_task(void *arg)
 	if (sc->sc_7927_csa_chan == sc->sc_7927_bss.chan &&
 	    sc->sc_7927_csa_band == sc->sc_7927_bss.band)
 		return;
+	/* re-review S2: an earlier run already decided to rejoin */
+	if (sc->sc_7927_csa_leave)
+		return;
 	sc->sc_7927_csa_switches++;
 	/*
 	 * What is not done in place is done by rejoining on the new channel
@@ -12472,10 +12475,17 @@ mt7927_csa_task(void *arg)
 	}
 	nb = sc->sc_7927_bss;
 	nb.chan = sc->sc_7927_csa_chan;
-	if (sc->sc_7927_csa_cbw >= 0)
+	if (sc->sc_7927_csa_cbw >= 0 && sc->sc_7927_csa_cbw <= nb.bw)
 		nb.bw = (uint8_t)sc->sc_7927_csa_cbw;
-	nb.center_chan = sc->sc_7927_csa_center ? sc->sc_7927_csa_center :
-	    mt7927_csa_center(nb.band, nb.chan, nb.bw);
+	/*
+	 * Re-review S1: never wider than associated (STA_REC and net80211
+	 * describe that width): keep ours, with its own center.
+	 */
+	if (sc->sc_7927_csa_cbw > (int)sc->sc_7927_bss.bw)
+		nb.center_chan = mt7927_csa_center(nb.band, nb.chan, nb.bw);
+	else
+		nb.center_chan = sc->sc_7927_csa_center ? sc->sc_7927_csa_center :
+		    mt7927_csa_center(nb.band, nb.chan, nb.bw);
 	if (nb.center_chan == 0) {
 		nb.bw = 0;
 		nb.center_chan = nb.chan;
