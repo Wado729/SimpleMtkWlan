@@ -282,7 +282,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLScan(const AirportWCL::ScanReques
         }
         return kIOReturnNotReady;
     }
-    if (joinPending)
+    if (joinPending || roamPending)     // phase 4u
         return kIOReturnBusy;
     if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
         return kIOReturnBusy;
@@ -655,6 +655,8 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         explicit_bzero(&join, sizeof(join));
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }
+    if (roamPending)            // phase 4u: macOS's join wins over a roam
+        leaveWCLNetwork("new join during a roam");
     if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
         leaveWCLNetwork("new join");
     ieee80211_disable_rsn(ic);
@@ -866,6 +868,10 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
 void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventSource *)
 {
     auto self = OSDynamicCast(AirportItlwmSkywalkInterface, owner);
+    if (self && !self->wclStopping && self->roamPending) {
+        self->finishWCLRoam(false, "timeout");     // phase 4u
+        return;
+    }
     if (self && !self->wclStopping) {
         self->finishWCLJoin(1, 1004, kIOReturnTimeout);
         self->leaveWCLNetwork("join timeout");
@@ -875,6 +881,8 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
 IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork(const char *why)
 {
     ieee80211com *ic = fHalService->get80211Controller();
+    bool abandonedRoam = roamPending;   // phase 4u: macOS's leave or join ends a roam
+    abortWCLRoam(kIOReturnAborted, why);
     XYLog("WCL leave (%s): state %d joinPending %d assoc %d firstBeacon %d bssValid %d "
         "join beacons %u assoc beacons %u port %d\n", why, ic->ic_state, joinPending,
         assocNotified, firstBeaconNotified, wclBssValid, wclJoinBeacons,
@@ -933,6 +941,8 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork(const char *why)
     ic->ic_flags &= ~(IEEE80211_F_PSK | IEEE80211_F_DESBSSID);
     ic->ic_des_esslen = 0;
     bzero(ic->ic_des_essid, sizeof(ic->ic_des_essid));
+    if (abandonedRoam)
+        syncLinkAfterRoam();    // phase 4u
     return kIOReturnSuccess;
 }
 
@@ -1018,11 +1028,251 @@ void AirportItlwmSkywalkInterface::synthesizeWCLFirstBeacon()
     notifyWCLFirstBeacon("cached scan beacon");
 }
 
+/*
+ * Phase 4u: roaming between the APs of the joined network (mesh nodes).
+ * A real Mac's Broadcom firmware roams by itself and tells WCL in a fixed
+ * order (AppleBCMWLANCore: roam scan start 137, reassoc 73, link up 216 with
+ * the new BSSID, roam completion 80); WCLNetManager::linkUp then reads the
+ * new BSS (updateBss), and WCLRoamManager keeps its statistics. Here the
+ * driver decides like a Mac with default settings (the user's choice):
+ * only on a weak link (averaged signal, phase 4t, at or below -72 dBm) and
+ * only to an AP of the same network at least 8 dB stronger, heard in the
+ * last 30 s (macOS's own associated scans keep the list fresh); not in the
+ * first minute of a link, at most one try a minute, and an AP that failed
+ * is left alone for 5 minutes. No fast transition on the user's network,
+ * so a roam is a full join (SAE, association, 4-way) with the password the
+ * join gave: about 1.5-2 s without data, link kept up for macOS.
+ * -mtk7927noroam turns it off.
+ */
+static constexpr uint64_t kRoamSettleMs = 60000;
+static constexpr uint64_t kRoamRetryMs = 60000;
+static constexpr uint64_t kRoamBlockMs = 300000;
+static constexpr uint64_t kRoamHeardMs = 30000;
+static constexpr uint32_t kRoamTimeoutMs = 10000;       // 6 GHz: its channel alone
+static constexpr uint32_t kRoamSweepTimeoutMs = 15000;  // otherwise a full sweep first
+
+void AirportItlwmSkywalkInterface::checkWCLRoam()
+{
+    static int disabled = -1;
+    if (disabled < 0) {
+        char v[8];
+        disabled = PE_parse_boot_argn("-mtk7927noroam", v, sizeof(v)) ? 1 : 0;
+    }
+    ieee80211com *ic = fHalService->get80211Controller();
+    if (disabled || wclStopping || roamPending || joinPending || scanPending ||
+        !portAuthorized || ic->ic_opmode != IEEE80211_M_STA ||
+        ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL ||
+        ic->ic_wcl_enterprise || !(ic->ic_flags & IEEE80211_F_PSK) ||
+        !(ic->ic_flags & IEEE80211_F_RSNON))
+        return;
+    uint64_t now = airport_up_time();
+    if (now - linkUpMs < kRoamSettleMs || now - roamLastTryMs < kRoamRetryMs)
+        return;
+    ieee80211_node *bss = ic->ic_bss;
+    int cur = int(bss->ni_rssi) - 100;      // dBm, averaged (phase 4t)
+    if (bss->ni_rssi == 0 || cur > AirportWCL::kRoamTriggerDbm) {
+        roamConfirm.armed = false;
+        return;
+    }
+    ieee80211_node *best = NULL, *ni;
+    int bestRssi = -128;
+    RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+        if (ni == bss || IEEE80211_ADDR_EQ(ni->ni_macaddr, bss->ni_macaddr) ||
+            ni->ni_esslen != bss->ni_esslen ||
+            memcmp(ni->ni_essid, bss->ni_essid, bss->ni_esslen) != 0 ||
+            !(ni->ni_rsnakms & bss->ni_rsnakms) || ni->ni_fails != 0 ||
+            ni->ni_age_ts == 0 || now - ni->ni_age_ts > kRoamHeardMs ||
+            ni->ni_rssi == 0 || ni->ni_chan == NULL ||
+            ni->ni_chan == IEEE80211_CHAN_ANYC)
+            continue;
+        if (now < roamBlockUntilMs && IEEE80211_ADDR_EQ(ni->ni_macaddr, roamBlockBSSID))
+            continue;
+        int r = int(ni->ni_rssi) - 100;
+        if (r > bestRssi) {
+            bestRssi = r;
+            best = ni;
+        }
+    }
+    bool wanted = best != NULL && AirportWCL::roamWanted(cur, bestRssi);
+    bool go = false;
+    if (!wanted)
+        roamConfirm.armed = false;
+    else
+        go = AirportWCL::roamConfirmed(roamConfirm, best->ni_macaddr, best->ni_age_ts);
+    if (go || (wanted && roamConfirm.armed && roamLastLogMs != roamConfirm.sampleMs) ||
+        now - roamLastLogMs >= 30000) {
+        roamLastLogMs = wanted ? roamConfirm.sampleMs : now;
+        XYLog("WCL roam check: %s at %d dBm (average), best other AP %s at %d dBm%s\n",
+              ether_sprintf(bss->ni_macaddr), cur,
+              best ? ether_sprintf(best->ni_macaddr) : "none", best ? bestRssi : 0,
+              go ? ": roaming" : wanted ? ": waiting for a second reading" : "");
+    }
+    if (go)
+        startWCLRoam(best);
+}
+
+bool AirportItlwmSkywalkInterface::startWCLRoam(ieee80211_node *target)
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    uint64_t now = airport_up_time();
+    roamLastTryMs = now;
+    uint8_t to[6];
+    memcpy(to, target->ni_macaddr, 6);
+    uint8_t chan = uint8_t(ieee80211_chan2ieee(ic, target->ni_chan));
+    bool sixGHz = IEEE80211_IS_CHAN_6GHZ(target->ni_chan);
+    memcpy(roamFromBSSID, joinBSSID, 6);
+
+    AirportWCL::RoamScanStartEvent start = {};
+    start.reason = AirportWCL::kRoamReasonLowRSSI;
+    instance->postMessage(this, AirportWCL::RoamScanStart, &start, sizeof(start), true);
+    roamPending = true;
+    roamStartMs = now;
+
+    // Leave the old AP as leaveWCLNetwork does (phase 4i): protected deauth
+    // while RSN is on, no data after it; the HAL lets it leave the chip
+    // before the station entry goes.
+    timeout_del(&ic->ic_assoc_to);
+    int rv = -1;
+    if (!ic->ic_leave_pending) {
+        ic->ic_xflags |= IEEE80211_F_TX_MGMT_ONLY;
+        ic->ic_leave_pending = 1;
+        rv = IEEE80211_SEND_MGMT(ic, ic->ic_bss, IEEE80211_FC0_SUBTYPE_DEAUTH,
+                                 IEEE80211_REASON_AUTH_LEAVE);
+    }
+    ic->ic_deauth_reason = IEEE80211_REASON_AUTH_LEAVE;
+    XYLog("WCL roam: from %s, deauth -> %d; to %s on channel %u%s\n",
+          ether_sprintf(roamFromBSSID), rv, ether_sprintf(to), chan,
+          sixGHz ? " (6 GHz)" : "");
+    // Aim the join at the target; the network's credentials (PSK, SAE
+    // password and PT: the same SSID) stay as the join set them.
+    memcpy(ic->ic_des_bssid, to, 6);
+    memcpy(joinBSSID, to, 6);
+    ic->ic_flags |= IEEE80211_F_DESBSSID;
+    ic->ic_wcl_join_chan6g = sixGHz ? chan : 0;    // 4p/4r: its channel alone first
+    ic->ic_wcl_join_scans = 0;
+    ic->ic_wcl_join_requested = true;
+    ic->ic_wcl_scan_requested = false;
+    // review: the old AP's BSS and beacon information stay readable until
+    // the new one's beacons replace them (assocNotified again at
+    // association). portAuthorized stays set: the held link down never
+    // reaches handleWCLLink, so link-quality reports go on through the roam.
+    assocNotified = firstBeaconNotified = false;
+    joinTimer->setTimeoutMS(sixGHz ? kRoamTimeoutMs : kRoamSweepTimeoutMs);
+    if (ic->ic_newstate(ic, IEEE80211_S_SCAN, -1) != 0) {
+        finishWCLRoam(false, "could not start");
+        return false;
+    }
+    return true;
+}
+
+void AirportItlwmSkywalkInterface::finishWCLRoam(bool ok, const char *why)
+{
+    if (!roamPending)
+        return;
+    // review: WCL reads the BSS (IOC 0x1b1, wclBssInfo) right after the
+    // link-up and leaves on a failure or keeps the old AP: it must be the
+    // new AP's by then
+    if (ok && !publishRoamBss()) {
+        ok = false;
+        why = "no BSS information for the new AP";
+    }
+    roamPending = false;
+    joinTimer->cancelTimeout();
+    uint64_t now = airport_up_time();
+    XYLog("WCL roam %s to %s after %llu ms (%s)\n", ok ? "done" : "failed",
+          ether_sprintf(joinBSSID), now - roamStartMs, why);
+    if (ok) {
+        assocNotified = firstBeaconNotified = true;
+        linkUpMs = now;
+        AirportWCL::ReassocEvent reassoc = {};
+        instance->postMessage(this, AirportWCL::Reassoc, &reassoc, sizeof(reassoc), true);
+        AirportWCL::LinkStatusEvent link = {};
+        memcpy(link.bssid, joinBSSID, 6);
+        link.up = 1;
+        link.reason = 255;      // as the first link-up (notifyWCLFirstBeacon)
+        wclLinkIndicated = true;
+        instance->postMessage(this, AirportWCL::LinkStatus, &link, sizeof(link), true);
+    } else {
+        memcpy(roamBlockBSSID, joinBSSID, 6);
+        roamBlockUntilMs = now + kRoamBlockMs;
+        memcpy(joinBSSID, roamFromBSSID, 6);    // review: the link down names the old AP
+    }
+    AirportWCL::RoamStatus status = {};
+    status.status = ok ? 0 : uint32_t(kIOReturnTimeout);
+    status.reason = AirportWCL::kRoamReasonLowRSSI;
+    instance->postMessage(this, AirportWCL::RoamDone, &status, sizeof(status), true);
+    if (!ok) {
+        // Not on any AP now: a real disconnect, so macOS joins again
+        leaveWCLNetwork("roam failed");
+        syncLinkAfterRoam();
+    }
+    updateWCLLinkQuality(true);
+}
+
+// The new AP's BSS for WCL: from its beacons since the association (they
+// refresh wclBssInfo once assocNotified is set), else from the scan entry,
+// as synthesizeWCLFirstBeacon does.
+bool AirportItlwmSkywalkInterface::publishRoamBss()
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    auto stored = [this]() {
+        return wclBssValid && memcmp(wclBssInfo + offsetof(AirportWCL::BeaconMetadata, bssid),
+                                     joinBSSID, 6) == 0;
+    };
+    if (stored())
+        return true;
+    ieee80211_node *ni = ic->ic_bss;
+    if (ni == NULL || !IEEE80211_ADDR_EQ(ni->ni_bssid, joinBSSID) ||
+        ni->ni_rsnie_tlv == NULL || ni->ni_rsnie_tlv_len == 0)
+        return false;
+    bool was = assocNotified;
+    assocNotified = true;           // publishWCLBeacon stores it only then
+    publishWCLBeacon(ni, ni->ni_rsnie_tlv, ni->ni_rsnie_tlv_len);
+    assocNotified = was;
+    return stored();
+}
+
+// A roam ended from outside (macOS's leave or join, the driver stopping):
+// WCL got 137, so it gets the completion too.
+void AirportItlwmSkywalkInterface::abortWCLRoam(IOReturn reason, const char *why)
+{
+    if (!roamPending)
+        return;
+    roamPending = false;
+    joinTimer->cancelTimeout();
+    AirportWCL::RoamStatus status = {};
+    status.status = uint32_t(reason);
+    status.reason = AirportWCL::kRoamReasonLowRSSI;
+    instance->postMessage(this, AirportWCL::RoamDone, &status, sizeof(status), true);
+    XYLog("WCL roam to %s abandoned (%s)\n", ether_sprintf(joinBSSID), why);
+    memcpy(joinBSSID, roamFromBSSID, 6);
+}
+
+/*
+ * A roam that did not end on the new AP: the link down that
+ * AirportItlwm::setLinkStatus held back during it is passed on now, so the
+ * controller's link state is down again (otherwise the next join's link-up
+ * would look like no change and never reach WCL) and WCL hears the
+ * disconnect (handleWCLLink).
+ */
+void AirportItlwmSkywalkInterface::syncLinkAfterRoam()
+{
+    if (!wclStopping)
+        instance->setLinkStatus(kIONetworkLinkValid, NULL);
+}
+
 void AirportItlwmSkywalkInterface::handleWCLLink(bool up)
 {
     if (wclStopping)
         return;
     portAuthorized = up;
+    if (roamPending) {          // phase 4u: macOS keeps the link during a roam
+        if (up)
+            finishWCLRoam(true, "port authorized");
+        return;
+    }
+    if (up)
+        linkUpMs = airport_up_time();
     if (!up && wclLinkIndicated) {
         AirportWCL::LinkStatusEvent event = {};
         memcpy(event.bssid, joinBSSID, sizeof(event.bssid));
@@ -1069,6 +1319,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
         case IEEE80211_EVT_DRIVER_STOPPED: {
             bool ready = code == IEEE80211_EVT_DRIVER_READY;
             if (!ready) {
+                if (roamPending) {      // phase 4u (review: 80 too, timer off)
+                    abortWCLRoam(kIOReturnOffline, "driver stopped");
+                    syncLinkAfterRoam();
+                }
                 finishWCLScan(ic->ic_wcl_mac_reconfig ? kIOReturnAborted : kIOReturnOffline);
                 finishWCLJoin(1, 0, kIOReturnOffline);
                 portAuthorized = false;
@@ -1114,7 +1368,7 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                 break;
             // Retain the actual associated beacon, including its advancing TSF.
             // WCL polls BEACON_INFO to distinguish fresh reception from a stale BSS.
-            if (assocNotified && (joinPending || portAuthorized) &&
+            if (assocNotified && (joinPending || portAuthorized || roamPending) &&
                 IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID) &&
                 beacon->frame && beacon->frame_length >= 36 &&
                 beacon->frame_length <= 0x800 &&
@@ -1148,9 +1402,12 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
 #endif
                     updateWCLLinkQuality();
                 }
+                if (portAuthorized && (wclLqmBeacons % 20 == 0))
+                    checkWCLRoam();     // phase 4u: about every 2 s
             }
             if (scanPending || joinPending || ic->ic_state == IEEE80211_S_SCAN ||
-                (portAuthorized && IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID)))
+                ((portAuthorized || (roamPending && assocNotified)) &&  // phase 4u
+                 IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID)))
                 publishWCLBeacon(beacon->node, beacon->ies, beacon->length);
             if (joinPending && IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID))
                 ++wclJoinBeacons;
@@ -1173,6 +1430,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             }
             break;
         case IEEE80211_EVT_STA_ASSOC_DONE:
+            // phase 4u (review): associated with the new AP: its beacons
+            // now refresh the BSS and beacon information WCL reads
+            if (roamPending && !ic->ic_assoc_status)
+                assocNotified = true;
             if (joinPending && !assocNotified) {
                 AirportWCL::AssociationEvent event = {};
                 event.status = ic->ic_assoc_status;
@@ -1185,6 +1446,11 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             }
             break;
         case IEEE80211_EVT_STA_DEAUTH: {
+            if (roamPending) {      // phase 4u: the join to the new AP retries
+                XYLog("WCL roam: deauth (reason %u) while roaming, not reported\n",
+                      ic->ic_deauth_reason);
+                break;
+            }
             portAuthorized = false;
             updateWCLLinkQuality(true);
             AirportWCL::DeauthEvent event = {};

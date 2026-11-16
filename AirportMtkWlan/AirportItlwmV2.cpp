@@ -772,6 +772,19 @@ bool AirportItlwm::
 setLinkStatus(UInt32 status, const IONetworkMedium * activeMedium, UInt64 speed, OSData * data)
 {
     struct _ifnet *ifq = &fHalService->get80211Controller()->ic_ac.ac_if;
+#ifdef AIRPORT_WCL
+    /*
+     * Phase 4u: during a driver-side roam the link stays up for macOS (a
+     * real Mac's firmware roam does not drop it either): the down is not
+     * passed on, and the up that ends the roam still reaches WCL, which
+     * then reports the new BSSID (WCLNetManager::linkUp).
+     */
+    if (fNetIf && static_cast<AirportItlwmSkywalkInterface *>(fNetIf)->wclRoaming()) {
+        if (status & kIONetworkLinkActive)
+            getCommandGate()->runAction(setLinkStateGated, (void *)kIO80211NetworkLinkUp, (void *)0);
+        return true;
+    }
+#endif
     if (status == currentStatus) {
         return true;
     }

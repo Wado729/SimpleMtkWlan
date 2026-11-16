@@ -423,6 +423,7 @@ public:
     void handleWCLEvent(int, void *);
     void handleWCLLink(bool);
     void completeWCLScan();
+    bool wclRoaming() const { return roamPending; }    // phase 4u
 private:
     static IOReturn wclCommand(OSObject *, void *, void *, void *, void *);
     struct CountryUpdate;
@@ -448,6 +449,18 @@ private:
     void publishWCLBeacon6G(const ieee80211_beacon6g_event *);
     void notifyWCLFirstBeacon(const char *);
     void synthesizeWCLFirstBeacon();
+    // Phase 4u: driver-side roaming between APs of the joined network
+    void checkWCLRoam();
+    bool startWCLRoam(struct ieee80211_node *);
+    void finishWCLRoam(bool ok, const char *why);
+    void syncLinkAfterRoam();
+    void abortWCLRoam(IOReturn status, const char *why);
+    bool publishRoamBss();
+    AirportWCL::RoamConfirm roamConfirm = {};
+    bool roamPending = false;
+    uint64_t roamStartMs = 0, roamLastTryMs = 0, linkUpMs = 0, roamBlockUntilMs = 0;
+    uint64_t roamLastLogMs = 0;
+    uint8_t roamFromBSSID[6] = {}, roamBlockBSSID[6] = {};
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];
     bool scanPending;

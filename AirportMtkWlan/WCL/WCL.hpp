@@ -65,8 +65,69 @@ enum Message : uint32_t {
     JoinAbortComplete = 214,
     LinkStatus = 216,
     LqmUpdate = 39,
-    ScanDone = 237
+    ScanDone = 237,
+    // Phase 4u: a driver-side roam, as AppleBCMWLANCore reports one
+    // (handleRoamScanStartEvent, handleReassocEvent, postRoamCompletionStatus;
+    // WCLRoamManager's callback table takes these ids and sizes)
+    Reassoc = 73,
+    RoamDone = 80,
+    RoamScanStart = 137
 };
+
+// Phase 4u: payloads (sizes checked by WCLRoamManager's handlers)
+struct RoamScanStartEvent {
+    uint32_t status;            // 0, or an IOReturn
+    uint32_t reason;            // 0xe0820c00 | roam reason (1: low RSSI)
+    uint16_t count;
+    uint16_t reserved;
+};
+static_assert(sizeof(RoamScanStartEvent) == 0xc, "RoamScanStartEvent size");
+
+struct ReassocEvent {
+    uint32_t status;            // 0: success
+    uint32_t reason;
+};
+static_assert(sizeof(ReassocEvent) == 0x8, "ReassocEvent size");
+
+// apple80211_message_roam_status: with status 0 WCLRoamManager::roamDone
+// builds the from/to details itself (buildRoamCompletionStatus)
+struct RoamStatus {
+    uint32_t status;
+    uint32_t reason;
+    uint64_t startTime;
+    uint64_t endTime;
+    uint8_t reserved[0xa8 - 0x18];
+};
+static_assert(sizeof(RoamStatus) == 0xa8, "RoamStatus size");
+static constexpr uint32_t kRoamReasonLowRSSI = 0xe0820c01;
+
+// Phase 4u: the roam decision (host-tested in tests/roam). Like a Mac with
+// default settings: a weak link and another AP clearly stronger.
+static constexpr int kRoamTriggerDbm = -72;
+static constexpr int kRoamDeltaDb = 8;
+inline bool roamWanted(int currentDbm, int candidateDbm)
+{
+    return currentDbm <= kRoamTriggerDbm && candidateDbm >= currentDbm + kRoamDeltaDb;
+}
+
+// A candidate's signal is one reading from macOS's last scan (review): go
+// only when a second, newer reading of the same AP still qualifies.
+struct RoamConfirm {
+    uint8_t bssid[6];
+    uint64_t sampleMs;
+    bool armed;
+};
+inline bool roamConfirmed(RoamConfirm &c, const uint8_t *bssid, uint64_t sampleMs)
+{
+    if (c.armed && memcmp(c.bssid, bssid, 6) == 0 && sampleMs != c.sampleMs) {
+        c.armed = false;
+        return true;
+    }
+    memcpy(c.bssid, bssid, 6);
+    c.sampleMs = sampleMs;
+    c.armed = true;
+    return false;
+}
 
 struct SequoiaLqmUpdate {
     uint8_t rssiValid;
