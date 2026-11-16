@@ -443,7 +443,16 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
         *orxseq = nrxseq;
     }
     if (ic->ic_state > IEEE80211_S_SCAN) {
-        ni->ni_rssi = rxi->rxi_rssi;
+        /*
+         * Phase 4t (review): in STA mode every management frame maps to
+         * ic_bss (ieee80211_find_rxnode), also other networks' beacons
+         * heard in an associated scan: only the AP's own frames set its
+         * signal, which macOS shows (they made it jump -81 <-> -51).
+         */
+        if (!(ic->ic_opmode == IEEE80211_M_STA && ni == ic->ic_bss &&
+              ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_CTL ||
+               !IEEE80211_ADDR_EQ(wh->i_addr2, ni->ni_macaddr))))
+            ni->ni_rssi = rxi->rxi_rssi;
         ni->ni_rstamp = rxi->rxi_tstamp;
         ni->ni_inact = 0;
         

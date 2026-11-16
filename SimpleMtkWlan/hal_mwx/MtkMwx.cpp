@@ -616,6 +616,10 @@ struct mwx_softc {
 	bool			sc_7927_cancel_valid;	/* phase 4q: a cancelled scan's */
 	uint8_t			sc_7927_cancel_seq;	/* completion to ignore */
 	bool			sc_7927_scan_nstate;	/* phase 4r: scan from the newstate task */
+	/* phase 4t: the AP's signal, averaged as mac80211 does (EWMA, 1/8) */
+	int32_t			sc_7927_sig_avg16;	/* dBm x 16, 0: none yet */
+	int8_t			sc_7927_sig_last, sc_7927_sig_min, sc_7927_sig_max;
+	uint32_t		sc_7927_sig_n;
 	uint32_t		sc_7927_bgscans, sc_7927_bgscan_busy;	/* phase 4e.3 */
 	/* phase 4b: join */
 	bool			sc_7927_joined;		/* BSS_INFO + STA_REC set */
@@ -1041,6 +1045,48 @@ mwx_dbm_to_rssi(int dbm)
 	if (dbm >= 0)
 		return 100;
 	return dbm + 100;
+}
+
+/*
+ * Phase 4t: the signal of each frame from the AP (strongest chain, as
+ * mt7925_mac_fill_rx) went straight into ni_rssi, which macOS shows (Wi-Fi
+ * menu, link quality): one frame's value, jumping by tens of dB. mac80211
+ * keeps an average per station (DECLARE_EWMA(signal, 10, 8): each frame
+ * moves it 1/8 of the way) and reports that as signal_avg. Same here, in
+ * dBm x 16; returns the average in dBm.
+ */
+static int
+mt7927_sig_note(struct mwx_softc *sc, int dbm)
+{
+	if (sc->sc_7927_sig_n == 0) {
+		sc->sc_7927_sig_min = sc->sc_7927_sig_max = (int8_t)dbm;
+	} else {
+		if (dbm < sc->sc_7927_sig_min)
+			sc->sc_7927_sig_min = (int8_t)dbm;
+		if (dbm > sc->sc_7927_sig_max)
+			sc->sc_7927_sig_max = (int8_t)dbm;
+	}
+	sc->sc_7927_sig_n++;
+	sc->sc_7927_sig_last = (int8_t)dbm;
+	if (sc->sc_7927_sig_avg16 == 0)
+		sc->sc_7927_sig_avg16 = dbm * 16;
+	else
+		sc->sc_7927_sig_avg16 += (dbm * 16 - sc->sc_7927_sig_avg16) / 8;
+	return (sc->sc_7927_sig_avg16 - 8) / 16;	/* rounded, negative */
+}
+
+/*
+ * Phase 4t (review): in station mode ieee80211_find_rxnode() maps every
+ * management frame to ic_bss (IEEE80211_STA_ONLY), whoever sent it, so
+ * "ni == ic_bss" also holds for other networks' beacons and probe
+ * responses (associated scans, the other mesh node). The AP's own frames:
+ * not control frames (no transmitter address), sent by the AP's address.
+ */
+static bool
+mt7927_rx_from_ap(uint8_t fc0, const uint8_t *addr2, const uint8_t *ap)
+{
+	return (fc0 & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_CTL &&
+	    memcmp(addr2, ap, 6) == 0;
 }
 
 static inline uint32_t
@@ -2304,6 +2350,14 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 	/* grab a reference to the source node */
 	ni = ieee80211_find_rxnode(ic, wh);
 
+	/* phase 4t: the AP's own frames (management, non-offloaded data) into
+	 * the average; other transmitters' keep their reading (scan results) */
+	if (sc->sc_hwtype == MWX_HW_MT7927 && ic->ic_opmode == IEEE80211_M_STA &&
+	    ic->ic_state == IEEE80211_S_RUN && ni == ic->ic_bss &&
+	    mbuf_len(m) >= sizeof(struct ieee80211_frame) &&
+	    mt7927_rx_from_ap(wh->i_fc[0], wh->i_addr2, ni->ni_macaddr) &&
+	    rxi.rxi_rssi < 0 && rxi.rxi_rssi > -127)
+		rxi.rxi_rssi = mt7927_sig_note(sc, rxi.rxi_rssi);
 	if (ic->ic_max_rssi && rxi.rxi_rssi < 0)
 		rxi.rxi_rssi = mwx_dbm_to_rssi(rxi.rxi_rssi);
 
@@ -10663,6 +10717,8 @@ mt7927_join_prepare(struct mwx_softc *sc)
 	if ((rv = mt7927_band_reconfig(sc->sc_7927, &v, band_idx)) != 0)
 		return rv;
 	sc->sc_vif.band_idx = v.band_idx;
+	sc->sc_7927_sig_avg16 = 0;	/* phase 4t: a new AP, a new average */
+	sc->sc_7927_sig_n = 0;
 	MWX_DEV_LOG(sc, "MT7927 joining \"%.*s\" %s ch %u (%s GHz) rssi %d "
 	    "%s%s rates basic 0x%x ra 0x%x\n", ni->ni_esslen,
 	    (const char *)ni->ni_essid, ether_sprintf(bss.bssid), bss.chan,
@@ -11857,8 +11913,10 @@ mt7927_rx_8023(struct mwx_softc *sc, const uint8_t *p, uint32_t len)
 		sc->sc_7927_rx_amsdu_sub++;
 	/* what ieee80211_input() keeps up to date for the AP */
 	ni->ni_inact = 0;
-	if (ri.rssi < 0 && ri.rssi > -127)
-		ni->ni_rssi = (uint8_t)mwx_dbm_to_rssi(ri.rssi);
+	if (ri.rssi < 0 && ri.rssi > -127)	/* phase 4t: averaged */
+		ni->ni_rssi = (uint8_t)mwx_dbm_to_rssi(ic->ic_state ==
+		    IEEE80211_S_RUN && ni == ic->ic_bss ?
+		    mt7927_sig_note(sc, ri.rssi) : ri.rssi);
 
 	u.tid = 16;
 	if (ri.has_g4) {
@@ -12940,6 +12998,16 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		sc->sc_7927_scan_ticks = 0;
 	}
 	mt7927_join_poll(sc);
+	/* phase 4t: the signal over the last 30 s, for the log */
+	if ((sc->sc_7927_poll % 30) == 0 && sc->sc_7927_sig_n != 0 &&
+	    sc->sc_ic.ic_state == IEEE80211_S_RUN) {
+		MWX_DEV_LOG(sc, "MT7927 signal: average %d dBm (last %d, "
+		    "range %d to %d over %u frames)\n",
+		    (sc->sc_7927_sig_avg16 - 8) / 16, sc->sc_7927_sig_last,
+		    sc->sc_7927_sig_min, sc->sc_7927_sig_max,
+		    sc->sc_7927_sig_n);
+		sc->sc_7927_sig_n = 0;
+	}
 	/*
 	 * Phase 4f.2 (review): SAE frames resent each second, 3 tries, within
 	 * the 3 s join ROC (net80211's own 5 s timer comes after it).
