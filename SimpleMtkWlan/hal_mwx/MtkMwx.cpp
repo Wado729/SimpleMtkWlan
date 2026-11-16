@@ -10076,6 +10076,7 @@ mt7927_hal_stop(struct mwx_softc *sc)
 
 static int	mt7927_hal_scan_send(struct mwx_softc *,
 		    const struct mt7927_scan_chan *, int);
+#define	MT7927_JOIN6G_SCANS	20	/* phase 4p: ~2-3 s of 1-channel scans */
 
 /* Active (wildcard) scan of every channel in the net80211 table, as Linux. */
 static int
@@ -10100,6 +10101,31 @@ mt7927_hal_scan(struct mwx_softc *sc)
 	restricted = ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted;
 #else
 	restricted = false;
+#endif
+#ifdef AIRPORT_WCL
+	/*
+	 * Phase 4p: a 6 GHz join names its channel. A full join sweep spent
+	 * ~3.2 s on 41 channels of 2.4/5 GHz and ~0.75 s on the 15 PSCs at
+	 * ~50 ms each, where the AP's beacon (no probing on 6 GHz) often fell
+	 * outside the dwell: four sweeps in a row missed Home_6GHz (hardware,
+	 * Nov 16) while macOS's 1-channel scans heard it within 40 ms. Scan
+	 * that channel alone first, as macOS's follow-up scans do (and
+	 * cfg80211 with a known frequency); the full sweep after that.
+	 */
+	if (ic->ic_wcl_join_requested && !ic->ic_wcl_scan_requested &&
+	    ic->ic_state == IEEE80211_S_SCAN && ic->ic_wcl_join_chan6g != 0 &&
+	    /* review nit: a 20 MHz channel (1, 5, ...), not a wide centre */
+	    ((ic->ic_wcl_join_chan6g - 1) % 4) == 0 && sc->sc_7927_scan6g &&
+	    ic->ic_wcl_join_scans < MT7927_JOIN6G_SCANS) {
+		if (ic->ic_wcl_join_scans++ == 0)
+			MWX_DEV_LOG(sc, "MT7927 join scan: 6 GHz channel %u "
+			    "alone (up to %d scans, then all channels)\n",
+			    ic->ic_wcl_join_chan6g, MT7927_JOIN6G_SCANS);
+		ch[0].band = 3;
+		ch[0].chan = ic->ic_wcl_join_chan6g;
+		sc->sc_7927_pend6_n = 0;
+		return mt7927_hal_scan_send(sc, ch, 1);
+	}
 #endif
 	for (c = &ic->ic_channels[1];
 	    c <= &ic->ic_channels[IEEE80211_CHAN_MAX] && n < 64; c++) {

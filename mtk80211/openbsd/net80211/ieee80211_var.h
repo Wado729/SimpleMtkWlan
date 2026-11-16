@@ -487,6 +487,7 @@ struct ieee80211com {
     bool ic_wcl_scan_restart;   /* a newer request: the HAL starts it when the current scan ends */
     bool ic_wcl_scan_restart_supported;   /* the HAL consumes ic_wcl_scan_restart (MT7927) */
     uint8_t ic_wcl_join_chan6g;           /* phase 4g: the 6 GHz channel of macOS's join, 0 if none */
+    uint8_t ic_wcl_join_scans;            /* phase 4p: join scans of that channel alone */
 #endif
     /* The channel width has changed (20<->2040) */
     void            (*ic_update_chw)(struct ieee80211com *);

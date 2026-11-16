@@ -755,6 +755,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     // the join scan even off the PSC grid
     ic->ic_wcl_join_chan6g = (join.channelSpec & 0xc000) == 0x4000 ?
         uint8_t(join.channelSpec & 0xff) : 0;
+    ic->ic_wcl_join_scans = 0;     // phase 4p: the channel alone first
     memcpy(ic->ic_des_bssid, join.bssid, 6);
     memcpy(joinBSSID, join.bssid, 6);
     ic->ic_flags |= IEEE80211_F_DESBSSID;
