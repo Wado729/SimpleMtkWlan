@@ -54,6 +54,8 @@ public:
 #ifdef AIRPORT_WCL
     /* Native Wi-Fi (AirportMtkWlan): off-channel time per channel macOS asks scans to use. */
     virtual IOReturn setScanHomeAwayTime(uint32_t) { return kIOReturnUnsupported; }
+    /* Phase 4q: end a running unassociated sweep so a join can scan its channel. */
+    virtual IOReturn abortScanForJoin() { return kIOReturnUnsupported; }
 #endif
     
     virtual MtkDriverInfo *getDriverInfo() = 0;

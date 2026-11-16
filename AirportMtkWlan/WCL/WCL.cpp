@@ -794,6 +794,16 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
             ieee80211_end_scan(&ic->ic_if);
         } else
             ieee80211_next_scan(&ic->ic_if);
+    } else if (ic->ic_state == IEEE80211_S_SCAN && ic->ic_wcl_join_chan6g != 0 &&
+               !scanPending) {
+        /*
+         * Phase 4q: a sweep runs (the interface starts one when it comes
+         * up, right before macOS's join): cancel it so the join scans its
+         * 6 GHz channel (4p) now instead of in ~4 s.
+         */
+        IOReturn ar = fHalService->abortScanForJoin();
+        XYLog("WCL join: 6 GHz join during a scan, scan %s (0x%x)\n",
+              ar == kIOReturnSuccess ? "cancelled" : "left to finish", ar);
     }
     if (ic->ic_state != IEEE80211_S_SCAN && ic->ic_newstate(ic, IEEE80211_S_SCAN, -1)) {
         joinPending = false;

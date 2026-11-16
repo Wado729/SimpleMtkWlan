@@ -613,6 +613,8 @@ struct mwx_softc {
 	uint64_t		sc_7927_6g_heard_age_ns; /* phase 4e.8: forget after 5 min */
 	uint8_t			sc_7927_pend6[64][2];	/* 6 GHz half (band, chan), sent next */
 	int			sc_7927_pend6_n;
+	bool			sc_7927_cancel_valid;	/* phase 4q: a cancelled scan's */
+	uint8_t			sc_7927_cancel_seq;	/* completion to ignore */
 	uint32_t		sc_7927_bgscans, sc_7927_bgscan_busy;	/* phase 4e.3 */
 	/* phase 4b: join */
 	bool			sc_7927_joined;		/* BSS_INFO + STA_REC set */
@@ -11438,6 +11440,17 @@ mt7927_hal_event(void *arg, uint8_t eid, const uint8_t *p, uint32_t len)
 
 	if (eid != MT7927_UNI_EVENT_SCAN_DONE || !mt7927_scan_event_done(p, len))
 		return;
+	/*
+	 * Phase 4q: the completion of a sweep cancelled for a join (seq in the
+	 * first byte, as sent) must not end the scan that replaced it.
+	 */
+	if (sc->sc_7927_cancel_valid && len >= 1) {
+		bool stale = (p[0] & 0x7f) == sc->sc_7927_cancel_seq;
+
+		sc->sc_7927_cancel_valid = false;
+		if (stale)
+			return;
+	}
 	sc->sc_scan_done_count++;
 	sc->sc_flags &= ~MWX_FLAG_SCANNING;
 	task_add(systq, &sc->sc_scan_task);
@@ -16553,6 +16566,45 @@ MtkMwx::clearScanningFlags()
 	if (com)
 		com->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
 }
+
+#ifdef AIRPORT_WCL
+/*
+ * Phase 4q: macOS's join came while an unassociated sweep runs (the one the
+ * interface starts when it comes up): ~4 s of 2.4/5 GHz and PSC channels
+ * before the 6 GHz join could scan its own channel (4p). Cancel it, as
+ * mac80211 aborts a scan for a connect (mt7925_mcu_cancel_hw_scan), and end
+ * the scan now: net80211 then chooses or scans again.
+ */
+IOReturn
+MtkMwx::abortScanForJoin()
+{
+	struct mwx_softc *sc = com;
+	struct mt7927_vif v;
+	uint8_t seq;
+
+	if (sc == NULL || sc->sc_hwtype != MWX_HW_MT7927 ||
+	    !mt7927_engine_running(sc->sc_7927) ||
+	    !(sc->sc_flags & MWX_FLAG_SCANNING) ||
+	    (sc->sc_flags & MWX_FLAG_BGSCAN) ||
+	    sc->sc_ic.ic_state != IEEE80211_S_SCAN)
+		return kIOReturnNotReady;
+	mt7927_vif_fill(sc, &v);
+	seq = sc->sc_7927->scan_seq & 0x7f;
+	/* review nit: armed before the cancel, so a completion during it is known */
+	sc->sc_7927_cancel_seq = seq;
+	sc->sc_7927_cancel_valid = true;
+	if (mt7927_scan_cancel(sc->sc_7927, &v) != 0) {
+		sc->sc_7927_cancel_valid = false;
+		return kIOReturnError;
+	}
+	sc->sc_flags &= ~MWX_FLAG_SCANNING;
+	sc->sc_7927_pend6_n = 0;
+	sc->sc_ic.ic_wcl_scan_restart = false;
+	MWX_DEV_LOG(sc, "MT7927 scan seq %u cancelled for a join\n", seq);
+	task_add(systq, &sc->sc_scan_task);
+	return kIOReturnSuccess;
+}
+#endif
 
 IOReturn
 MtkMwx::setMulticastList(IOEthernetAddress *addr, int count)

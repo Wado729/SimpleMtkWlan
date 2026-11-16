@@ -49,6 +49,9 @@ public:
     int getRxRateMcs() override;
 
     void clearScanningFlags() override;
+#ifdef AIRPORT_WCL
+    IOReturn abortScanForJoin() override;
+#endif
     void debugPoll() override;
     void suspend() override;
     void resume() override;
