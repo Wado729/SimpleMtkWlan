@@ -626,7 +626,7 @@ struct mwx_softc {
 	uint32_t		sc_7927_tx_hwenc;
 	uint32_t		sc_7927_tx_swenc;
 	/* phase 4c.3: hardware A-MSDU, TX status samples */
-	bool			sc_7927_amsdu_ok;	/* off: -mtk7927noamsdu */
+	bool			sc_7927_amsdu_ok;	/* on: -mtk7927amsdu */
 	/* phase 4d: 802.11ax */
 	bool			sc_7927_he;		/* off: -mtk7927nohe */
 	uint32_t		sc_7927_tx_amsdu;
@@ -2979,16 +2979,18 @@ common:
 		    &sw, sizeof(sw));
 		/*
 		 * With keys in the chip the MAC can build A-MSDUs itself
-		 * (MT_TXD3_HW_AMSDU), as Linux mt7925 does. Phase 4k: on by
-		 * default, as in Linux; -mtk7927noamsdu turns it off.
+		 * (MT_TXD3_HW_AMSDU), as Linux mt7925 does. Phase 4k.2: opt-in
+		 * again with -mtk7927amsdu. Linux packs only frames the chip
+		 * converts from 802.3; ours are 802.11 frames, and on hardware
+		 * (Deco, 6 GHz) upload fell to 0 and download to 44 Mbit/s.
 		 */
 		sc->sc_7927_amsdu_ok = sc->sc_7927_hwcrypto &&
-		    !PE_parse_boot_argn("-mtk7927noamsdu", &sw, sizeof(sw));
+		    PE_parse_boot_argn("-mtk7927amsdu", &sw, sizeof(sw));
 		if (sc->sc_7927_amsdu_ok)
 			ic->ic_caps |= IEEE80211_C_TX_AMSDU_IN_AMPDU;
 		MWX_DEV_LOG(sc, "MT7927 hardware A-MSDU (TX): %s\n",
 		    sc->sc_7927_amsdu_ok ? "on" : !sc->sc_7927_hwcrypto ?
-		    "off (software crypto)" : "off (-mtk7927noamsdu)");
+		    "off (software crypto)" : "off (default; -mtk7927amsdu: on)");
 		ic->ic_ampdu_rx_start = mt7927_ampdu_rx_start;
 		ic->ic_ampdu_rx_stop = mt7927_ampdu_rx_stop;
 		ic->ic_ampdu_tx_start = mt7927_ampdu_tx_start;
