@@ -615,6 +615,7 @@ struct mwx_softc {
 	int			sc_7927_pend6_n;
 	bool			sc_7927_cancel_valid;	/* phase 4q: a cancelled scan's */
 	uint8_t			sc_7927_cancel_seq;	/* completion to ignore */
+	bool			sc_7927_scan_nstate;	/* phase 4r: scan from the newstate task */
 	uint32_t		sc_7927_bgscans, sc_7927_bgscan_busy;	/* phase 4e.3 */
 	/* phase 4b: join */
 	bool			sc_7927_joined;		/* BSS_INFO + STA_REC set */
@@ -10115,7 +10116,15 @@ mt7927_hal_scan(struct mwx_softc *sc)
 	 * cfg80211 with a known frequency); the full sweep after that.
 	 */
 	if (ic->ic_wcl_join_requested && !ic->ic_wcl_scan_requested &&
-	    ic->ic_state == IEEE80211_S_SCAN && ic->ic_wcl_join_chan6g != 0 &&
+	    /*
+	     * Phase 4r: the first scan of a join comes from the newstate task,
+	     * where ic_state is still the old state (mwx_scan sets SCAN after
+	     * this returns), so 4p only ever shaped the later scans: hardware,
+	     * Nov 16 (4q build), the join's first scan swept every channel
+	     * for 3.9 s.
+	     */
+	    (ic->ic_state == IEEE80211_S_SCAN || sc->sc_7927_scan_nstate) &&
+	    ic->ic_wcl_join_chan6g != 0 &&
 	    /* review nit: a 20 MHz channel (1, 5, ...), not a wide centre */
 	    ((ic->ic_wcl_join_chan6g - 1) % 4) == 0 && sc->sc_7927_scan6g &&
 	    ic->ic_wcl_join_scans < MT7927_JOIN6G_SCANS) {
@@ -10759,6 +10768,44 @@ mt7927_join_assoc(struct mwx_softc *sc)
 	return rv;
 }
 
+#ifdef AIRPORT_WCL
+/*
+ * Phase 4q: macOS's join came while an unassociated sweep runs (the one the
+ * interface starts when it comes up): ~4 s of 2.4/5 GHz and PSC channels
+ * before the 6 GHz join could scan its own channel (4p). Cancel it, as
+ * mac80211 aborts a scan for a connect (mt7925_mcu_cancel_hw_scan), and end
+ * the scan now: net80211 then chooses or scans again. Phase 4r: shared by
+ * MtkMwx::abortScanForJoin and the newstate task.
+ */
+static IOReturn
+mt7927_abort_scan_for_join(struct mwx_softc *sc)
+{
+	struct mt7927_vif v;
+	uint8_t seq;
+
+	if (!mt7927_engine_running(sc->sc_7927) ||
+	    !(sc->sc_flags & MWX_FLAG_SCANNING) ||
+	    (sc->sc_flags & MWX_FLAG_BGSCAN) ||
+	    sc->sc_ic.ic_state != IEEE80211_S_SCAN)
+		return kIOReturnNotReady;
+	mt7927_vif_fill(sc, &v);
+	seq = sc->sc_7927->scan_seq & 0x7f;
+	/* review nit: armed before the cancel, so a completion during it is known */
+	sc->sc_7927_cancel_seq = seq;
+	sc->sc_7927_cancel_valid = true;
+	if (mt7927_scan_cancel(sc->sc_7927, &v) != 0) {
+		sc->sc_7927_cancel_valid = false;
+		return kIOReturnError;
+	}
+	sc->sc_flags &= ~MWX_FLAG_SCANNING;
+	sc->sc_7927_pend6_n = 0;
+	sc->sc_ic.ic_wcl_scan_restart = false;
+	MWX_DEV_LOG(sc, "MT7927 scan seq %u cancelled for a join\n", seq);
+	task_add(systq, &sc->sc_scan_task);
+	return kIOReturnSuccess;
+}
+#endif
+
 /* mwx_newstate_task() for the MT7927. */
 static void
 mt7927_newstate(struct mwx_softc *sc, enum ieee80211_state ostate,
@@ -10791,9 +10838,25 @@ mt7927_newstate(struct mwx_softc *sc, enum ieee80211_state ostate,
 			/* re-review S2: net80211 is not told; end a leave here */
 			ic->ic_leave_pending = 0;
 			ic->ic_xflags &= ~IEEE80211_F_TX_MGMT_ONLY;
+#ifdef AIRPORT_WCL
+			/*
+			 * Phase 4r (review): a 6 GHz join that came while this
+			 * sweep was being started (ic_state not yet SCAN, so 4q's
+			 * cancel in startWCLJoin did not apply) ends here: cancel
+			 * the sweep so the join scans its channel alone (4p).
+			 */
+			if (ic->ic_wcl_join_requested &&
+			    !ic->ic_wcl_scan_requested &&
+			    ic->ic_wcl_join_chan6g != 0 &&
+			    ((ic->ic_wcl_join_chan6g - 1) % 4) == 0 &&
+			    sc->sc_7927_scan6g && ic->ic_wcl_join_scans == 0)
+				(void)mt7927_abort_scan_for_join(sc);
+#endif
 			return;
 		}
+		sc->sc_7927_scan_nstate = true;	/* phase 4r */
 		rv = mwx_scan(sc);
+		sc->sc_7927_scan_nstate = false;
 		break;
 	case IEEE80211_S_AUTH:
 		rv = mt7927_join_prepare(sc);
@@ -16579,30 +16642,10 @@ IOReturn
 MtkMwx::abortScanForJoin()
 {
 	struct mwx_softc *sc = com;
-	struct mt7927_vif v;
-	uint8_t seq;
 
-	if (sc == NULL || sc->sc_hwtype != MWX_HW_MT7927 ||
-	    !mt7927_engine_running(sc->sc_7927) ||
-	    !(sc->sc_flags & MWX_FLAG_SCANNING) ||
-	    (sc->sc_flags & MWX_FLAG_BGSCAN) ||
-	    sc->sc_ic.ic_state != IEEE80211_S_SCAN)
+	if (sc == NULL || sc->sc_hwtype != MWX_HW_MT7927)
 		return kIOReturnNotReady;
-	mt7927_vif_fill(sc, &v);
-	seq = sc->sc_7927->scan_seq & 0x7f;
-	/* review nit: armed before the cancel, so a completion during it is known */
-	sc->sc_7927_cancel_seq = seq;
-	sc->sc_7927_cancel_valid = true;
-	if (mt7927_scan_cancel(sc->sc_7927, &v) != 0) {
-		sc->sc_7927_cancel_valid = false;
-		return kIOReturnError;
-	}
-	sc->sc_flags &= ~MWX_FLAG_SCANNING;
-	sc->sc_7927_pend6_n = 0;
-	sc->sc_ic.ic_wcl_scan_restart = false;
-	MWX_DEV_LOG(sc, "MT7927 scan seq %u cancelled for a join\n", seq);
-	task_add(systq, &sc->sc_scan_task);
-	return kIOReturnSuccess;
+	return mt7927_abort_scan_for_join(sc);
 }
 #endif
 
