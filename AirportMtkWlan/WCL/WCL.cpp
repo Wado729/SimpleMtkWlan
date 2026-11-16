@@ -766,6 +766,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     wclBssValid = false;
     joinPending = true;
     assocNotified = firstBeaconNotified = portAuthorized = false;
+    firstBeaconDeferredLogged = false;
     wclAssociatedBeacons = 0;
     wclJoinBeacons = 0;
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
@@ -935,6 +936,23 @@ void AirportItlwmSkywalkInterface::notifyWCLFirstBeacon(const char *source)
 {
     if (!joinPending || !assocNotified || firstBeaconNotified || !wclBssValid)
         return;
+    /*
+     * Phase 4n: the association event goes up from recv_assoc_resp, but
+     * ic_state becomes RUN only when the HAL's newstate task ends (~30 ms of
+     * BSS_INFO/STA_REC commands). The link-up below makes WCL fetch
+     * APPLE80211_IOC_WCL_EXTENDED_BSS_INFO at once, which answers NotReady
+     * outside RUN; WCL then leaves with "Update Bss fail" (hardware log,
+     * Nov 16: a beacon 1 ms before RUN). Wait for RUN: the next beacon, at
+     * most a beacon interval later, sends it.
+     */
+    if (fHalService->get80211Controller()->ic_state != IEEE80211_S_RUN) {
+        if (!firstBeaconDeferredLogged) {
+            firstBeaconDeferredLogged = true;
+            XYLog("WCL first beacon (%s) before RUN (state %d): waiting for the next one\n",
+                source, fHalService->get80211Controller()->ic_state);
+        }
+        return;
+    }
     AirportWCL::FirstBeaconEvent event = {};
     memcpy(event.peer.bssid, joinBSSID, 6);
     firstBeaconNotified = true;
@@ -1209,8 +1227,11 @@ IOReturn AirportItlwmSkywalkInterface::getWCL_EXTENDED_BSS_INFO(apple80211_exten
 IOReturn AirportItlwmSkywalkInterface::copyWCLExtendedBss(void *data)
 {
     ieee80211com *ic = fHalService->get80211Controller();
-    if (!data || !ic->ic_bss || ic->ic_state != IEEE80211_S_RUN)
+    if (!data || !ic->ic_bss || ic->ic_state != IEEE80211_S_RUN) {
+        /* phase 4n: WCL leaves the network on this ("Update Bss fail") */
+        XYLog("WCL extended BSS info asked in state %d: not ready\n", ic->ic_state);
         return kIOReturnNotReady;
+    }
     static_assert(sizeof(apple80211_rate_set_data) == 0xbc, "Extended BSS rates size");
     static_assert(sizeof(apple80211_mcs_index_set_data) == 0x10, "Extended BSS MCS size");
     auto bytes = static_cast<uint8_t *>(data);

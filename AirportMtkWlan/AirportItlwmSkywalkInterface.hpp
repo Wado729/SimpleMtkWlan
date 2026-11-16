@@ -471,6 +471,7 @@ private:
     AirportWCL::JoinRequest deferredJoin = {};
     bool assocNotified;
     bool firstBeaconNotified;
+    bool firstBeaconDeferredLogged = false;    /* phase 4n */
     bool portAuthorized;
     uint8_t wclPermanentMAC[6] = {};
     bool wclStopping;
