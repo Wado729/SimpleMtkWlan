@@ -1376,6 +1376,17 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs, i
             mgt = IEEE80211_FC0_SUBTYPE_DEAUTH;
         }
         
+        /*
+         * Phase 4o: each probe request of a scan arms ic_mgt_timer (5 s).
+         * The HAL's newstate task for AUTH takes ~0.5 s (band reconfig,
+         * BSS_INFO, ROC) and ic_state stays SCAN meanwhile, so a timer
+         * left by the scan could run out there and ieee80211_watchdog()
+         * would restart the scan under the join (hardware, Nov 16: SAE
+         * accepted after the join had been torn down). The AUTH frame
+         * arms the timer again when it is sent.
+         */
+        if (ic->ic_opmode == IEEE80211_M_STA)
+            ic->ic_mgt_timer = 0;
         ieee80211_new_state(ic, IEEE80211_S_AUTH, mgt);
     }
 }
