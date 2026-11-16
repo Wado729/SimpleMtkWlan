@@ -419,6 +419,7 @@ public:
     bool initWCL();
     void free() override;
     void stopWCL();
+    bool leaveForShutdown();     // phase 4s: deauth before shutdown/restart
     void handleWCLEvent(int, void *);
     void handleWCLLink(bool);
     void completeWCLScan();

@@ -1540,6 +1540,56 @@ void AirportItlwm::setPowerStateOff()
     pmPolicyMaker->acknowledgeSetPowerState();
 }
 
+#ifdef AIRPORT_WCL
+static IOReturn shutdownLeaveGated(OSObject *owner, void *arg0, void *, void *, void *)
+{
+    AirportItlwm *self = OSDynamicCast(AirportItlwm, owner);
+    bool *sent = static_cast<bool *>(arg0);
+
+    if (self == NULL || self->fNetIf == NULL)
+        return kIOReturnNotReady;
+    *sent = static_cast<AirportItlwmSkywalkInterface *>(self->fNetIf)->leaveForShutdown();
+    return kIOReturnSuccess;
+}
+#endif
+
+/*
+ * Phase 4s: macOS does not leave the network at a shutdown or restart
+ * (hardware, Nov 16: the last Wi-Fi lines before "System shutdown
+ * initiated" are a join; no leaveNetworkCommand, no power-off follows), so
+ * the AP kept our PMF session and answered the first association after the
+ * reboot with status 30 (a 1 s comeback) or a deauth (reason 9), when macOS
+ * moved to the weaker mesh node. Send the deauth (protected with the PTK in
+ * RUN) as mac80211 does when the interface goes down at shutdown, and give
+ * it 100 ms to leave the chip before the power goes. Review: called from
+ * IOPCIEDeviceWrapper::systemWillShutdown too (that one is surely in the
+ * power plane); the first call does it.
+ */
+void AirportItlwm::leaveForSystemShutdown(IOOptionBits specifier)
+{
+#ifdef AIRPORT_WCL
+    // review: other notices (paging off) neither act nor use up the flag
+    if (shutdownLeaveDone ||
+        (specifier != kIOMessageSystemWillPowerOff &&
+         specifier != kIOMessageSystemWillRestart))
+        return;
+    shutdownLeaveDone = true;
+    bool sent = false;
+    if (_fCommandGate != NULL)
+        _fCommandGate->runAction(shutdownLeaveGated, &sent);
+    XYLog("system shutdown (0x%x): deauth to the AP %s\n", specifier,
+          sent ? "queued" : "not needed (not connected)");
+    if (sent)
+        IOSleep(100);
+#endif
+}
+
+void AirportItlwm::systemWillShutdown(IOOptionBits specifier)
+{
+    leaveForSystemShutdown(specifier);
+    super::systemWillShutdown(specifier);
+}
+
 void AirportItlwm::setPowerStateOn()
 {
     XYLog("%s\n", __FUNCTION__);

@@ -28,6 +28,8 @@ public:
     virtual IOReturn setPowerState(
         unsigned long powerStateOrdinal,
                                    IOService *   whatDevice ) override;
+    // Phase 4s: forwarded to the Wi-Fi controller (deauth before shutdown)
+    virtual void systemWillShutdown(IOOptionBits specifier) override;
     
 public:
     MtkHalService *fHalService;

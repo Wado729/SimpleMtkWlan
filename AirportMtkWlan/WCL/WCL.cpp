@@ -936,6 +936,21 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork(const char *why)
     return kIOReturnSuccess;
 }
 
+// Phase 4s (AirportItlwm::systemWillShutdown, on the command gate): leave
+// as macOS's disassociate does, so the AP drops our session now.
+bool AirportItlwmSkywalkInterface::leaveForShutdown()
+{
+    ieee80211com *ic = fHalService ? fHalService->get80211Controller() : NULL;
+    if (wclStopping || ic == NULL || ic->ic_opmode != IEEE80211_M_STA ||
+        ic->ic_state != IEEE80211_S_RUN)
+        return false;
+    // review: true only if the deauth was queued (leaveWCLNetwork skips it
+    // when a leave is pending or RSN is already off)
+    bool pendingBefore = ic->ic_leave_pending != 0;
+    leaveWCLNetwork("system shutdown");
+    return !pendingBefore && ic->ic_leave_pending != 0;
+}
+
 IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
 {
     leaveWCLNetwork("join abort");

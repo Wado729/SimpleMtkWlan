@@ -238,6 +238,12 @@ public:
     virtual IOReturn setWakeOnMagicPacket( bool active ) override;
     void setPowerStateOff(void);
     void setPowerStateOn(void);
+    // Phase 4s: tell the AP we are leaving before a shutdown or restart
+    // (from here if this object is in the power plane, else from the
+    // IOPCIEDeviceWrapper, which is; once either way)
+    virtual void systemWillShutdown(IOOptionBits specifier) override;
+    void leaveForSystemShutdown(IOOptionBits specifier);
+    bool shutdownLeaveDone = false;
     void unregistPM();
     bool initPCIPowerManagment(IOPCIDevice *provider);
 

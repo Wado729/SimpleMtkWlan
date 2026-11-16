@@ -11,6 +11,9 @@
 #include "Apple80211.h"
 
 #include "MtkMwx.hpp"
+#ifdef AIRPORT_WCL
+#include "AirportItlwmV2.hpp"
+#endif
 
 #define super IOService
 OSDefineMetaClassAndStructors(IOPCIEDeviceWrapper, IOService);
@@ -141,4 +144,25 @@ IOReturn IOPCIEDeviceWrapper::
 setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice)
 {
     return IOPMAckImplied;
+}
+
+/*
+ * Phase 4s (review): this object joins the power plane (PMinit +
+ * joinPMtree in start), so the shutdown notice surely reaches it; the
+ * controller may not be a plane member. Leaf-to-root order: if the
+ * controller got it first, it already left (done once).
+ */
+void IOPCIEDeviceWrapper::
+systemWillShutdown(IOOptionBits specifier)
+{
+#ifdef AIRPORT_WCL
+    OSIterator *it = getClientIterator();
+    if (it) {
+        while (OSObject *obj = it->getNextObject())
+            if (AirportItlwm *ctl = OSDynamicCast(AirportItlwm, obj))
+                ctl->leaveForSystemShutdown(specifier);
+        it->release();
+    }
+#endif
+    super::systemWillShutdown(specifier);
 }
