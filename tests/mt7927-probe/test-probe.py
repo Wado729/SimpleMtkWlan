@@ -941,6 +941,23 @@ int main() {
       assert(t.frame.size() == 30 && memcmp(t.frame.data(), auth, 30) == 0);
     }
     assert(r->b.tx_done == 1 && r->b.tx_free_events == 1 && r->b.tok_busy[chip.txf.back().msdu & 0x7fff] == 0);
+    /* phase 4v: the watchdog's QoS-Null on ALTX0 with a TX status; its TX free is logged once */
+    {
+      uint8_t qn[26] = {0xc8, 0x01}; memcpy(qn + 4, ap, 6); memcpy(qn + 10, v.addr, 6); memcpy(qn + 16, ap, 6); qn[24] = 7;
+      struct mt7927_txinfo pi = ti; pi.hdrlen = 26; pi.tid = 7; pi.txs = true; pi.txs_pid = MT7927_TXS_PID_PROBE;
+      size_t l0 = logbuf.size();
+      assert(mt7927_tx_frame(&r->b, &pi, qn, sizeof qn) == 0);
+      const Chip::TxFrame &t = chip.txf.back();
+      assert((t.txd[0] >> 25) == 0x10 && ((t.txd[1] >> 21) & 0xf) == 7 && (t.txd[1] >> 31) == 1);
+      assert((t.txd[5] & 0xff) == MT7927_TXS_PID_PROBE && (t.txd[5] & (1u << 10)) && (t.txd[3] & (1u << 28)));
+      assert(((t.txd[2] >> 4) & 3) == 2 && (t.txd[2] & 0xf) == 0xc);
+      char want[96]; snprintf(want, sizeof want, "null probe freed by the chip (token %u, tx count 1, status 0)",
+                              t.msdu & 0x7fff);
+      assert(logbuf.find(want, l0) != std::string::npos && r->b.probe_tok1 == 0);
+      size_t l1 = logbuf.size();
+      assert(mt7927_tx_frame(&r->b, &ti, auth, sizeof auth) == 0);           /* not a probe: no line */
+      assert(logbuf.find("null probe freed", l1) == std::string::npos);
+    }
     /* a QoS data frame: rate control (no fixed rate), BE queue */
     uint8_t data[26 + 8 + 20] = {0x88, 0x01}; memcpy(data + 4, ap, 6); memcpy(data + 10, v.addr, 6); memcpy(data + 16, ap, 6);
     ti.q_idx = 1; ti.hdrlen = 26; ti.fixed_rate = false; ti.tid = 0;
@@ -957,7 +974,7 @@ int main() {
     assert(mt7927_engine_tx_room(&r->b));
     r->b.tx_blocked = false;
     for (int k = 0; k < 6; k++) assert(mt7927_tx_frame(&r->b, &ti, data, sizeof data) == 0);
-    assert(r->b.tx_reclaimed == 6 && r->b.tx_queued == 2 + MT7927_TX_TOKENS + 6);
+    assert(r->b.tx_reclaimed == 6 && r->b.tx_queued == 4 + MT7927_TX_TOKENS + 6);   /* 4v: + probe, auth */
     /* phase 4c.3: once a free event comes back, a full set of tokens waits instead of being reclaimed */
     post_txfree(1, chip.txf.back().msdu & 0x7fff); deliver_irq();
     assert(r->b.tok_free_seq == r->b.tok_seq && r->b.tok_free_tick == r->b.wd_ticks);

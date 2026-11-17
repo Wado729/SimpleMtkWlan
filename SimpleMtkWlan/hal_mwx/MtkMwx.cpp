@@ -690,6 +690,15 @@ struct mwx_softc {
 	uint32_t		sc_7927_rx_mcast;	/* group-addressed data */
 	uint32_t		sc_7927_rx_ucast;	/* unicast data */
 	uint32_t		sc_7927_rx_bss_mgt;	/* other management */
+	/*
+	 * Phase 4v: our BSS is a nontransmitted BSSID of a multiple-BSSID set
+	 * (mac80211: bss_conf->nontransmitted, transmitter_bssid). Valid for
+	 * the BSSID in sc_7927_mbss_for; cleared at each join and leave.
+	 */
+	bool			sc_7927_mbss_known;
+	uint8_t			sc_7927_mbss_for[6];	/* our BSSID */
+	uint8_t			sc_7927_mbss_tx[6];	/* its transmitted BSSID */
+	uint32_t		sc_7927_rx_tx_bcn;	/* beacons from that one */
 	/* phase 4i: link watchdog probes the AP before leaving */
 	uint32_t		sc_7927_wd_probes;
 	uint32_t		sc_7927_wd_rx_mark;
@@ -1091,6 +1100,122 @@ mt7927_rx_from_ap(uint8_t fc0, const uint8_t *addr2, const uint8_t *ap)
 {
 	return (fc0 & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_CTL &&
 	    memcmp(addr2, ap, 6) == 0;
+}
+
+/*
+ * Phase 4v: does a frame from `tx` announce `bssid` as a nontransmitted
+ * BSSID of its multiple-BSSID set? Multiple BSSID elements (71: the MaxBSSID
+ * Indicator n, then subelements), in each Nontransmitted BSSID Profile
+ * (subelement 0) its Multiple BSSID-Index element (85). The BSSID is
+ * cfg80211_gen_new_bssid()'s: the low n bits of tx plus the index, modulo
+ * 2^n; n is 1..8, so only the last octet differs. A profile split over two
+ * elements is found only if its index element is in the first part.
+ */
+static bool
+mt7927_mbssid_lists(const uint8_t *ies, size_t len, const uint8_t *tx,
+    const uint8_t *bssid, uint8_t *idx_out, uint8_t *max_out)
+{
+	const uint8_t *e, *end = ies + len;
+
+	if (memcmp(tx, bssid, 5) != 0)
+		return false;
+	for (e = ies; e + 2 <= end && e + 2 + e[1] <= end; e += 2 + e[1]) {
+		const uint8_t *s, *se;
+		uint8_t n, mask;
+
+		if (e[0] != IEEE80211_ELEMID_MULTI_BSSID || e[1] < 1)
+			continue;
+		n = e[2];
+		if (n < 1 || n > 8)
+			continue;
+		mask = (uint8_t)((1U << n) - 1);
+		se = e + 2 + e[1];
+		for (s = e + 3; s + 2 <= se && s + 2 + s[1] <= se;
+		    s += 2 + s[1]) {
+			const uint8_t *p, *pe;
+
+			if (s[0] != 0)		/* Nontransmitted BSSID Profile */
+				continue;
+			pe = s + 2 + s[1];
+			for (p = s + 2; p + 2 <= pe && p + 2 + p[1] <= pe;
+			    p += 2 + p[1]) {
+				uint8_t idx;
+
+				if (p[0] != IEEE80211_ELEMID_MULTI_BSSID_IDX ||
+				    p[1] < 1)
+					continue;
+				idx = p[2];
+				if (idx != 0 && idx <= mask &&
+				    (uint8_t)((tx[5] & ~mask) |
+				    (((tx[5] & mask) + idx) & mask)) == bssid[5]) {
+					*idx_out = idx;
+					*max_out = n;
+					return true;
+				}
+				break;		/* one index per profile */
+			}
+		}
+	}
+	return false;
+}
+
+/*
+ * Phase 4i: count the frames our AP sends, the link watchdog's signs of it
+ * (mt7927_rx_from_bss). Phase 4v: when our BSS is a nontransmitted BSSID of
+ * a multiple-BSSID set, the AP's beacons come from the set's transmitted
+ * BSSID. mac80211 takes those as our beacons (ieee80211_rx_our_beacon(): the
+ * BSS's bssid or its transmitted_bss's) and, in ieee80211_rx_mgmt_beacon(),
+ * cancels an AP probe and pushes its beacon loss detection back on them.
+ * cfg80211 knows the set from the scan; here it is the first beacon heard
+ * associated that lists our BSSID in its Multiple BSSID element.
+ */
+static void
+mt7927_rx_count_bss(struct mwx_softc *sc, const uint8_t *f, size_t len)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	const struct ieee80211_frame *wh = (const struct ieee80211_frame *)f;
+	const uint8_t *bssid;
+	uint8_t t, st, idx = 0, max = 0;
+
+	if (ic->ic_bss == NULL || ic->ic_state < IEEE80211_S_ASSOC ||
+	    len < sizeof(*wh))
+		return;
+	bssid = ic->ic_bss->ni_bssid;
+	t = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
+	st = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+	if (IEEE80211_ADDR_EQ(wh->i_addr2, bssid)) {
+		if (t == IEEE80211_FC0_TYPE_MGT &&
+		    st == IEEE80211_FC0_SUBTYPE_BEACON)
+			sc->sc_7927_rx_bcn++;
+		else if (t == IEEE80211_FC0_TYPE_DATA &&
+		    IEEE80211_IS_MULTICAST(wh->i_addr1))
+			sc->sc_7927_rx_mcast++;
+		else if (t == IEEE80211_FC0_TYPE_DATA)
+			sc->sc_7927_rx_ucast++;
+		else if (t == IEEE80211_FC0_TYPE_MGT)
+			sc->sc_7927_rx_bss_mgt++;
+		return;
+	}
+	if (t != IEEE80211_FC0_TYPE_MGT || st != IEEE80211_FC0_SUBTYPE_BEACON ||
+	    !IEEE80211_ADDR_EQ(wh->i_addr2, wh->i_addr3))
+		return;
+	if (sc->sc_7927_mbss_known &&
+	    IEEE80211_ADDR_EQ(sc->sc_7927_mbss_for, bssid)) {
+		if (IEEE80211_ADDR_EQ(wh->i_addr3, sc->sc_7927_mbss_tx))
+			sc->sc_7927_rx_tx_bcn++;
+		return;
+	}
+	/* elements after the header, timestamp, interval and capabilities */
+	if (len < sizeof(*wh) + 12 || !mt7927_mbssid_lists(f + sizeof(*wh) + 12,
+	    len - sizeof(*wh) - 12, wh->i_addr3, bssid, &idx, &max))
+		return;
+	IEEE80211_ADDR_COPY(sc->sc_7927_mbss_for, bssid);
+	IEEE80211_ADDR_COPY(sc->sc_7927_mbss_tx, wh->i_addr3);
+	sc->sc_7927_mbss_known = true;
+	sc->sc_7927_rx_tx_bcn++;
+	MWX_DEV_LOG(sc, "MT7927 link watchdog: our AP's beacons come from the "
+	    "transmitted BSSID %s (multiple BSSID index %u, max indicator %u)\n",
+	    ether_sprintf(sc->sc_7927_mbss_tx), idx, max);
 }
 
 static inline uint32_t
@@ -2298,24 +2423,12 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 		}
 	}
 	sc->sc_rx_delivered++;
-	if (sc->sc_hwtype == MWX_HW_MT7927 && ic->ic_bss != NULL &&
-	    ic->ic_state >= IEEE80211_S_ASSOC &&
-	    mbuf_len(m) >= sizeof(struct ieee80211_frame) &&
-	    IEEE80211_ADDR_EQ(wh->i_addr2, ic->ic_bss->ni_bssid)) {
-		uint8_t t = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
-
-		if (t == IEEE80211_FC0_TYPE_MGT &&
-		    (wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK) ==
-		    IEEE80211_FC0_SUBTYPE_BEACON)
-			sc->sc_7927_rx_bcn++;
-		else if (t == IEEE80211_FC0_TYPE_DATA &&
-		    IEEE80211_IS_MULTICAST(wh->i_addr1))
-			sc->sc_7927_rx_mcast++;
-		else if (t == IEEE80211_FC0_TYPE_DATA)
-			sc->sc_7927_rx_ucast++;
-		else if (t == IEEE80211_FC0_TYPE_MGT)
-			sc->sc_7927_rx_bss_mgt++;
-	}
+	if (sc->sc_hwtype == MWX_HW_MT7927)
+		/*
+		 * mtod/mbuf_len: the first mbuf only. mt7927_hal_rx copies a
+		 * frame into one packet, and RX frames fit one cluster.
+		 */
+		mt7927_rx_count_bss(sc, mtod(m, const uint8_t *), mbuf_len(m));
 	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_CTL) {
 		mwx_rx_ctl_cnt++;
 		if ((wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK) ==
@@ -5135,6 +5248,7 @@ struct mt7927_bringup {
 	uint32_t		tx_failed;
 	uint32_t		tx_free_events;
 	uint32_t		tx_free_badver;
+	uint32_t		probe_tok1;	/* 4v: null probe's token + 1, 0: none */
 	uint32_t		tx_no_token;
 	uint32_t		tx_reclaimed;
 	uint32_t		tx_ring_full;
@@ -8765,7 +8879,7 @@ mt7927_tx_free_mem(struct mt7927_bringup *b)
 static void
 mt7927_tx_free_event(struct mt7927_bringup *b, const uint8_t *p, uint32_t len)
 {
-	uint32_t total, count = 0, off, ver;
+	uint32_t total, count = 0, off, ver, hdr = 0;
 
 	b->tx_free_events++;
 	b->tok_free_seq = b->tok_seq;
@@ -8785,6 +8899,7 @@ mt7927_tx_free_event(struct mt7927_bringup *b, const uint8_t *p, uint32_t len)
 				/* MT_TXFREE_INFO_COUNT / _STAT (mt7925_mac_tx_free) */
 				uint32_t cnt = (info >> 24) & 0xf;
 
+				hdr = info;
 				if (cnt > 1)
 					b->tx_retries += cnt - 1;
 				if (((info >> 28) & 3) != 0)
@@ -8802,6 +8917,27 @@ mt7927_tx_free_event(struct mt7927_bringup *b, const uint8_t *p, uint32_t len)
 				OSSynchronizeIO();
 				b->tok_busy[msdu] = 0;
 				b->tx_done++;
+				/*
+				 * Phase 4v: the chip is done with the null probe
+				 * (one line per probe): tells "dropped" from "no
+				 * TX status". COUNT / STAT of the last header
+				 * (MT_TXFREE_INFO_*, mt7925_mac_tx_free()).
+				 */
+				if (b->probe_tok1 == msdu + 1) {
+					b->probe_tok1 = 0;
+					if (hdr != 0)
+						MWX_DEV_LOG(b->sc, "MT7927 link "
+						    "watchdog: null probe freed by "
+						    "the chip (token %u, tx count "
+						    "%u, status %u)\n", msdu,
+						    (hdr >> 24) & 0xf,
+						    (hdr >> 28) & 3);
+					else
+						MWX_DEV_LOG(b->sc, "MT7927 link "
+						    "watchdog: null probe freed by "
+						    "the chip (token %u, no "
+						    "header)\n", msdu);
+				}
 			}
 		}
 	}
@@ -9001,6 +9137,11 @@ mt7927_tx_frame(struct mt7927_bringup *b, const struct mt7927_txinfo *ti,
 	}
 	b->tok_busy[tok] = 1;
 	b->tok_when[tok] = ++b->tok_seq;
+	/* phase 4v: the link watchdog's null probe, to log its TX free */
+	if (ti->txs && ti->txs_pid == MT7927_TXS_PID_PROBE)
+		b->probe_tok1 = tok + 1;
+	else if (b->probe_tok1 == tok + 1)
+		b->probe_tok1 = 0;		/* reclaimed for another frame */
 	b->tok_next = (tok + 1) % MT7927_TX_TOKENS;
 	{
 		const struct mt7927_dmamem *c =
@@ -10662,6 +10803,7 @@ mt7927_join_teardown(struct mwx_softc *sc, const char *why)
 	mt7927_bss_info(sc->sc_7927, &v, &sc->sc_7927_bss, false);
 	sc->sc_7927_joined = false;
 	sc->sc_7927_assoc = false;
+	sc->sc_7927_mbss_known = false;		/* phase 4v */
 	sc->sc_7927_hwkeys = 0;
 	sc->sc_7927_ptk_pending = false;
 	mt7927_rx_decap_reset(sc);
@@ -10684,6 +10826,7 @@ mt7927_join_prepare(struct mwx_softc *sc)
 	    ni->ni_chan == IEEE80211_CHAN_ANYC)
 		return EINVAL;
 	mt7927_bss_fill(sc, ni, &bss);
+	sc->sc_7927_mbss_known = false;		/* phase 4v: learned again */
 	/* the association request's HE caps are for the AP's band */
 	if (sc->sc_7927_he)
 		mt7927_he_caps(ic, bss.band != 1);
@@ -12824,8 +12967,18 @@ mt7927_send_null_probe(struct mwx_softc *sc)
 	ti.wcid = MT7927_PEER_WCID;
 	ti.omac_idx = sc->sc_vif.omac_idx;
 	ti.band_idx = sc->sc_vif.band_idx;
-	ti.q_idx = qos ? 3 : 1;				/* VO : BE */
-	ti.tid = qos ? 7 : 0;
+	/*
+	 * Phase 4v: on ALTX0, as Linux sends it. mac80211 has no TXQ for a
+	 * frame without data when the driver did not opt in (tx.c
+	 * ieee80211_get_txq()), so it goes to mt76's pending path, which puts
+	 * a no-data, non-bufferable frame on MT_TXQ_PSD (mt76 tx.c,
+	 * MT_DRV_HW_MGMT_TXQ), and mt7925_mac_write_txwi() makes that
+	 * MT_LMAC_ALTX0. TID 7 (ieee80211_tx_skb() sends on VO), fixed rate
+	 * (USE_MINRATE while polling) and BA off (mt7927_tx_frame) as there.
+	 * On the AC queue (3/1) the TX status never came.
+	 */
+	ti.q_idx = MT7927_LMAC_ALTX0;
+	ti.tid = 7;
 	ti.hdrlen = qos ? sizeof(wh) : sizeof(struct ieee80211_frame);
 	ti.fixed_rate = true;
 	ti.rate_idx = MT7927_BASIC_RATES_IDX(sc->sc_7927_bss.band);
@@ -12840,13 +12993,15 @@ mt7927_send_null_probe(struct mwx_softc *sc)
 /*
  * Phase 4i: signs of the AP: frames from our BSS of any kind (beacons,
  * data, management) and, phase 4k, ACKs of the watchdog's null probes.
+ * Phase 4v: and beacons of our multiple-BSSID set's transmitted BSSID (the
+ * same radio; mac80211's ieee80211_rx_our_beacon()).
  */
 static uint32_t
 mt7927_rx_from_bss(struct mwx_softc *sc)
 {
-	return sc->sc_7927_rx_bcn + sc->sc_7927_rx_mcast +
-	    sc->sc_7927_rx_ucast + sc->sc_7927_rx_bss_mgt +
-	    sc->sc_7927_probe_acks;
+	return sc->sc_7927_rx_bcn + sc->sc_7927_rx_tx_bcn +
+	    sc->sc_7927_rx_mcast + sc->sc_7927_rx_ucast +
+	    sc->sc_7927_rx_bss_mgt + sc->sc_7927_probe_acks;
 }
 
 /*
@@ -12948,7 +13103,8 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 			 * the null probes' ACKs alone (its beacons come from
 			 * the transmitted BSSID of an MBSSID set). Leave only
 			 * if TX status said "not acked"; without any status,
-			 * stay (and say so), as before this phase.
+			 * stay (and say so), as before this phase. Phase 4v:
+			 * those beacons count now, when they reach the host.
 			 */
 			if (sc->sc_7927_wd_idle &&
 			    sc->sc_7927_probe_nacks == sc->sc_7927_wd_nack_mark) {
@@ -13037,6 +13193,10 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 		 * (and no ACK) for IEEE80211_CONNECTION_IDLE_TIME, 30 s, and
 		 * it probes (ieee80211_sta_conn_mon_timer). Same here; an AP
 		 * that is there ACKs the null probe and we stay.
+		 * Phase 4v: per the drop log (Nov 16) no beacons reach the host
+		 * in RUN outside scans, so the transmitted BSSID's beacons
+		 * (sc_7927_rx_tx_bcn) move `heard` only during scans. An idle
+		 * link rests on the null probe's TX status (now on ALTX0).
 		 */
 		else if (sc->sc_7927_run_polls > 35 &&
 		    heard == sc->sc_7927_wd_window_mark) {
@@ -13223,11 +13383,13 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		mt7927_engine_tx_counters(sc->sc_7927, &q, &d, &fe, &nt, &rc, &rf);
 		MWX_DEV_LOG(sc, "MT7927 tx: queued %u done %u free events %u "
 		    "no token %u reclaimed %u ring full %u encfail %u, oerrors %u; "
-		    "rx from bss: beacons %u mcast %u ucast %u, decrypt fail %u, "
+		    "rx from bss: beacons %u (transmitted BSSID %u) mcast %u "
+		    "ucast %u, decrypt fail %u, "
 		    "ierrors %u; chip keys 0x%x: rx decrypted %u (no PN %u), "
 		    "tx hw %u sw %u, key failures %u\n",
 		    q, d, fe, nt, rc, rf, sc->sc_7927_tx_encfail,
 		    sc->sc_ic.ic_if.if_oerrors, sc->sc_7927_rx_bcn,
+		    sc->sc_7927_rx_tx_bcn,
 		    sc->sc_7927_rx_mcast, sc->sc_7927_rx_ucast,
 		    (unsigned)sc->sc_ic.ic_stats.is_rx_wepfail,
 		    sc->sc_ic.ic_if.if_ierrors, sc->sc_7927_hwkeys,
