@@ -90,6 +90,7 @@ struct Chip {
   uint32_t fw_start_option = 0xffff, fw_start_addr = 0xffff;
   /* phase 4b */
   std::vector<uint16_t> bss_tags; uint16_t bss_ntlv = 0; uint8_t bss_bssid[6] = {0}; int bss_conn_state = -1;
+  uint8_t bss_mbssid[8] = {0};                           /* phase 4v.1: the 11V_MBSSID TLV as sent */
   uint8_t bss_phymode = 0, bss_rate_idx = 0, bss_rlm_ch = 0, bss_rlm_band = 0, bss_band = 0xff; uint16_t bss_basic_rate = 0;
   uint8_t bss_rlm_center = 0, bss_rlm_bw = 0xff, bss_rlm_sco = 0xff, bss_rlm_htop = 0xff;
   uint16_t bss_he_rts = 0, bss_he_mcs[3] = {0}; uint8_t bss_he_pe = 0, bss_color_en = 0xff, bss_color = 0xff;
@@ -318,6 +319,7 @@ static void handle_cmd(const uint8_t *buf, uint32_t len) {
           if (tg == 16) { assert(ln == 8); chip.bss_sec_mode = pl[off + 4]; chip.bss_sec_status = pl[off + 5];
                           chip.bss_sec_cipher = pl[off + 6]; }
           if (tg == 15) assert(ln == 8);
+          if (tg == 6) { assert(ln == 8); memcpy(chip.bss_mbssid, pl + off, 8); }   /* 11V_MBSSID */
           if (tg == 5) { assert(ln == 16 && pl[off + 7] == 0 && pl[off + 14] == 0 && pl[off + 15] == 0);  /* HE_BASIC */
                          memcpy(&chip.bss_he_rts, pl + off + 4, 2); chip.bss_he_pe = pl[off + 6];
                          memcpy(chip.bss_he_mcs, pl + off + 8, 6); }
@@ -907,6 +909,17 @@ int main() {
     assert(mt7927_bss_info(&r->b, &v, &bss, true) == 0);
     const uint16_t want_bss[] = {0, 16, 11, 15, 26, 23, 2, 6};
     assert(chip.bss_tags.size() == 8 && memcmp(chip.bss_tags.data(), want_bss, sizeof want_bss) == 0);
+    /* phase 4v.1: struct bss_info_uni_mbssid, byte for byte: tag 6, len 8, max_indicator, mbss_idx,
+       tx_bss_omac_idx 0, rsv; all zero for a BSS that is no nontransmitted BSSID */
+    { const uint8_t z[8] = {6, 0, 8, 0, 0, 0, 0, 0}; assert(memcmp(chip.bss_mbssid, z, 8) == 0); }
+    { struct mt7927_bss nt = bss; nt.mbss_max = 2; nt.mbss_idx = 1;
+      memset(chip.bss_mbssid, 0xee, 8);
+      assert(mt7927_bss_info(&r->b, &v, &nt, true) == 0);
+      const uint8_t w[8] = {6, 0, 8, 0, 2, 1, 0, 0}; assert(memcmp(chip.bss_mbssid, w, 8) == 0);
+      assert(chip.bss_tags.size() == 8 && chip.bss_tags.back() == 6);
+      memset(chip.bss_mbssid, 0xee, 8);                                       /* leave: no MBSSID TLV */
+      assert(mt7927_bss_info(&r->b, &v, &nt, false) == 0 && chip.bss_mbssid[0] == 0xee);
+      assert(mt7927_bss_info(&r->b, &v, &bss, true) == 0); }
     assert(chip.bss_conn_state == 0 && memcmp(chip.bss_bssid, ap, 6) == 0 && chip.bss_wcid == 1 && chip.bss_band == 1);
     assert(chip.bss_rate_idx == MT7927_BASIC_RATES_TBL + 4 && chip.bss_basic_rate == 0x540);
     assert(chip.bss_rlm_ch == 36 && chip.bss_rlm_band == 2 && chip.bss_phymode == 0x01);

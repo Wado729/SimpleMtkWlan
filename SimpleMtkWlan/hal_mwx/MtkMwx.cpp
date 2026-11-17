@@ -479,6 +479,25 @@ struct mt7927_ba_op {
 	uint8_t			key[32];
 };
 
+/*
+ * Phase 4v.1: a multiple-BSSID set heard in a beacon or probe response
+ * (cfg80211 keeps them as bss->transmitted_bss, max_bssid_indicator,
+ * bssid_index): the transmitted BSSID, its MaxBSSID Indicator and which
+ * Multiple BSSID-Index values have a profile.
+ */
+#define	MT7927_MBSS_SETS	8
+/* review: not trusted after 5 min unheard (cfg80211 expires scan entries) */
+#define	MT7927_MBSS_EXPIRE_MS	(5 * 60 * 1000)
+struct mt7927_mbss_set {
+	uint8_t		tx[6];
+	uint8_t		n;			/* 0: entry unused */
+	uint8_t		map[32];		/* bit i: index i listed */
+	uint32_t	seen;			/* sc_7927_mbss_seq when heard */
+	uint32_t	when;			/* mt7927_now_ms() when heard */
+};
+
+static uint32_t	mt7927_now_ms(void);
+
 struct mwx_softc {
 	struct device		sc_dev;
 	struct ieee80211com	sc_ic;
@@ -696,9 +715,15 @@ struct mwx_softc {
 	 * the BSSID in sc_7927_mbss_for; cleared at each join and leave.
 	 */
 	bool			sc_7927_mbss_known;
+	bool			sc_7927_mbss_heard;	/* logged its first beacon */
 	uint8_t			sc_7927_mbss_for[6];	/* our BSSID */
 	uint8_t			sc_7927_mbss_tx[6];	/* its transmitted BSSID */
+	uint8_t			sc_7927_mbss_max;	/* 4v.1: MaxBSSID Indicator */
+	uint8_t			sc_7927_mbss_idx;	/* 4v.1: our index */
 	uint32_t		sc_7927_rx_tx_bcn;	/* beacons from that one */
+	struct mt7927_mbss_set	sc_7927_mbss_sets[MT7927_MBSS_SETS];	/* 4v.1 */
+	uint32_t		sc_7927_mbss_seq;
+	uint32_t		sc_7927_bcn_loss_base;	/* 4v.1: at association */
 	/* phase 4i: link watchdog probes the AP before leaving */
 	uint32_t		sc_7927_wd_probes;
 	uint32_t		sc_7927_wd_rx_mark;
@@ -1103,22 +1128,22 @@ mt7927_rx_from_ap(uint8_t fc0, const uint8_t *addr2, const uint8_t *ap)
 }
 
 /*
- * Phase 4v: does a frame from `tx` announce `bssid` as a nontransmitted
- * BSSID of its multiple-BSSID set? Multiple BSSID elements (71: the MaxBSSID
- * Indicator n, then subelements), in each Nontransmitted BSSID Profile
- * (subelement 0) its Multiple BSSID-Index element (85). The BSSID is
- * cfg80211_gen_new_bssid()'s: the low n bits of tx plus the index, modulo
- * 2^n; n is 1..8, so only the last octet differs. A profile split over two
- * elements is found only if its index element is in the first part.
+ * Phase 4v: the multiple-BSSID set a frame announces. Multiple BSSID
+ * elements (71: the MaxBSSID Indicator n, then subelements), in each
+ * Nontransmitted BSSID Profile (subelement 0) its Multiple BSSID-Index
+ * element (85). Sets *n_out and map (bit i: index i has a profile); false
+ * without a valid element. Elements whose n differs from the first are
+ * skipped. A profile split over two elements counts only if its index
+ * element is in the first part.
  */
 static bool
-mt7927_mbssid_lists(const uint8_t *ies, size_t len, const uint8_t *tx,
-    const uint8_t *bssid, uint8_t *idx_out, uint8_t *max_out)
+mt7927_mbssid_parse(const uint8_t *ies, size_t len, uint8_t *n_out,
+    uint8_t map[32])
 {
 	const uint8_t *e, *end = ies + len;
+	uint8_t first = 0;
 
-	if (memcmp(tx, bssid, 5) != 0)
-		return false;
+	memset(map, 0, 32);
 	for (e = ies; e + 2 <= end && e + 2 + e[1] <= end; e += 2 + e[1]) {
 		const uint8_t *s, *se;
 		uint8_t n, mask;
@@ -1126,8 +1151,9 @@ mt7927_mbssid_lists(const uint8_t *ies, size_t len, const uint8_t *tx,
 		if (e[0] != IEEE80211_ELEMID_MULTI_BSSID || e[1] < 1)
 			continue;
 		n = e[2];
-		if (n < 1 || n > 8)
+		if (n < 1 || n > 8 || (first != 0 && n != first))
 			continue;
+		first = n;
 		mask = (uint8_t)((1U << n) - 1);
 		se = e + 2 + e[1];
 		for (s = e + 3; s + 2 <= se && s + 2 + s[1] <= se;
@@ -1139,24 +1165,130 @@ mt7927_mbssid_lists(const uint8_t *ies, size_t len, const uint8_t *tx,
 			pe = s + 2 + s[1];
 			for (p = s + 2; p + 2 <= pe && p + 2 + p[1] <= pe;
 			    p += 2 + p[1]) {
-				uint8_t idx;
-
 				if (p[0] != IEEE80211_ELEMID_MULTI_BSSID_IDX ||
 				    p[1] < 1)
 					continue;
-				idx = p[2];
-				if (idx != 0 && idx <= mask &&
-				    (uint8_t)((tx[5] & ~mask) |
-				    (((tx[5] & mask) + idx) & mask)) == bssid[5]) {
-					*idx_out = idx;
-					*max_out = n;
-					return true;
-				}
+				if (p[2] != 0 && p[2] <= mask)
+					map[p[2] / 8] |= (uint8_t)(1U << (p[2] % 8));
 				break;		/* one index per profile */
 			}
 		}
 	}
-	return false;
+	*n_out = first;
+	return first != 0;
+}
+
+/*
+ * Phase 4v: is `bssid` index *idx_out of the set (tx, n, map)? The BSSID is
+ * cfg80211_gen_new_bssid()'s: the low n bits of tx plus the index, modulo
+ * 2^n; n is 1..8, so only the last octet differs.
+ */
+static bool
+mt7927_mbssid_index(const uint8_t *tx, uint8_t n, const uint8_t map[32],
+    const uint8_t *bssid, uint8_t *idx_out)
+{
+	uint8_t mask, idx;
+
+	if (n < 1 || n > 8 || memcmp(tx, bssid, 5) != 0)
+		return false;
+	mask = (uint8_t)((1U << n) - 1);
+	if ((tx[5] & ~mask) != (bssid[5] & ~mask))
+		return false;
+	idx = (uint8_t)((bssid[5] - tx[5]) & mask);
+	if (idx == 0 || !(map[idx / 8] & (1U << (idx % 8))))
+		return false;
+	*idx_out = idx;
+	return true;
+}
+
+/* Phase 4v: does a frame from `tx` announce `bssid` in its MBSSID set? */
+static bool
+mt7927_mbssid_lists(const uint8_t *ies, size_t len, const uint8_t *tx,
+    const uint8_t *bssid, uint8_t *idx_out, uint8_t *max_out)
+{
+	uint8_t n, map[32];
+
+	if (memcmp(tx, bssid, 5) != 0 ||
+	    !mt7927_mbssid_parse(ies, len, &n, map) ||
+	    !mt7927_mbssid_index(tx, n, map, bssid, idx_out))
+		return false;
+	*max_out = n;
+	return true;
+}
+
+/*
+ * Phase 4v.1: remember the sets that beacons and probe responses announce
+ * (any state: scans), as cfg80211 does for its scan results, so that the
+ * join knows its BSS's set before an association response.
+ */
+static void
+mt7927_rx_mbss_note(struct mwx_softc *sc, const uint8_t *f, size_t len)
+{
+	const struct ieee80211_frame *wh = (const struct ieee80211_frame *)f;
+	struct mt7927_mbss_set *e = NULL;
+	uint8_t n, map[32], st;
+	unsigned i;
+
+	if (len < sizeof(*wh) + 12 ||
+	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_MGT)
+		return;
+	st = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+	if ((st != IEEE80211_FC0_SUBTYPE_BEACON &&
+	    st != IEEE80211_FC0_SUBTYPE_PROBE_RESP) ||
+	    !IEEE80211_ADDR_EQ(wh->i_addr2, wh->i_addr3) ||
+	    !mt7927_mbssid_parse(f + sizeof(*wh) + 12,
+	    len - sizeof(*wh) - 12, &n, map))
+		return;
+	for (i = 0; i < MT7927_MBSS_SETS; i++) {
+		struct mt7927_mbss_set *c = &sc->sc_7927_mbss_sets[i];
+
+		if (c->n != 0 && IEEE80211_ADDR_EQ(c->tx, wh->i_addr3)) {
+			e = c;
+			break;
+		}
+		if (e == NULL || c->n == 0 ||
+		    (e->n != 0 && (int32_t)(c->seen - e->seen) < 0))
+			e = c;				/* free, or the oldest */
+	}
+	IEEE80211_ADDR_COPY(e->tx, wh->i_addr3);
+	e->n = n;
+	memcpy(e->map, map, sizeof(e->map));
+	e->seen = ++sc->sc_7927_mbss_seq;
+	e->when = mt7927_now_ms();
+}
+
+/*
+ * Phase 4v.1: at the join, our BSS's set if one was heard (cfg80211's
+ * bss->transmitted_bss, max_bssid_indicator, bssid_index). Sets the
+ * sc_7927_mbss_* record; false if none lists `bssid`.
+ */
+static bool
+mt7927_mbss_lookup(struct mwx_softc *sc, const uint8_t *bssid)
+{
+	const struct mt7927_mbss_set *best = NULL;
+	uint8_t idx = 0, bidx = 0;
+	uint32_t now = mt7927_now_ms();
+	unsigned i;
+
+	for (i = 0; i < MT7927_MBSS_SETS; i++) {
+		const struct mt7927_mbss_set *c = &sc->sc_7927_mbss_sets[i];
+
+		if (c->n != 0 && now - c->when <= MT7927_MBSS_EXPIRE_MS &&
+		    mt7927_mbssid_index(c->tx, c->n, c->map, bssid,
+		    &idx) && (best == NULL || (int32_t)(c->seen - best->seen) > 0)) {
+			best = c;
+			bidx = idx;
+		}
+	}
+	if (best == NULL)
+		return false;
+	IEEE80211_ADDR_COPY(sc->sc_7927_mbss_for, bssid);
+	IEEE80211_ADDR_COPY(sc->sc_7927_mbss_tx, best->tx);
+	sc->sc_7927_mbss_max = best->n;
+	sc->sc_7927_mbss_idx = bidx;
+	sc->sc_7927_mbss_known = true;
+	sc->sc_7927_mbss_heard = false;
+	return true;
 }
 
 /*
@@ -1166,8 +1298,9 @@ mt7927_mbssid_lists(const uint8_t *ies, size_t len, const uint8_t *tx,
  * BSSID. mac80211 takes those as our beacons (ieee80211_rx_our_beacon(): the
  * BSS's bssid or its transmitted_bss's) and, in ieee80211_rx_mgmt_beacon(),
  * cancels an AP probe and pushes its beacon loss detection back on them.
- * cfg80211 knows the set from the scan; here it is the first beacon heard
- * associated that lists our BSSID in its Multiple BSSID element.
+ * cfg80211 knows the set from the scan (4v.1: mt7927_mbss_lookup at the
+ * join); otherwise the first beacon heard associated that lists our BSSID
+ * in its Multiple BSSID element.
  */
 static void
 mt7927_rx_count_bss(struct mwx_softc *sc, const uint8_t *f, size_t len)
@@ -1199,23 +1332,29 @@ mt7927_rx_count_bss(struct mwx_softc *sc, const uint8_t *f, size_t len)
 	if (t != IEEE80211_FC0_TYPE_MGT || st != IEEE80211_FC0_SUBTYPE_BEACON ||
 	    !IEEE80211_ADDR_EQ(wh->i_addr2, wh->i_addr3))
 		return;
-	if (sc->sc_7927_mbss_known &&
-	    IEEE80211_ADDR_EQ(sc->sc_7927_mbss_for, bssid)) {
-		if (IEEE80211_ADDR_EQ(wh->i_addr3, sc->sc_7927_mbss_tx))
-			sc->sc_7927_rx_tx_bcn++;
+	if (!sc->sc_7927_mbss_known ||
+	    !IEEE80211_ADDR_EQ(sc->sc_7927_mbss_for, bssid)) {
+		/* elements after the header, timestamp, interval, capabilities */
+		if (len < sizeof(*wh) + 12 ||
+		    !mt7927_mbssid_lists(f + sizeof(*wh) + 12,
+		    len - sizeof(*wh) - 12, wh->i_addr3, bssid, &idx, &max))
+			return;
+		IEEE80211_ADDR_COPY(sc->sc_7927_mbss_for, bssid);
+		IEEE80211_ADDR_COPY(sc->sc_7927_mbss_tx, wh->i_addr3);
+		sc->sc_7927_mbss_max = max;
+		sc->sc_7927_mbss_idx = idx;
+		sc->sc_7927_mbss_known = true;
+		sc->sc_7927_mbss_heard = false;
+	} else if (!IEEE80211_ADDR_EQ(wh->i_addr3, sc->sc_7927_mbss_tx))
 		return;
-	}
-	/* elements after the header, timestamp, interval and capabilities */
-	if (len < sizeof(*wh) + 12 || !mt7927_mbssid_lists(f + sizeof(*wh) + 12,
-	    len - sizeof(*wh) - 12, wh->i_addr3, bssid, &idx, &max))
-		return;
-	IEEE80211_ADDR_COPY(sc->sc_7927_mbss_for, bssid);
-	IEEE80211_ADDR_COPY(sc->sc_7927_mbss_tx, wh->i_addr3);
-	sc->sc_7927_mbss_known = true;
 	sc->sc_7927_rx_tx_bcn++;
-	MWX_DEV_LOG(sc, "MT7927 link watchdog: our AP's beacons come from the "
-	    "transmitted BSSID %s (multiple BSSID index %u, max indicator %u)\n",
-	    ether_sprintf(sc->sc_7927_mbss_tx), idx, max);
+	if (!sc->sc_7927_mbss_heard) {
+		sc->sc_7927_mbss_heard = true;
+		MWX_DEV_LOG(sc, "MT7927 link watchdog: our AP's beacons come from "
+		    "the transmitted BSSID %s (multiple BSSID index %u, max "
+		    "indicator %u)\n", ether_sprintf(sc->sc_7927_mbss_tx),
+		    sc->sc_7927_mbss_idx, sc->sc_7927_mbss_max);
+	}
 }
 
 static inline uint32_t
@@ -2423,12 +2562,14 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 		}
 	}
 	sc->sc_rx_delivered++;
-	if (sc->sc_hwtype == MWX_HW_MT7927)
+	if (sc->sc_hwtype == MWX_HW_MT7927) {
 		/*
 		 * mtod/mbuf_len: the first mbuf only. mt7927_hal_rx copies a
 		 * frame into one packet, and RX frames fit one cluster.
 		 */
+		mt7927_rx_mbss_note(sc, mtod(m, const uint8_t *), mbuf_len(m));
 		mt7927_rx_count_bss(sc, mtod(m, const uint8_t *), mbuf_len(m));
+	}
 	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_CTL) {
 		mwx_rx_ctl_cnt++;
 		if ((wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK) ==
@@ -8385,7 +8526,14 @@ mt7927_bss_info(struct mt7927_bringup *b, const struct mt7927_vif *v,
 		t[11] = bss->chan < center ? 1 : bss->chan > center ? 3 : 0;	/* sco */
 		t[12] = bss->band;				/* 1: 2.4, 2: 5, 3: 6 GHz */
 
+		/*
+		 * mt7925_mcu_bss_mbssid_tlv(), struct bss_info_uni_mbssid:
+		 * max_indicator, mbss_idx, tx_bss_omac_idx 0, rsv. Phase 4v.1:
+		 * filled for a nontransmitted BSSID (zero otherwise).
+		 */
 		t = mt7927_msg_tlv(&m, MT7927_BSS_TAG_MBSSID, 8);
+		t[4] = bss->mbss_max;
+		t[5] = bss->mbss_idx;
 	}
 	rv = mt7927_uni_send_status(b, MCU_UNI_CMD_BSS_INFO_UPDATE, &m, &status);
 	MWX_DEV_LOG(b->sc, "MT7927 BSS_INFO %s %02x:%02x:%02x:%02x:%02x:%02x ch %u "
@@ -10775,6 +10923,63 @@ mt7927_tx_drain(struct mwx_softc *sc, const char *why)
 		    "the chip, %u not fetched)\n", why, waited, inflight, ring);
 }
 
+/*
+ * Phase 4v.1 (review): the multiple-BSSID table and the sc_7927_mbss_*
+ * record are written by the RX path (mt7927_rx_mbss_note,
+ * mt7927_rx_count_bss) on the work loop; the join and leave run on the
+ * newstate thread. Their part runs here, on the command gate (as 4x's
+ * mt7927_join_scan_abort_action), so a set is never read half replaced.
+ */
+enum { MT7927_MBSS_JOIN = 1, MT7927_MBSS_LEAVE, MT7927_MBSS_GET };
+
+static IOReturn
+mt7927_mbss_action(OSObject *, void *arg0, void *arg1, void *arg2, void *arg3)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg0;
+	const uint8_t *bssid = (const uint8_t *)arg2;
+	uint8_t *out = (uint8_t *)arg3;		/* GET: max, idx, tx[6] */
+
+	switch ((int)(uintptr_t)arg1) {
+	case MT7927_MBSS_JOIN:
+		sc->sc_7927_mbss_known = false;		/* learned again */
+		if (!mt7927_mbss_lookup(sc, bssid))
+			return kIOReturnNotFound;
+		MWX_DEV_LOG(sc, "MT7927 joining a nontransmitted BSSID: index %u "
+		    "of the multiple-BSSID set of %s (max indicator %u)\n",
+		    sc->sc_7927_mbss_idx, ether_sprintf(sc->sc_7927_mbss_tx),
+		    sc->sc_7927_mbss_max);
+		return kIOReturnSuccess;
+	case MT7927_MBSS_LEAVE:
+		sc->sc_7927_mbss_known = false;
+		return kIOReturnSuccess;
+	case MT7927_MBSS_GET:
+		if (!sc->sc_7927_mbss_known ||
+		    !IEEE80211_ADDR_EQ(sc->sc_7927_mbss_for, bssid))
+			return kIOReturnNotFound;
+		out[0] = sc->sc_7927_mbss_max;
+		out[1] = sc->sc_7927_mbss_idx;
+		IEEE80211_ADDR_COPY(out + 2, sc->sc_7927_mbss_tx);
+		return kIOReturnSuccess;
+	}
+	return kIOReturnBadArgument;
+}
+
+static bool
+mt7927_mbss_gated(struct mwx_softc *sc, int op, const uint8_t *bssid,
+    uint8_t *out)
+{
+	IOCommandGate *gate = gMwxHal != NULL ? gMwxHal->mwxGate() : NULL;
+	IOReturn r;
+
+	if (gate != NULL)
+		r = gate->runAction(mt7927_mbss_action, sc,
+		    (void *)(uintptr_t)op, (void *)bssid, out);
+	else
+		r = mt7927_mbss_action(NULL, sc, (void *)(uintptr_t)op,
+		    (void *)bssid, out);
+	return r == kIOReturnSuccess;
+}
+
 static void
 mt7927_join_teardown(struct mwx_softc *sc, const char *why)
 {
@@ -10803,7 +11008,7 @@ mt7927_join_teardown(struct mwx_softc *sc, const char *why)
 	mt7927_bss_info(sc->sc_7927, &v, &sc->sc_7927_bss, false);
 	sc->sc_7927_joined = false;
 	sc->sc_7927_assoc = false;
-	sc->sc_7927_mbss_known = false;		/* phase 4v */
+	(void)mt7927_mbss_gated(sc, MT7927_MBSS_LEAVE, NULL, NULL);	/* 4v */
 	sc->sc_7927_hwkeys = 0;
 	sc->sc_7927_ptk_pending = false;
 	mt7927_rx_decap_reset(sc);
@@ -10826,7 +11031,8 @@ mt7927_join_prepare(struct mwx_softc *sc)
 	    ni->ni_chan == IEEE80211_CHAN_ANYC)
 		return EINVAL;
 	mt7927_bss_fill(sc, ni, &bss);
-	sc->sc_7927_mbss_known = false;		/* phase 4v: learned again */
+	/* phase 4v: learned again; 4v.1: its set from the scan, as cfg80211 */
+	(void)mt7927_mbss_gated(sc, MT7927_MBSS_JOIN, bss.bssid, NULL);
 	/* the association request's HE caps are for the AP's band */
 	if (sc->sc_7927_he)
 		mt7927_he_caps(ic, bss.band != 1);
@@ -10910,6 +11116,22 @@ mt7927_join_assoc(struct mwx_softc *sc)
 
 		mt7927_bss_fill(sc, ic->ic_bss, &nb);
 		nb.cipher = sc->sc_7927_bss.cipher;
+		/*
+		 * Phase 4v.1: a nontransmitted BSSID's set, as mac80211 sets
+		 * bss_conf->bssid_indicator/bssid_index at the association
+		 * (ieee80211_assoc_config_link()) and mt7925 sends them in this
+		 * BSS_INFO (mt7925_mac_link_sta_assoc() ->
+		 * mt7925_mcu_bss_mbssid_tlv()). At AUTH they are still 0.
+		 */
+		uint8_t mb[8];
+
+		if (mt7927_mbss_gated(sc, MT7927_MBSS_GET, nb.bssid, mb)) {
+			nb.mbss_max = mb[0];
+			nb.mbss_idx = mb[1];
+			MWX_DEV_LOG(sc, "MT7927 BSS_INFO MBSSID: index %u, max "
+			    "indicator %u (transmitted BSSID %s)\n", nb.mbss_idx,
+			    nb.mbss_max, ether_sprintf(mb + 2));
+		}
 		sc->sc_7927_bss = nb;
 		MWX_DEV_LOG(sc, "MT7927 peer at association: %s%s%s%sphymode 0x%02x "
 		    "phy_type 0x%02x bw %u center %u ampdu 0x%02x max %u "
@@ -13033,6 +13255,12 @@ static void	mt7927_link_leave(struct mwx_softc *, const char *, uint32_t,
 		    uint32_t, uint32_t);
 
 /*
+ * Phase 4v.1: the poll (1 s) after the association's first 60 s, when the
+ * watchdog says how many firmware beacon loss events came in them.
+ */
+#define	MT7927_BCN_LOSS_REPORT_POLLS	61
+
+/*
  * The radio stopped hearing the AP: a firmware beacon-loss event (Linux:
  * mt7925_mcu_connection_loss_event()), or no receive airtime at all in a
  * 30 s MIB window while associated (on a working 5 GHz channel there is
@@ -13135,6 +13363,7 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 	if (sc->sc_7927_run_polls == 1) {
 		/* baseline at association: count only what happens from now */
 		sc->sc_7927_bcn_loss_seen = loss;
+		sc->sc_7927_bcn_loss_base = loss;
 		sc->sc_7927_mib_seen = windows;
 		sc->sc_7927_wd_window_mark = mt7927_rx_from_bss(sc);
 		return;
@@ -13161,9 +13390,21 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 			return;
 		}
 		MWX_DEV_LOG(sc, "MT7927 link watchdog: firmware beacon loss "
-		    "event (%u so far), not acted on; rx airtime %u us\n", loss,
-		    rxt);
+		    "event (%u so far), not acted on; rx airtime %u us; %u s "
+		    "into the association, MBSSID %s\n", loss, rxt,
+		    sc->sc_7927_run_polls, sc->sc_7927_bss.mbss_max ?
+		    "set told to the firmware" : "none told");
 	}
+	/*
+	 * Phase 4v.1 evidence: those events came ~30 s after every join. Say
+	 * once per association whether any came in its first 60 s, and
+	 * whether the firmware was told of an MBSSID set (BSS_INFO 11V_MBSSID).
+	 */
+	if (sc->sc_7927_run_polls == MT7927_BCN_LOSS_REPORT_POLLS)
+		MWX_DEV_LOG(sc, "MT7927 link watchdog: %u firmware beacon loss "
+		    "events in the first 60 s of the association (MBSSID %s)\n",
+		    loss - sc->sc_7927_bcn_loss_base, sc->sc_7927_bss.mbss_max ?
+		    "set told to the firmware" : "none told");
 	if (windows != sc->sc_7927_mib_seen) {
 		uint32_t heard = mt7927_rx_from_bss(sc);
 

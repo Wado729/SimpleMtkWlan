@@ -49,6 +49,9 @@ struct mt7927_bss {
 	uint8_t		phymode_ext;	/* BSS_INFO basic: PHY_MODE_AX_6G BIT(0) */
 	uint8_t		vht_tlv;	/* STA_REC_VHT even without VHT (6 GHz) */
 	uint16_t	he_6g_capa;	/* the AP's HE 6 GHz Band Capabilities: STA_REC_HE_6G */
+	/* phase 4v.1: a nontransmitted BSSID (mt7925_mcu_bss_mbssid_tlv) */
+	uint8_t		mbss_max;	/* MaxBSSID Indicator, 0: not one */
+	uint8_t		mbss_idx;	/* its Multiple BSSID-Index */
 };
 
 /* MT7927 phase 4b: per-frame TXD inputs. */

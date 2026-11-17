@@ -47,11 +47,13 @@ static_assert(sizeof(ieee80211_frame) == 24, "802.11 header");
 struct ieee80211_node { uint8_t ni_bssid[6]; };
 struct ieee80211com { int ic_state; ieee80211_node *ic_bss; };
 struct mwx_softc { ieee80211com sc_ic; uint32_t sc_7927_rx_bcn, sc_7927_rx_mcast, sc_7927_rx_ucast, sc_7927_rx_bss_mgt;
-  bool sc_7927_mbss_known; uint8_t sc_7927_mbss_for[6], sc_7927_mbss_tx[6]; uint32_t sc_7927_rx_tx_bcn, sc_7927_probe_acks; };
+  bool sc_7927_mbss_known, sc_7927_mbss_heard; uint8_t sc_7927_mbss_for[6], sc_7927_mbss_tx[6], sc_7927_mbss_max, sc_7927_mbss_idx;
+  uint32_t sc_7927_rx_tx_bcn, sc_7927_probe_acks; };
 static int logs;
 static const char *ether_sprintf(const uint8_t *) { return "tx"; }
 #define MWX_DEV_LOG(sc, ...) (logs++, printf(__VA_ARGS__))
-''' + fn(s, "mt7927_mbssid_lists", "static bool") + fn(s, "mt7927_rx_count_bss", "static void") + \
+''' + fn(s, "mt7927_mbssid_parse", "static bool") + fn(s, "mt7927_mbssid_index", "static bool") + \
+    fn(s, "mt7927_mbssid_lists", "static bool") + fn(s, "mt7927_rx_count_bss", "static void") + \
     fn(s, "mt7927_rx_from_bss", "static uint32_t") + r'''
 typedef std::vector<uint8_t> V;
 static const uint8_t TX[6] = { 0x72, 0x00, 0x00, 0x00, 0x03, 0x4c }, B4D[6] = { 0x72, 0x00, 0x00, 0x00, 0x03, 0x4d },
@@ -111,6 +113,7 @@ int main() {
   rx(&sc, bcn);
   assert(sc.sc_7927_mbss_known && !memcmp(sc.sc_7927_mbss_tx, TX, 6) && !memcmp(sc.sc_7927_mbss_for, B4D, 6));
   assert(sc.sc_7927_rx_tx_bcn == 1 && logs == 1 && mt7927_rx_from_bss(&sc) == h0 + 1);
+  assert(sc.sc_7927_mbss_max == 2 && sc.sc_7927_mbss_idx == 1);
   assert(sc.sc_7927_rx_bcn == 0 && sc.sc_7927_rx_bss_mgt == 0);
   /* later beacons count without the element (one log per association) */
   rx(&sc, frame(0x80, BC, TX, TX, V{ 0, 0 })); assert(sc.sc_7927_rx_tx_bcn == 2 && logs == 1);
@@ -131,6 +134,11 @@ int main() {
   memcpy(ap.ni_bssid, B4E, 6);
   rx(&sc, frame(0x80, BC, TX, TX, V{ 0, 0 })); assert(sc.sc_7927_rx_tx_bcn == 2);
   rx(&sc, bcn); assert(sc.sc_7927_rx_tx_bcn == 3 && !memcmp(sc.sc_7927_mbss_for, B4E, 6) && logs == 2);
+  /* known from the scan (4v.1): the first beacon from it logs, without the element */
+  { mwx_softc s3{}; s3.sc_ic.ic_bss = &ap; s3.sc_ic.ic_state = IEEE80211_S_ASSOC; s3.sc_7927_mbss_known = true;
+    memcpy(s3.sc_7927_mbss_for, B4E, 6); memcpy(s3.sc_7927_mbss_tx, TX, 6); s3.sc_7927_mbss_max = 2; s3.sc_7927_mbss_idx = 2; int l = logs;
+    rx(&s3, frame(0x80, BC, TX, TX, V{ 0, 0 })); rx(&s3, frame(0x80, BC, TX, TX, V{ 0, 0 }));
+    assert(s3.sc_7927_rx_tx_bcn == 2 && logs == l + 1 && s3.sc_7927_mbss_heard); }
   /* cleared (join/leave): learned again */
   sc.sc_7927_mbss_known = false; rx(&sc, frame(0x80, BC, TX, TX, V{ 0, 0 })); assert(sc.sc_7927_rx_tx_bcn == 3);
   printf("PASS\n"); return 0;
