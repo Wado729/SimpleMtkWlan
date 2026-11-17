@@ -888,6 +888,7 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork(const char *why)
     abortWCLRoam(kIOReturnAborted, why);
     roamScanPending = false;            // 4u.1 review
     roamScanIntervalMs = 0;
+    roamLastWideMs = 0;                 // 4w review
     XYLog("WCL leave (%s): state %d joinPending %d assoc %d firstBeacon %d bssValid %d "
         "join beacons %u assoc beacons %u port %d\n", why, ic->ic_state, joinPending,
         assocNotified, firstBeaconNotified, wclBssValid, wclJoinBeacons,
@@ -1039,10 +1040,12 @@ void AirportItlwmSkywalkInterface::synthesizeWCLFirstBeacon()
  * order (AppleBCMWLANCore: roam scan start 137, reassoc 73, link up 216 with
  * the new BSSID, roam completion 80); WCLNetManager::linkUp then reads the
  * new BSS (updateBss), and WCLRoamManager keeps its statistics. Here the
- * driver decides like a Mac with default settings (the user's choice):
- * only on a weak link (averaged signal, phase 4t, at or below -72 dBm) and
- * only to an AP of the same network at least 8 dB stronger, heard in the
- * last 30 s (macOS's own associated scans keep the list fresh); not in the
+ * driver decides like a Mac with default settings (the user's choice), by
+ * the roam profile macOS gives it for the band of our AP (phase 4w,
+ * AirportWCL::roamProfile): only on a weak link (averaged signal, phase 4t,
+ * at or below -70 dBm on 6 GHz, -75 dBm otherwise) and only to an AP of the
+ * same network at least 12 dB stronger, heard in the last 30 s (our roam
+ * scans and macOS's associated scans keep the list fresh); not in the
  * first minute of a link, at most one try a minute, and an AP that failed
  * is left alone for 5 minutes. No fast transition on the user's network,
  * so a roam is a full join (SAE, association, 4-way) with the password the
@@ -1056,9 +1059,20 @@ static constexpr uint64_t kRoamHeardMs = 30000;
 // 4u.3: after link loss an older reading still beats macOS's rejoin; a
 // stale one costs one failed roam (10-15 s), then the leave as before
 static constexpr uint64_t kRoamLostHeardMs = 120000;
-static constexpr uint64_t kRoamScanMs = 15000;     // a Mac's low-RSSI roam scans: 30 s
+// 4w: a candidate's second reading (our rule, not Apple's: its firmware
+// roams on one scan) comes from a roam scan this soon, while the first one
+// is still fresh (kRoamHeardMs)
+static constexpr uint64_t kRoamConfirmScanMs = 15000;
 static constexpr uint32_t kRoamTimeoutMs = 10000;       // 6 GHz: its channel alone
 static constexpr uint32_t kRoamSweepTimeoutMs = 15000;  // otherwise a full sweep first
+
+// 4w: the roam profile for the band of our AP's channel
+static AirportWCL::RoamProfile roamProfileFor(const ieee80211_channel *c)
+{
+    bool known = c != NULL && c != IEEE80211_CHAN_ANYC;
+    return AirportWCL::roamProfile(known && IEEE80211_IS_CHAN_6GHZ(c) ? AirportWCL::kRoamBand6g :
+        known && IEEE80211_IS_CHAN_2GHZ(c) ? AirportWCL::kRoamBand2g : AirportWCL::kRoamBand5g);
+}
 
 /*
  * The strongest other AP of our network (same SSID, a shared AKM, no failed
@@ -1175,14 +1189,19 @@ void AirportItlwmSkywalkInterface::checkWCLRoam()
         return;
     ieee80211_node *bss = ic->ic_bss;
     int cur = int(bss->ni_rssi) - 100;      // dBm, averaged (phase 4t)
-    if (bss->ni_rssi == 0 || cur > AirportWCL::kRoamTriggerDbm) {
+    AirportWCL::RoamProfile prof = roamProfileFor(bss->ni_chan);
+    if (bss->ni_rssi == 0 || cur > prof.triggerDbm) {
         roamConfirm.armed = false;
-        roamScanIntervalMs = 0;
+        // review: not on every upward tick of an average at the trigger
+        if (bss->ni_rssi != 0 && AirportWCL::roamScanReset(prof, cur)) {
+            roamScanIntervalMs = 0;
+            roamLastWideMs = 0;     // the first scan below the trigger: wide
+        }
         return;
     }
     int bestRssi = -128;
     ieee80211_node *best = findRoamCandidate(kRoamHeardMs, &bestRssi);
-    bool wanted = best != NULL && AirportWCL::roamWanted(cur, bestRssi);
+    bool wanted = best != NULL && AirportWCL::roamWanted(prof, cur, bestRssi);
     bool go = false;
     if (!wanted)
         roamConfirm.armed = false;
@@ -1208,11 +1227,19 @@ void AirportItlwmSkywalkInterface::checkWCLRoam()
         roamConfirm.armed = true;   // the confirmed reading still counts
         roamConfirm.sampleMs = 0;
     }
-    if (go)
+    uint64_t due = roamScanIntervalMs ? roamScanIntervalMs : prof.initScanMs;
+    // review: at most two such early scans per armed AP
+    bool quick = wanted && roamConfirm.armed && due > kRoamConfirmScanMs &&
+        roamConfirm.quickScans < AirportWCL::kRoamConfirmQuickScans;
+    if (quick)
+        due = kRoamConfirmScanMs;
+    if (go) {
         startWCLRoam(best);
-    else if (!roamScanPending &&
-             now - roamLastScanMs >= (roamScanIntervalMs ? roamScanIntervalMs : kRoamScanMs))
+    } else if (!roamScanPending && now - roamLastScanMs >= due) {
+        if (quick)
+            roamConfirm.quickScans++;
         startWCLRoamScan();
+    }
 }
 
 /*
@@ -1220,8 +1247,12 @@ void AirportItlwmSkywalkInterface::checkWCLRoam()
  * fresh enough: macOS skips its own roam scans here ("SKIPPING RoamScan;
  * Env:0 isDualBand:0") and its other scans are minutes apart, and the
  * firmware filters other APs' beacons in RUN. A Mac's firmware roam-scans
- * itself on a weak link (WCL's roam profile below -75 dBm: every 30 s).
- * Here every 15 s while the link is weak: the channels where APs of this
+ * itself on a weak link, by the roam profile's bracket for it (phase 4w:
+ * IO80211's default profile 0, on every band 30 s doubling to 180 s, a
+ * full scan every 90 s; airportd on AC power asks for 20 s to 90 s and a
+ * full scan every 120 s, but our driver returns Unsupported to
+ * WCL_ROAM_PROFILE_CONFIG, and we keep the conservative default). So here
+ * while the link is weak: the channels where APs of this
  * network were heard and our own, through the associated-scan path macOS's
  * scans use (a 6 GHz channel of our own does not leave the home channel).
  */
@@ -1231,10 +1262,11 @@ void AirportItlwmSkywalkInterface::startWCLRoamScan()
     roamLastScanMs = airport_up_time();
     if (roamScanPending || scanPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
         return;
-    // review: back off (15, 30, 60 s) while the scans find nothing better
-    roamScanIntervalMs = roamScanIntervalMs == 0 ? kRoamScanMs :
-        (roamScanIntervalMs * 2 > 4 * kRoamScanMs ? 4 * kRoamScanMs : roamScanIntervalMs * 2);
     ieee80211_node *bss = ic->ic_bss, *ni;
+    AirportWCL::RoamProfile prof = roamProfileFor(bss->ni_chan);
+    // review: back off while the scans find nothing better; 4w: as the
+    // profile does (30, 60, 120, 180, 180 s ...)
+    roamScanIntervalMs = AirportWCL::nextRoamScanMs(prof, roamScanIntervalMs);
     uint8_t bitmap[sizeof(ic->ic_wcl_scan_channels)] = {};
     uint8_t six[sizeof(ic->ic_wcl_scan_channels6g)] = {};
     unsigned n6 = 0, n = 0;
@@ -1267,10 +1299,15 @@ void AirportItlwmSkywalkInterface::startWCLRoamScan()
             memcmp(ni->ni_essid, bss->ni_essid, bss->ni_esslen) == 0)
             add(ni->ni_chan);
     }
-    // review: every 4th roam scan wider, for an AP never heard or aged out:
-    // on 6 GHz the preferred scanning channels (5, 21, ... 229), else the
-    // channels of our band
-    bool wide = (++roamScanCount % 4) == 0;
+    // review: some roam scans wider, for an AP never heard or aged out: on
+    // 6 GHz the preferred scanning channels (5, 21, ... 229), else the
+    // channels of our band. 4w review: the first one below the trigger,
+    // then one per the profile's fullscan_period (roamScanWide); only on a
+    // weak link (a LINK_DOUBT scan on a strong one stays on our channels)
+    uint64_t scanMs = roamLastScanMs;
+    int cur = int(bss->ni_rssi) - 100;
+    bool wide = bss->ni_rssi != 0 && cur <= prof.triggerDbm &&
+        AirportWCL::roamScanWide(prof, roamLastWideMs, scanMs);
     if (wide && IEEE80211_IS_CHAN_6GHZ(bss->ni_chan)) {
         for (unsigned psc = 5; psc <= 229; psc += 16)
             add6(psc);
@@ -1291,6 +1328,8 @@ void AirportItlwmSkywalkInterface::startWCLRoamScan()
     roamScanPending = true;
     ieee80211_begin_cache_bgscan(&ic->ic_if);
     bool started = (ic->ic_flags & IEEE80211_F_BGSCAN) != 0;
+    if (started && wide)
+        roamLastWideMs = scanMs;
     if (!started) {
         roamScanPending = false;
         ic->ic_wcl_scan_requested = false;

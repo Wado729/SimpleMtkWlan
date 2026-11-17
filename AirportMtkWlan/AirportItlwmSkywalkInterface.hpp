@@ -462,7 +462,7 @@ private:
     bool roamScanPending = false;
     uint64_t roamLastScanMs = 0;
     uint64_t roamScanIntervalMs = 0;
-    uint32_t roamScanCount = 0;
+    uint64_t roamLastWideMs = 0;
     void abortWCLRoam(IOReturn status, const char *why);
     bool publishRoamBss();
     AirportWCL::RoamConfirm roamConfirm = {};

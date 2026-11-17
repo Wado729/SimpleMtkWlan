@@ -112,28 +112,88 @@ inline bool set6gChannel(uint8_t *bitmap, size_t length, unsigned num)
     return true;
 }
 
-// Phase 4u: the roam decision (host-tested in tests/roam). Like a Mac with
-// default settings: a weak link and another AP clearly stronger.
-static constexpr int kRoamTriggerDbm = -72;
-static constexpr int kRoamDeltaDb = 8;
-inline bool roamWanted(int currentDbm, int candidateDbm)
+// Phase 4w: the roam decision, per band of the current BSS, from a Mac's
+// roam profile (host-tested in tests/roam): IO80211's profile 0 as Sequoia
+// 15.8.1 logged it for this driver (printRoamingBracket, before the
+// APPLE80211_IOC_WCL_ROAM_PROFILE_CONFIG it failed to set), the bracket that
+// covers a weak link:
+//   Band:0 Index 1 RSSI[-75,-128] Scan(2,90,30,2,180,..) C2g(12,..)  2.4 GHz
+//   Band:1 Index 1 RSSI[-75,-128] Scan(2,90,30,2,180,..) C5g(12,..)  5 GHz
+//   Band:2 Index 0 RSSI[-70,-128] Scan(2,90,30,2,180,..) C6g(12,..)  6 GHz
+// RSSI[trigger, lower]; Scan(nfscan, fullscan_period, init_scan_period,
+// backoff_multiplier, max_scan_period). C2g/C5g/C6g are per CANDIDATE band
+// (roam delta, boost threshold, boost); every delta in these weak-link
+// brackets is 12 (and AppleBCMWLAN hands the firmware one roam_delta), so
+// one 12 dB here. The boost (6 GHz: +70 dB at -65 dBm or better) is left
+// out: it only matters for a candidate of the SSID on another band, so we
+// move up to 5/6 GHz more conservatively than a Mac. Not here either: the
+// 2.4/5 GHz brackets above -75 dBm (lazy, scans every 180-1200 s).
+// This is IO80211's default profile 0. airportd on AC power asks for faster
+// scans (6 GHz: 20 s to 90 s, full scan 120 s), but that path is not taken
+// while our driver returns Unsupported to WCL_ROAM_PROFILE_CONFIG; we keep
+// the conservative default.
+enum RoamBand { kRoamBand2g, kRoamBand5g, kRoamBand6g };
+struct RoamProfile {
+    int triggerDbm;         // roam scans and roams at or below this
+    int deltaDb;            // to a candidate at least this much stronger
+    uint32_t initScanMs;    // first roam-scan interval,
+    uint32_t backoff;       // times this after each scan,
+    uint32_t maxScanMs;     // up to this
+    uint32_t fullScanMs;    // a wide roam scan at least this often
+};
+inline RoamProfile roamProfile(RoamBand band)
 {
-    return currentDbm <= kRoamTriggerDbm && candidateDbm >= currentDbm + kRoamDeltaDb;
+    RoamProfile p = { band == kRoamBand6g ? -70 : -75, 12, 30000, 2, 180000, 90000 };
+    return p;
+}
+// Review: the scan cadence starts over only once the average is clearly
+// above the trigger, not on every tick of one hovering at it.
+static constexpr int kRoamResetHysteresisDb = 3;
+inline bool roamScanReset(const RoamProfile &p, int currentDbm)
+{
+    return currentDbm >= p.triggerDbm + kRoamResetHysteresisDb;
+}
+inline bool roamWanted(const RoamProfile &p, int currentDbm, int candidateDbm)
+{
+    return currentDbm <= p.triggerDbm && candidateDbm >= currentDbm + p.deltaDb;
+}
+// The interval to the roam scan after one that waited intervalMs (0: first).
+inline uint64_t nextRoamScanMs(const RoamProfile &p, uint64_t intervalMs)
+{
+    if (intervalMs == 0)
+        return p.initScanMs;
+    return intervalMs * p.backoff > p.maxScanMs ? p.maxScanMs : intervalMs * p.backoff;
+}
+// Review: a roam scan is wide (an AP never heard or aged out) first after
+// the cadence starts over (lastWideMs 0), then once per fullscan_period
+// (the profile's nfscan is 2: its first two scans are full; ours one).
+inline bool roamScanWide(const RoamProfile &p, uint64_t lastWideMs, uint64_t nowMs)
+{
+    return lastWideMs == 0 || nowMs - lastWideMs >= p.fullScanMs;
 }
 
 // A candidate's signal is one reading from macOS's last scan (review): go
 // only when a second, newer reading of the same AP still qualifies.
+// 4w: quickScans counts the early roam scans (kRoamConfirmScanMs in
+// WCL.cpp) for that second reading; at most kRoamConfirmQuickScans per AP
+// armed, after which the profile's cadence goes on.
 struct RoamConfirm {
     uint8_t bssid[6];
     uint64_t sampleMs;
     bool armed;
+    uint8_t quickScans;
 };
+static constexpr uint8_t kRoamConfirmQuickScans = 2;
 inline bool roamConfirmed(RoamConfirm &c, const uint8_t *bssid, uint64_t sampleMs)
 {
     if (c.armed && memcmp(c.bssid, bssid, 6) == 0 && sampleMs != c.sampleMs) {
         c.armed = false;
         return true;
     }
+    // review: a new episode only (not armed); candidates that alternate as
+    // the best keep the count, so the early scans stay capped
+    if (!c.armed)
+        c.quickScans = 0;
     memcpy(c.bssid, bssid, 6);
     c.sampleMs = sampleMs;
     c.armed = true;
