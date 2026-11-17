@@ -3135,9 +3135,43 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
         return;
     }
     ic->ic_deauth_reason = reason;
+    /*
+     * Phase 4u.4 (hardware, Nov 17): the near Deco answered our first
+     * Association Request after a successful SAE with nothing, the second
+     * with deauth reason 9 (associating without being authenticated), both
+     * for macOS's join (which then failed) and for a roam (which waited
+     * out the 5 s management timer, then a new SAE went through at once).
+     * wpa_supplicant authenticates again after the first such failure
+     * within 100 ms (wpas_connection_failed()). Here: once per join, the
+     * management timer ends at its next 1 s tick, and the watchdog starts a
+     * new authentication (ni_fails bounds it as before). The front end
+     * reads ic_deauth_retrying and keeps the join.
+     */
+    /*
+     * Review: until the new authentication has started (ieee80211_node_
+     * join_bss), further such deauths (the AP answering each request we
+     * had in flight) belong to the same retry.
+     */
+    bool retrying = false;
+    if (ic->ic_opmode == IEEE80211_M_STA && ni == ic->ic_bss &&
+        (reason == IEEE80211_REASON_ASSOC_NOT_AUTHED ||
+         reason == IEEE80211_REASON_NOT_AUTHED)) {
+        if (ic->ic_notauth_pending &&
+            (ic->ic_state == IEEE80211_S_ASSOC || ic->ic_state == IEEE80211_S_AUTH))
+            retrying = true;
+        else if (ic->ic_state == IEEE80211_S_ASSOC && ic->ic_notauth_retries == 0) {
+            ic->ic_notauth_retries++;
+            ic->ic_notauth_pending = true;
+            retrying = true;
+            XYLog("Deauth reason %d right after authentication: authenticating "
+                  "again\n", reason);
+        }
+    }
+    ic->ic_deauth_retrying = retrying;
     if (ic->ic_event_handler) {
         (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
     }
+    ic->ic_deauth_retrying = false;     /* review: only for this event */
     
     ic->ic_stats.is_rx_deauth++;
     switch (ic->ic_opmode) {
@@ -3151,6 +3185,9 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
             if (!(roamscan || stay_auth))
                 ieee80211_new_state(ic, IEEE80211_S_AUTH,
                                     IEEE80211_FC0_SUBTYPE_DEAUTH);
+            /* 4u.4: the watchdog's next tick authenticates again */
+            if (retrying && ic->ic_mgt_timer > 1)
+                ic->ic_mgt_timer = 1;
         }
             break;
 #ifndef IEEE80211_STA_ONLY

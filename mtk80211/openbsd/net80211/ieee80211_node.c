@@ -1257,6 +1257,7 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs, i
     
     /* phase 4i: a new join; any earlier leave is over */
     ic->ic_leave_pending = 0;
+    ic->ic_notauth_pending = false;     /* phase 4u.4: the retry has started */
     /* Reinitialize media mode and channels if needed. */
     mode = ieee80211_chan2mode(ic, selbs->ni_chan);
     if (mode != ic->ic_curmode)

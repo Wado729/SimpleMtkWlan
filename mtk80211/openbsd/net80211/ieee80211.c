@@ -965,6 +965,16 @@ ieee80211_watchdog(struct _ifnet *ifp)
     struct ieee80211com *ic = (struct ieee80211com *)ifp;
     
     if (ic->ic_mgt_timer && --ic->ic_mgt_timer == 0) {
+        /*
+         * Phase 4u.4 (review): the deauth's AUTH transition is still in the
+         * driver's task: authenticate again on the next tick, not a rescan.
+         */
+        if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_notauth_pending &&
+            ic->ic_state == IEEE80211_S_ASSOC && ic->ic_notauth_retries < 3) {
+            ic->ic_notauth_retries++;   /* bounded, should the task hang */
+            ic->ic_mgt_timer = 1;
+            goto done;
+        }
         if (ic->ic_opmode == IEEE80211_M_STA &&
             (ic->ic_state == IEEE80211_S_AUTH ||
              ic->ic_state == IEEE80211_S_ASSOC)) {

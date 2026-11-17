@@ -2120,6 +2120,8 @@ justcleanup:
 			break;
 		case IEEE80211_S_SCAN:		/* adhoc/hostap mode */
 		case IEEE80211_S_ASSOC:		/* infra mode */
+			ic->ic_notauth_retries = 0;	/* phase 4u.4 */
+			ic->ic_notauth_pending = false;
 			if (ni->ni_txrate >= ni->ni_rates.rs_nrates)
 				panic("%s: bogus xmit rate %u setup",
 				    __FUNCTION__, ni->ni_txrate);

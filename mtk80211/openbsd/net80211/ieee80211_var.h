@@ -503,6 +503,16 @@ struct ieee80211com {
 	CTimeout*		ic_assoc_to;
 	uint8_t			ic_assoc_retry;
 	uint8_t			ic_assoc_tries;
+	/*
+	 * Phase 4u.4: "not authenticated" deauths answered by authenticating
+	 * again at once, this join; and whether the last deauth was one.
+	 * ic_notauth_retries: nonzero once this join's retry is used; the
+	 * watchdog's deferral (AUTH transition still queued) also counts in it,
+	 * up to 3.
+	 */
+	uint8_t			ic_notauth_retries;
+	bool			ic_deauth_retrying;
+	bool			ic_notauth_pending;	/* until the new authentication starts */
 	uint8_t			ic_assoc_reassoc;
 	/* phase 4i: a voluntary leave (deauth sent) until newstate runs */
 	uint8_t			ic_leave_pending;

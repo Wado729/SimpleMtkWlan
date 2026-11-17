@@ -762,6 +762,8 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     memcpy(joinBSSID, join.bssid, 6);
     ic->ic_flags |= IEEE80211_F_DESBSSID;
     ic->ic_wcl_join_requested = true;
+    ic->ic_notauth_retries = 0;         // phase 4u.4: per join
+    ic->ic_notauth_pending = false;
     ic->ic_wcl_scan_requested = false;
     roamScanPending = false;            // phase 4u.1
     current_authtype_lower = join.lowerAuth;
@@ -1341,6 +1343,8 @@ bool AirportItlwmSkywalkInterface::startWCLRoam(ieee80211_node *target)
     ic->ic_wcl_join_chan6g = sixGHz ? chan : 0;    // 4p/4r: its channel alone first
     ic->ic_wcl_join_scans = 0;
     ic->ic_wcl_join_requested = true;
+    ic->ic_notauth_retries = 0;         // phase 4u.4: per join
+    ic->ic_notauth_pending = false;
     ic->ic_wcl_scan_requested = false;
     // review: the old AP's BSS and beacon information stay readable until
     // the new one's beacons replace them (assocNotified again at
@@ -1654,6 +1658,13 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             if (roamPending) {      // phase 4u: the join to the new AP retries
                 XYLog("WCL roam: deauth (reason %u) while roaming, not reported\n",
                       ic->ic_deauth_reason);
+                break;
+            }
+            // phase 4u.4: net80211 authenticates again at once (the AP said
+            // "not authenticated" right after SAE): the join goes on
+            if (joinPending && ic->ic_deauth_retrying) {
+                XYLog("WCL join: deauth (reason %u) right after authentication, "
+                      "authenticating again\n", ic->ic_deauth_reason);
                 break;
             }
             portAuthorized = false;
