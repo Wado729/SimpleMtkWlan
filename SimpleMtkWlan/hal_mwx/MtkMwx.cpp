@@ -10864,6 +10864,24 @@ mt7927_abort_scan_for_join(struct mwx_softc *sc)
 	task_add(systq, &sc->sc_scan_task);
 	return kIOReturnSuccess;
 }
+
+/*
+ * Phase 4x (R3): the newstate task's 4r cancel, on the command gate (the
+ * front end sets the join fields there, and abortScanForJoin runs there).
+ */
+static IOReturn
+mt7927_join_scan_abort_action(OSObject *, void *arg0, void *, void *, void *)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg0;
+	struct ieee80211com *ic = &sc->sc_ic;
+
+	if (ic->ic_wcl_join_requested && !ic->ic_wcl_scan_requested &&
+	    ic->ic_wcl_join_chan6g != 0 &&
+	    ((ic->ic_wcl_join_chan6g - 1) % 4) == 0 &&
+	    sc->sc_7927_scan6g && ic->ic_wcl_join_scans == 0)
+		return mt7927_abort_scan_for_join(sc);
+	return kIOReturnSuccess;
+}
 #endif
 
 /* mwx_newstate_task() for the MT7927. */
@@ -10880,12 +10898,20 @@ mt7927_newstate(struct mwx_softc *sc, enum ieee80211_state ostate,
 	if (ostate == IEEE80211_S_RUN && nstate < IEEE80211_S_RUN &&
 	    ic->ic_opmode == IEEE80211_M_STA) {
 		char why[96];
+		/*
+		 * Phase 4x (C5): ic_leave_pending is read here, when the task
+		 * runs: macOS leaving at once after the AP's deauth (or the
+		 * watchdog's leave) is not a choice. The latch says so.
+		 */
+		bool invol = ic->ic_drop_involuntary != 0;
+		bool vol = ic->ic_leave_pending != 0 && !invol;
 
+		ic->ic_drop_involuntary = 0;
 		snprintf(why, sizeof(why), "RUN -> %s (arg %d) from %s%s",
 		    ieee80211_state_name[nstate], arg,
 		    ether_sprintf(sc->sc_7927_bss.bssid),
-		    ic->ic_leave_pending ? ", macOS left" : "");
-		mtk_dbg_snapshot(why, ic->ic_leave_pending != 0);
+		    vol ? ", macOS left" : invol ? ", lost" : "");
+		mtk_dbg_snapshot(why, vol);
 		mtk_dbg_publish();
 	}
 	if (nstate < IEEE80211_S_AUTH)
@@ -10904,13 +10930,21 @@ mt7927_newstate(struct mwx_softc *sc, enum ieee80211_state ostate,
 			 * sweep was being started (ic_state not yet SCAN, so 4q's
 			 * cancel in startWCLJoin did not apply) ends here: cancel
 			 * the sweep so the join scans its channel alone (4p).
+			 * Phase 4x (R3): on the command gate, as
+			 * MtkMwx::abortScanForJoin and the scan's completion
+			 * (mt7927_hal_end_scan) run.
 			 */
-			if (ic->ic_wcl_join_requested &&
-			    !ic->ic_wcl_scan_requested &&
-			    ic->ic_wcl_join_chan6g != 0 &&
-			    ((ic->ic_wcl_join_chan6g - 1) % 4) == 0 &&
-			    sc->sc_7927_scan6g && ic->ic_wcl_join_scans == 0)
-				(void)mt7927_abort_scan_for_join(sc);
+			{
+				IOCommandGate *gate = gMwxHal != NULL ?
+				    gMwxHal->mwxGate() : NULL;
+
+				if (gate != NULL)
+					gate->runAction(mt7927_join_scan_abort_action,
+					    sc);
+				else
+					mt7927_join_scan_abort_action(NULL, sc, NULL,
+					    NULL, NULL);
+			}
 #endif
 			return;
 		}
@@ -10922,6 +10956,29 @@ mt7927_newstate(struct mwx_softc *sc, enum ieee80211_state ostate,
 		rv = mt7927_join_prepare(sc);
 		break;
 	case IEEE80211_S_ASSOC:
+		/*
+		 * Phase 4x (R2): an ASSOC queued while authenticating (SAE
+		 * accepted) can run after a SCAN queued before it (the task
+		 * reads its target when it starts): net80211 then takes
+		 * SCAN -> ASSOC as invalid, sends no request and the join
+		 * waits out the 5 s management timer. Stay in SCAN instead:
+		 * the scan running ends in net80211 choosing again (a new
+		 * AUTH), and with none running one is started.
+		 */
+		if (ostate < IEEE80211_S_AUTH) {
+			MWX_DEV_LOG(sc, "MT7927 %s -> ASSOC dropped (the join "
+			    "was left), %s\n", ieee80211_state_name[ostate],
+			    ostate != IEEE80211_S_SCAN ? "staying" :
+			    (sc->sc_flags & MWX_FLAG_SCANNING) ?
+			    "the scan goes on" : "scanning again");
+			/* mwx_newstate skips a repeat of the queued state */
+			if (sc->sc_ns_state == nstate)
+				sc->sc_ns_state = ostate;
+			if (ostate == IEEE80211_S_SCAN &&
+			    !(sc->sc_flags & MWX_FLAG_SCANNING))
+				ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+			return;
+		}
 		break;
 	case IEEE80211_S_RUN:
 		if (ic->ic_opmode == IEEE80211_M_MONITOR)
@@ -10939,6 +10996,9 @@ mt7927_newstate(struct mwx_softc *sc, enum ieee80211_state ostate,
 		ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
 		return;
 	}
+	/* 4x (C5) review: a new link starts with no drop latched */
+	if (nstate == IEEE80211_S_RUN)
+		ic->ic_drop_involuntary = 0;
 	sc->sc_newstate(ic, nstate, arg);
 }
 
@@ -11483,10 +11543,15 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 				/* the MAC packs MSDUs only of frames it encrypts */
 				ti.amsdu = hwenc && sc->sc_7927_bss.amsdu != 0 &&
 				    ieee80211_has_qos(wh);
-				if (ti.amsdu)
-					sc->sc_7927_tx_amsdu++;
 				/* one rate sample every 256 unicast data frames */
 				ti.txs = (++sc->sc_7927_txs_tick & 0xff) == 0;
+				/*
+				 * Phase 4x (C10): a sample goes without HW_AMSDU
+				 * (mt7927_tx_frame clears it, as mt7925_mac_write_
+				 * txwi does); counted below once sent
+				 */
+				if (ti.txs)
+					ti.amsdu = false;
 			}
 		} else {
 			ti.q_idx = MT7927_LMAC_ALTX0;
@@ -11535,6 +11600,8 @@ mt7927_hal_output_locked(struct mwx_softc *sc, struct ifnet *ifp)
 			}
 			continue;
 		}
+		if (ti.amsdu)
+			sc->sc_7927_tx_amsdu++;		/* 4x (C10): sent as A-MSDU */
 		if (ifp->netStat)
 			ifp->netStat->outputPackets++;
 	}
@@ -13020,6 +13087,7 @@ mt7927_link_leave(struct mwx_softc *sc, const char *why, uint32_t txt,
 	}
 	sc->sc_7927_last_recovery = sc->sc_7927_poll;
 	sc->sc_7927_recoveries++;
+	ic->ic_drop_involuntary = 1;	/* phase 4x (C5): for the drop log */
 #ifdef AIRPORT_WCL
 	/*
 	 * Phase 4u.3 (hardware, Nov 16): after this leave macOS rejoined the
@@ -17393,7 +17461,8 @@ MtkMwx::debugPoll()
  * ---------------------------------------------------------------------------
  * MT7927 OS helpers for the engine and glue above, shared by both kexts
  * (SimpleMtkWlan and AirportMtkWlan). The chip runs as a third hardware type
- * of this driver behind -mtk7927probe. The firmware is read
+ * of this driver, on by default (-mtk7927off leaves the card alone; phase
+ * 4j.2). The firmware is read
  * from disk at runtime by a kernel thread once the Data volume is mounted,
  * never compiled into the kext:
  *   /Library/Firmware/mediatek/mt7927/WIFI_MT6639_PATCH_MCU_2_1_hdr.bin

@@ -449,9 +449,16 @@ private:
     void publishWCLBeacon6G(const ieee80211_beacon6g_event *);
     void notifyWCLFirstBeacon(const char *);
     void synthesizeWCLFirstBeacon();
+    // phase 4x (R8): a first beacon held back before RUN, sent once in RUN
+    static void wclFirstBeaconTimeout(OSObject *, IOTimerEventSource *);
+    void retryWCLFirstBeacon();
+    IOTimerEventSource *firstBeaconTimer = nullptr;
+    uint8_t firstBeaconRetries = 0;
     // Phase 4u: driver-side roaming between APs of the joined network
     void checkWCLRoam();
-    struct ieee80211_node *findRoamCandidate(uint64_t heardMs, int *rssi);
+    struct ieee80211_node *findRoamCandidate(uint64_t heardMs, int *rssi,
+                                             const uint8_t *only = nullptr);
+    void clearRoamScan();   // phase 4x (C1)
     bool roamAfterLinkLoss();
     bool roamAllowed();
     void roamScanForLinkDoubt();

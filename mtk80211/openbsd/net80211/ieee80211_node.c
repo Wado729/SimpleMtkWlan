@@ -1257,6 +1257,7 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs, i
     
     /* phase 4i: a new join; any earlier leave is over */
     ic->ic_leave_pending = 0;
+    ic->ic_drop_involuntary = 0;        /* phase 4x (C5) */
     ic->ic_notauth_pending = false;     /* phase 4u.4: the retry has started */
     /* Reinitialize media mode and channels if needed. */
     mode = ieee80211_chan2mode(ic, selbs->ni_chan);
@@ -1384,7 +1385,8 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs, i
          * left by the scan could run out there and ieee80211_watchdog()
          * would restart the scan under the join (hardware, Nov 16: SAE
          * accepted after the join had been torn down). The AUTH frame
-         * arms the timer again when it is sent.
+         * arms the timer again when it is sent (4x: ieee80211_newstate
+         * arms it too when the frame cannot be sent).
          */
         if (ic->ic_opmode == IEEE80211_M_STA)
             ic->ic_mgt_timer = 0;

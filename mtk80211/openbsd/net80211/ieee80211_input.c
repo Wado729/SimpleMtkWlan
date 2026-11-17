@@ -1782,7 +1782,12 @@ ieee80211_sta_csa(struct ieee80211com *ic, uint8_t mode, uint8_t opclass,
 	(*ic->ic_csa_start)(ic, chan, band, count, mode, cbw, ccfs0);
 }
 
-/* Phase 4l: the Wide Bandwidth Channel Switch element in elements, if any. */
+/*
+ * Phase 4l: the Wide Bandwidth Channel Switch element in elements, if any,
+ * or in a Channel Switch Wrapper's subelements. Phase 4x (C3): one level
+ * only (802.11 puts no wrapper inside a wrapper; no recursion as deep as a
+ * frame's nesting).
+ */
 static const uint8_t *
 ieee80211_find_wbcs(const uint8_t *frm, const uint8_t *efrm)
 {
@@ -1790,11 +1795,13 @@ ieee80211_find_wbcs(const uint8_t *frm, const uint8_t *efrm)
 		if (frm[0] == IEEE80211_ELEMID_WIDE_BW_CHANNEL_SWITCH)
 			return frm;
 		if (frm[0] == IEEE80211_ELEMID_CHANNEL_SWITCH_WRAPPER) {
-			const uint8_t *w = ieee80211_find_wbcs(frm + 2,
-			    frm + 2 + frm[1]);
+			const uint8_t *w = frm + 2, *ew = frm + 2 + frm[1];
 
-			if (w != NULL)
-				return w;
+			while (w + 2 <= ew && w + 2 + w[1] <= ew) {
+				if (w[0] == IEEE80211_ELEMID_WIDE_BW_CHANNEL_SWITCH)
+					return w;
+				w += 2 + w[1];
+			}
 		}
 		frm += 2 + frm[1];
 	}
@@ -3136,6 +3143,14 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
     }
     ic->ic_deauth_reason = reason;
     /*
+     * Phase 4x (C5): for the drop log, whatever macOS does next. Only our
+     * AP's (in STA mode ni is ic_bss for any sender) and only in RUN: a
+     * deauth during a join (4u.4) must not label a later leave.
+     */
+    if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_state == IEEE80211_S_RUN &&
+        IEEE80211_ADDR_EQ(wh->i_addr2, ic->ic_bss->ni_bssid))
+        ic->ic_drop_involuntary = 1;
+    /*
      * Phase 4u.4 (hardware, Nov 17): the near Deco answered our first
      * Association Request after a successful SAE with nothing, the second
      * with deauth reason 9 (associating without being authenticated), both
@@ -3241,7 +3256,11 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
         XYLog("Disassoc ignored: leaving already\n");
         return;
     }
-    
+    /* phase 4x (C5): for the drop log; our AP's, in RUN (as for a deauth) */
+    if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_state == IEEE80211_S_RUN &&
+        IEEE80211_ADDR_EQ(wh->i_addr2, ic->ic_bss->ni_bssid))
+        ic->ic_drop_involuntary = 1;
+
     ic->ic_stats.is_rx_disassoc++;
     switch (ic->ic_opmode) {
         case IEEE80211_M_STA: {

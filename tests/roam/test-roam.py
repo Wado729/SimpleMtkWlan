@@ -13,6 +13,9 @@ WCL_ROAM_PROFILE_CONFIG; we keep the conservative default.)
 4u: go only on a second, newer reading of the same AP (one reading from one
 scan is not enough); a different AP or the same reading again re-arms; 4w
 review: at most two early (15 s) confirming scans per AP armed.
+4x (C8): roamKeepArmed keeps the armed AP while it still qualifies, so two
+candidates taking turns as the best one no longer re-arm each other forever
+(the quick-scan count goes on with it).
 """
 from pathlib import Path
 import subprocess, tempfile, re
@@ -28,6 +31,7 @@ reset = grab('static constexpr int kRoamResetHysteresisDb', '\n}\n')
 widef = grab('inline bool roamScanWide(', '\n}\n')
 set6g = grab('inline bool set6gChannel(', '\n}\n')
 confirm = grab('struct RoamConfirm {', '\n}\n')
+keep = grab('inline bool roamKeepArmed(', '\n}\n')
 pre = '#include <cassert>\n#include <cstdint>\n#include <cstdio>\n#include <cstring>\n#include <cstddef>\nnamespace AirportWCL {\n'
 main = r'''
 }
@@ -109,6 +113,36 @@ int main() {
     for (int i = 0; i < 6; i++) assert(!roamConfirmed(q, (i & 1) ? b : a, 2100 + i) && q.quickScans == 2);
     q.quickScans = 2; q.armed = false;
     assert(!roamConfirmed(q, b, 3000) && q.quickScans == 0);  /* re-armed: anew */
+    /* 4x (C8): two candidates taking turns as the best one. Before: each tick
+       re-armed for the other, and neither got its second reading */
+    {
+        RoamConfirm k = {};
+        uint64_t sa = 1000, sb = 1500;
+        int gos = 0; const uint8_t *went = nullptr;
+        for (int tick = 0; tick < 6 && !gos; tick++) {
+            const uint8_t *best = (tick % 2) ? b : a;
+            uint64_t sbest = (tick % 2) ? sb : sa;
+            sa += 2000; sb += 2000;                  /* each scan: new readings of both */
+            const uint8_t *pick = best; uint64_t spick = sbest;
+            if (roamKeepArmed(k, best, true)) {      /* the armed AP still qualifies */
+                pick = memcmp(k.bssid, a, 6) == 0 ? a : b;
+                spick = pick == a ? sa : sb;
+            }
+            if (roamConfirmed(k, pick, spick)) { gos++; went = pick; }
+        }
+        assert(gos == 1 && went == a);               /* the armed one, on its next reading */
+        /* with 4w: kept armed, the quick-scan count is not restarted */
+        RoamConfirm kq = {};
+        assert(!roamConfirmed(kq, a, 1000)); kq.quickScans = 1;
+        assert(roamKeepArmed(kq, b, true) && !roamConfirmed(kq, a, 1000) && kq.quickScans == 1);
+        /* the armed AP no longer qualifies: the best one is armed instead */
+        RoamConfirm m = {};
+        assert(!roamConfirmed(m, a, 1000));
+        assert(!roamKeepArmed(m, b, false) && !roamConfirmed(m, b, 2000) && memcmp(m.bssid, b, 6) == 0);
+        assert(!roamKeepArmed(m, b, true));          /* best is the armed one: nothing to keep */
+        RoamConfirm off = {};
+        assert(!roamKeepArmed(off, a, true));        /* nothing armed */
+    }
     /* 4u.1: the 6 GHz request bitmap, read as mt7927_hal_scan reads it */
     uint8_t bm[30] = {};
     assert(set6gChannel(bm, sizeof(bm), 165));
@@ -126,7 +160,7 @@ int main() {
 '''
 with tempfile.TemporaryDirectory() as d:
     p = Path(d)
-    (p / 't.cpp').write_text(pre + set6g + profile + '\n' + reset + '\n' + wanted + nextscan + '\n' + widef + confirm + main)
+    (p / 't.cpp').write_text(pre + set6g + profile + '\n' + reset + '\n' + wanted + nextscan + '\n' + widef + confirm + keep + main)
     subprocess.run(['clang++', '-std=c++14', '-fsanitize=address,undefined', '-g',
                     str(p / 't.cpp'), '-o', str(p / 't')], check=True)
     r = subprocess.run([str(p / 't')], capture_output=True, text=True)

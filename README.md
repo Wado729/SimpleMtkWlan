@@ -81,7 +81,7 @@ they match the same card.
    15.2+) from [Releases](https://github.com/flxxxxddd/SimpleMtkWlan/releases).
 2. Copy `AirportMT7927Wlan.kext` to `EFI/OC/Kexts/` and add it to
    `Kernel → Add` (same entry as below, `BundlePath` `AirportMT7927Wlan.kext`,
-   `ExecutablePath` `Contents/MacOS/AirportMtkWlan`). Set `MinKernel`
+   `ExecutablePath` `Contents/MacOS/AirportMT7927Wlan`). Set `MinKernel`
    `25.0.0` / `MaxKernel` `25.99.99` for the Tahoe build (`24.2.0` /
    `24.99.99` for Sequoia): each build only fits that IO80211 version and
    would panic on the other.

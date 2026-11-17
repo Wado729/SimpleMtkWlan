@@ -1859,6 +1859,30 @@ discard:
 	ic->ic_stats.is_rx_bad_auth++;
 }
 
+/*
+ * Phase 4x (R10): a station's Authentication frame. ieee80211_node_join_bss
+ * clears ic_mgt_timer before AUTH (4o) and only a frame that is sent arms it
+ * again (ieee80211_send_mgmt); one that could not be built (no mbuf, no SAE
+ * commit) left AUTH waiting for macOS's 30 s join timer. Arm the usual wait
+ * here then, so ieee80211_watchdog acts as after an unanswered request.
+ */
+static void
+ieee80211_send_auth_req(struct ieee80211com *ic, struct ieee80211_node *ni,
+    int arg)
+{
+	int error = IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_AUTH,
+	    arg);
+
+	if (error != 0 && ic->ic_opmode == IEEE80211_M_STA) {
+		XYLog("%s: authentication request to %s not sent (%d), "
+		    "scanning again in %d s\n", ic->ic_if.if_xname,
+		    ether_sprintf(ni->ni_macaddr), error,
+		    IEEE80211_TRANS_WAIT);
+		ic->ic_mgt_timer = IEEE80211_TRANS_WAIT;
+		ic->ic_if.if_timer = 1;
+	}
+}
+
 int
 ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
     int mgt)
@@ -2043,16 +2067,14 @@ justcleanup:
 				    ieee80211_state_name[nstate]);
 			break;
 		case IEEE80211_S_SCAN:
-			IEEE80211_SEND_MGMT(ic, ni,
-			    IEEE80211_FC0_SUBTYPE_AUTH, 1);
+			ieee80211_send_auth_req(ic, ni, 1);	/* 4x (R10) */
 			break;
 		case IEEE80211_S_AUTH:
 		case IEEE80211_S_ASSOC:
 			switch (mgt) {
 			case IEEE80211_FC0_SUBTYPE_AUTH:
 				if (ic->ic_opmode == IEEE80211_M_STA) {
-					IEEE80211_SEND_MGMT(ic, ni,
-					    IEEE80211_FC0_SUBTYPE_AUTH,
+					ieee80211_send_auth_req(ic, ni,
 					    IEEE80211_AUTH_OPEN_REQUEST);
 				}
 				break;
@@ -2074,8 +2096,7 @@ justcleanup:
 				break;
 			case IEEE80211_FC0_SUBTYPE_DEAUTH:
 				/* try to reauth */
-				IEEE80211_SEND_MGMT(ic, ni,
-				    IEEE80211_FC0_SUBTYPE_AUTH, 1);
+				ieee80211_send_auth_req(ic, ni, 1);
 				break;
 			}
 			break;

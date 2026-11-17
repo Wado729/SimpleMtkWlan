@@ -200,6 +200,15 @@ inline bool roamConfirmed(RoamConfirm &c, const uint8_t *bssid, uint64_t sampleM
     return false;
 }
 
+// Phase 4x (C8): which AP this tick confirms. Another AP best this tick no
+// longer re-arms while the armed one still qualifies (two candidates taking
+// turns as the best one re-armed each other, and neither got its second
+// reading): true to confirm the armed AP instead of the best one.
+inline bool roamKeepArmed(const RoamConfirm &c, const uint8_t *bestBssid, bool armedQualifies)
+{
+    return c.armed && armedQualifies && memcmp(c.bssid, bestBssid, 6) != 0;
+}
+
 struct SequoiaLqmUpdate {
     uint8_t rssiValid;
     uint8_t reserved0[3];

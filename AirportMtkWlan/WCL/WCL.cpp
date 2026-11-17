@@ -84,7 +84,15 @@ bool AirportItlwmSkywalkInterface::initWCL()
     joinTimer = IOTimerEventSource::timerEventSource(this, wclJoinTimeout);
     if (!joinTimer)
         return false;
-    return instance->getWorkQueue()->addEventSource(joinTimer) == kIOReturnSuccess;
+    if (instance->getWorkQueue()->addEventSource(joinTimer) != kIOReturnSuccess)
+        return false;
+    // phase 4x (R8): optional; without it the next beacon or the port's
+    // authorization sends a held-back first beacon, as before
+    firstBeaconTimer = IOTimerEventSource::timerEventSource(this, wclFirstBeaconTimeout);
+    if (firstBeaconTimer &&
+        instance->getWorkQueue()->addEventSource(firstBeaconTimer) != kIOReturnSuccess)
+        OSSafeReleaseNULL(firstBeaconTimer);
+    return true;
 }
 
 void AirportItlwmSkywalkInterface::stopWCL()
@@ -98,6 +106,12 @@ void AirportItlwmSkywalkInterface::stopWCL()
         if (joinTimer->getWorkLoop())
             joinTimer->getWorkLoop()->removeEventSource(joinTimer);
         OSSafeReleaseNULL(joinTimer);
+    }
+    if (firstBeaconTimer) {     // phase 4x (R8)
+        firstBeaconTimer->cancelTimeout();
+        if (firstBeaconTimer->getWorkLoop())
+            firstBeaconTimer->getWorkLoop()->removeEventSource(firstBeaconTimer);
+        OSSafeReleaseNULL(firstBeaconTimer);
     }
     if (scanSource)
         scanSource->cancelTimeout();
@@ -764,8 +778,8 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     ic->ic_wcl_join_requested = true;
     ic->ic_notauth_retries = 0;         // phase 4u.4: per join
     ic->ic_notauth_pending = false;
+    clearRoamScan();                    // phase 4u.1 (4x: C1)
     ic->ic_wcl_scan_requested = false;
-    roamScanPending = false;            // phase 4u.1
     current_authtype_lower = join.lowerAuth;
     current_authtype_upper = join.upperAuth;
     explicit_bzero(&join, sizeof(join));
@@ -773,6 +787,9 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     joinPending = true;
     assocNotified = firstBeaconNotified = portAuthorized = false;
     firstBeaconDeferredLogged = false;
+    firstBeaconRetries = 0;             // phase 4x (R8)
+    if (firstBeaconTimer)
+        firstBeaconTimer->cancelTimeout();
     wclAssociatedBeacons = 0;
     wclJoinBeacons = 0;
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
@@ -886,7 +903,7 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork(const char *why)
     ieee80211com *ic = fHalService->get80211Controller();
     bool abandonedRoam = roamPending;   // phase 4u: macOS's leave or join ends a roam
     abortWCLRoam(kIOReturnAborted, why);
-    roamScanPending = false;            // 4u.1 review
+    clearRoamScan();                    // 4u.1 review (4x: C1)
     roamScanIntervalMs = 0;
     roamLastWideMs = 0;                 // 4w review
     XYLog("WCL leave (%s): state %d joinPending %d assoc %d firstBeacon %d bssValid %d "
@@ -974,6 +991,10 @@ IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
     return kIOReturnSuccess;
 }
 
+// phase 4x (R8): a held-back first beacon looks for RUN every 20 ms, 2 s at most
+static constexpr uint32_t kFirstBeaconRetryMs = 20;
+static constexpr uint8_t kFirstBeaconRetries = 100;
+
 void AirportItlwmSkywalkInterface::notifyWCLFirstBeacon(const char *source)
 {
     if (!joinPending || !assocNotified || firstBeaconNotified || !wclBssValid)
@@ -985,16 +1006,22 @@ void AirportItlwmSkywalkInterface::notifyWCLFirstBeacon(const char *source)
      * APPLE80211_IOC_WCL_EXTENDED_BSS_INFO at once, which answers NotReady
      * outside RUN; WCL then leaves with "Update Bss fail" (hardware log,
      * Nov 16: a beacon 1 ms before RUN). Wait for RUN: the next beacon, at
-     * most a beacon interval later, sends it.
+     * most a beacon interval later, sends it. Phase 4x (R8): in RUN the
+     * firmware's beacon filter can pass none, and then only the port's
+     * authorization did: a short timer looks for RUN too.
      */
     if (fHalService->get80211Controller()->ic_state != IEEE80211_S_RUN) {
         if (!firstBeaconDeferredLogged) {
             firstBeaconDeferredLogged = true;
-            XYLog("WCL first beacon (%s) before RUN (state %d): waiting for the next one\n",
+            XYLog("WCL first beacon (%s) before RUN (state %d): waiting for RUN\n",
                 source, fHalService->get80211Controller()->ic_state);
         }
+        if (firstBeaconTimer && firstBeaconRetries < kFirstBeaconRetries)
+            firstBeaconTimer->setTimeoutMS(kFirstBeaconRetryMs);
         return;
     }
+    if (firstBeaconTimer)
+        firstBeaconTimer->cancelTimeout();
     AirportWCL::FirstBeaconEvent event = {};
     memcpy(event.peer.bssid, joinBSSID, 6);
     firstBeaconNotified = true;
@@ -1009,6 +1036,23 @@ void AirportItlwmSkywalkInterface::notifyWCLFirstBeacon(const char *source)
     instance->postMessage(this, AirportWCL::FirstBeacon, &event, sizeof(event), true);
     if (portAuthorized)
         finishWCLJoin(0, 0, kIOReturnSuccess);
+}
+
+// Phase 4x (R8): the first beacon held back before RUN (above), sent as
+// soon as the HAL's newstate task has made it RUN (~30 ms of commands).
+void AirportItlwmSkywalkInterface::wclFirstBeaconTimeout(OSObject *owner, IOTimerEventSource *)
+{
+    auto self = OSDynamicCast(AirportItlwmSkywalkInterface, owner);
+    if (self && !self->wclStopping)
+        self->retryWCLFirstBeacon();
+}
+
+void AirportItlwmSkywalkInterface::retryWCLFirstBeacon()
+{
+    if (!firstBeaconDeferredLogged || !joinPending || !assocNotified || firstBeaconNotified)
+        return;
+    firstBeaconRetries++;           // bounded: the timer is re-armed while not RUN
+    notifyWCLFirstBeacon("held back until RUN");
 }
 
 /*
@@ -1076,15 +1120,19 @@ static AirportWCL::RoamProfile roamProfileFor(const ieee80211_channel *c)
 
 /*
  * The strongest other AP of our network (same SSID, a shared AKM, no failed
- * join, not blocked after a failed roam) heard in the last heardMs.
+ * join, not blocked after a failed roam) heard in the last heardMs. With
+ * only (phase 4x, C8): that AP alone, if it still is such a candidate.
  */
-ieee80211_node *AirportItlwmSkywalkInterface::findRoamCandidate(uint64_t heardMs, int *rssi)
+ieee80211_node *AirportItlwmSkywalkInterface::findRoamCandidate(uint64_t heardMs, int *rssi,
+                                                                const uint8_t *only)
 {
     ieee80211com *ic = fHalService->get80211Controller();
     ieee80211_node *bss = ic->ic_bss, *best = NULL, *ni;
     uint64_t now = airport_up_time();
     int bestRssi = -128;
     RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+        if (only != nullptr && !IEEE80211_ADDR_EQ(ni->ni_macaddr, only))
+            continue;
         if (ni == bss || IEEE80211_ADDR_EQ(ni->ni_macaddr, bss->ni_macaddr) ||
             ni->ni_esslen != bss->ni_esslen ||
             memcmp(ni->ni_essid, bss->ni_essid, bss->ni_esslen) != 0 ||
@@ -1163,7 +1211,7 @@ bool AirportItlwmSkywalkInterface::roamAfterLinkLoss()
     XYLog("WCL roam: %s gone, to %s (%d dBm, heard %llu ms ago)\n", lostName,
           ether_sprintf(best->ni_macaddr), rssi, airport_up_time() - best->ni_age_ts);
     roamConfirm.armed = false;
-    roamScanPending = false;
+    clearRoamScan();                // 4x (C1)
     return startWCLRoam(best);
 }
 
@@ -1184,7 +1232,7 @@ void AirportItlwmSkywalkInterface::checkWCLRoam()
     uint64_t now = airport_up_time();
     // review: a completion the HAL drops never ends roamScanPending
     if (roamScanPending && now - roamLastScanMs > 20000)
-        roamScanPending = false;
+        clearRoamScan();            // 4x (C1)
     if (now - linkUpMs < kRoamSettleMs || now - roamLastTryMs < kRoamRetryMs)
         return;
     ieee80211_node *bss = ic->ic_bss;
@@ -1202,6 +1250,18 @@ void AirportItlwmSkywalkInterface::checkWCLRoam()
     int bestRssi = -128;
     ieee80211_node *best = findRoamCandidate(kRoamHeardMs, &bestRssi);
     bool wanted = best != NULL && AirportWCL::roamWanted(prof, cur, bestRssi);
+    // phase 4x (C8): the armed AP stays the one to confirm while it still
+    // qualifies (two APs taking turns as the best one re-armed each other);
+    // 4w's quickScans count goes on with it (roamConfirmed: still armed)
+    if (wanted && roamConfirm.armed) {
+        int armedRssi = -128;
+        ieee80211_node *armed = findRoamCandidate(kRoamHeardMs, &armedRssi, roamConfirm.bssid);
+        if (AirportWCL::roamKeepArmed(roamConfirm, best->ni_macaddr,
+                armed != NULL && AirportWCL::roamWanted(prof, cur, armedRssi))) {
+            best = armed;
+            bestRssi = armedRssi;
+        }
+    }
     bool go = false;
     if (!wanted)
         roamConfirm.armed = false;
@@ -1240,6 +1300,21 @@ void AirportItlwmSkywalkInterface::checkWCLRoam()
             roamConfirm.quickScans++;
         startWCLRoamScan();
     }
+}
+
+/*
+ * Phase 4x (C1): our roam scan is over or given up. Its request flags go
+ * with it unless macOS's own scan request holds them: left set, the next
+ * scan (a join's too) would be cut to the roam scan's few channels.
+ */
+void AirportItlwmSkywalkInterface::clearRoamScan()
+{
+    if (roamScanPending && !scanPending && fHalService) {
+        ieee80211com *ic = fHalService->get80211Controller();
+        ic->ic_wcl_scan_requested = false;
+        ic->ic_wcl_scan_restricted = false;
+    }
+    roamScanPending = false;
 }
 
 /*
@@ -1552,7 +1627,7 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
         case IEEE80211_EVT_DRIVER_STOPPED: {
             bool ready = code == IEEE80211_EVT_DRIVER_READY;
             if (!ready) {
-                roamScanPending = false;    // 4u.1 review
+                clearRoamScan();            // 4u.1 review (4x: C1)
                 if (roamPending) {      // phase 4u (review: 80 too, timer off)
                     abortWCLRoam(kIOReturnOffline, "driver stopped");
                     syncLinkAfterRoam();

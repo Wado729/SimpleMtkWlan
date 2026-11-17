@@ -517,6 +517,12 @@ struct ieee80211com {
 	/* phase 4i: a voluntary leave (deauth sent) until newstate runs */
 	uint8_t			ic_leave_pending;
 	/*
+	 * Phase 4x (C5): the link went from outside (a deauth or disassoc
+	 * from the AP, the link watchdog), latched until the drop log reads
+	 * it or the next join: macOS's leave right after it is no choice.
+	 */
+	uint8_t			ic_drop_involuntary;
+	/*
 	 * Phase 4l: our AP announces a channel switch (CSA/ECSA element in a
 	 * beacon or probe response, or a channel switch action frame), as
 	 * mac80211 hands it to drv_channel_switch(). band: 1 2.4, 2 5,

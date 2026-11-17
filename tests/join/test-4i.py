@@ -12,7 +12,9 @@ mt7927_link_leave, compiled against stubs:
     frames: probe (management timer cleared in RUN), an answer keeps the
     link, three unanswered probes leave with a deauth and a deauth event;
   - phase 4u.2: with airtime but no frame from the AP for 30 s, probe too;
-    leave then only on null probes reported not acked (no TX status: stay).
+    leave then only on null probes reported not acked (no TX status: stay);
+  - phase 4x: the leave latches ic_drop_involuntary; with the transition
+    queued (ic_state still RUN for a while) the watchdog leaves only once.
 """
 import pathlib, re, subprocess, sys, tempfile
 root = pathlib.Path(__file__).resolve().parents[2]
@@ -42,7 +44,7 @@ struct CTimeout {};
 struct ieee80211_node { uint8_t ni_macaddr[6]; int ni_port_valid; };
 struct ifn { const char *if_xname; };
 struct ieee80211com { int ic_opmode; int ic_state; ieee80211_node *ic_bss; CTimeout *ic_assoc_to;
-  uint8_t ic_assoc_retry, ic_assoc_tries, ic_assoc_reassoc, ic_leave_pending; ifn ic_if; int ic_mgt_timer; int ic_deauth_reason;
+  uint8_t ic_assoc_retry, ic_assoc_tries, ic_assoc_reassoc, ic_leave_pending, ic_drop_involuntary; ifn ic_if; int ic_mgt_timer; int ic_deauth_reason;
   void (*ic_event_handler)(ieee80211com*, int, void*); bool ic_wcl_link_lost_roamed; };
 static int armed = -1, sends_assoc, sends_probe, sends_deauth, events, newstates, last_arg;
 static int timeout_add_msec(CTimeout **, int ms) { armed = ms; return 1; }
@@ -54,7 +56,9 @@ static int send_mgmt(ieee80211com *ic, ieee80211_node *, int type, int arg) {
   if (type == IEEE80211_FC0_SUBTYPE_DEAUTH) sends_deauth++;
   return 0; }
 #define IEEE80211_SEND_MGMT(ic, ni, t, a) send_mgmt(ic, ni, t, a)
-static void ieee80211_new_state(ieee80211com *ic, int st, int) { ic->ic_state = st; newstates++; }
+/* 4x (C13): defer_ns queues the transition as mwx_newstate does (the HAL's task sets ic_state later) */
+static int defer_ns, queued = -1;
+static void ieee80211_new_state(ieee80211com *ic, int st, int) { newstates++; if (defer_ns) queued = st; else ic->ic_state = st; }
 static int roam_avail, lost_events, doubt_events;
 static void evh(ieee80211com *ic, int e, void *) { if (e == IEEE80211_EVT_STA_DEAUTH) events++;
   if (e == IEEE80211_EVT_LINK_LOST) { lost_events++; ic->ic_wcl_link_lost_roamed = roam_avail; }
@@ -174,6 +178,27 @@ int main() {
   le = lost_events; dd = sends_deauth;
   sc.sc_7927_poll++; mt7927_link_watchdog(&sc);
   assert(lost_events == le && sends_deauth == dd + 1 && !sc.sc_7927_leave_csa);
+  assert(sc.sc_ic.ic_drop_involuntary == 1);       /* 4x (C5): the drop log files it as lost */
+  /* 4x (C13): the transition queued, as on hardware: ic_state stays RUN until the HAL's task */
+  defer_ns = 1; roam_avail = 0; nack_nulls = 0; ack_nulls = 0;
+  sc.sc_ic.ic_state = IEEE80211_S_RUN; sc.sc_7927_run_polls = 0; sc.sc_7927_last_recovery = 0;
+  sc.sc_ic.ic_drop_involuntary = 0;
+  mt7927_link_watchdog(&sc); for (int i = 0; i < 40; i++) { sc.sc_7927_poll++; mt7927_link_watchdog(&sc); }
+  sc.sc_7927_csa_leave = true; sc.sc_7927_csa_why = "csa";
+  int ev = events; dd = sends_deauth; ns = newstates; le = lost_events;
+  sc.sc_7927_poll++; mt7927_link_watchdog(&sc);
+  assert(sends_deauth == dd + 1 && events == ev + 1 && newstates == ns + 1 && queued == IEEE80211_S_AUTH);
+  assert(sc.sc_ic.ic_state == IEEE80211_S_RUN && sc.sc_ic.ic_drop_involuntary == 1);
+  /* ticks while it waits: a silent window, probes, and no second leave (held 60 s) */
+  for (int i = 0; i < 40; i++) { sc.sc_7927_poll++; mt7927_link_watchdog(&sc); }
+  nack_nulls = 1; E_windows = 20;
+  for (int i = 0; i < 5; i++) { sc.sc_7927_poll++; mt7927_link_watchdog(&sc); }
+  assert(sends_deauth == dd + 1 && events == ev + 1 && newstates == ns + 1 && lost_events == le);
+  assert(sc.sc_ic.ic_drop_involuntary == 1);       /* kept until the drop log reads it */
+  /* the task runs: the watchdog stands down */
+  sc.sc_ic.ic_state = queued; sc.sc_7927_poll++; mt7927_link_watchdog(&sc);
+  assert(sc.sc_7927_run_polls == 0 && sc.sc_7927_wd_probes == 0 && newstates == ns + 1);
+  defer_ns = 0; nack_nulls = 0;
   printf("PASS\n"); return 0;
 }
 '''

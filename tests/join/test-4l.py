@@ -78,6 +78,9 @@ int main() {
   { const uint8_t w[] = {194, 3, 0, 0, 0}; ieee80211_sta_csa(&ic, 0, 134, 165, 5, w); assert(c_cbw == 1 && c_ccfs0 == 0); } /* 20/40 never wider */
   { const uint8_t w[] = {194, 3, 0, 0, 0}; ieee80211_sta_csa(&ic, 0, 0, 36, 5, w); assert(c_cbw == 0); }
   { const uint8_t e[] = {37, 3, 1, 9, 5, 196, 5, 194, 3, 2, 50, 0}; const uint8_t *w = ieee80211_find_wbcs(e, e + sizeof e); assert(w == e + 7); }
+  /* 4x (C3): a wrapper inside a wrapper is not searched (one level) */
+  { const uint8_t e[] = {37, 3, 1, 9, 5, 196, 7, 196, 5, 194, 3, 2, 50, 0}; assert(ieee80211_find_wbcs(e, e + sizeof e) == nullptr); }
+  { const uint8_t e[] = {196, 9, 7, 1, 0, 194, 3, 1, 42, 0, 0}; assert(ieee80211_find_wbcs(e, e + sizeof e) == e + 5); }
   ic.ic_state = 3; int k = c_calls; ieee80211_sta_csa(&ic, 0, 0, 36, 5, nullptr); assert(c_calls == k);   /* not in RUN */
   printf("PASS\n"); return 0;
 }
