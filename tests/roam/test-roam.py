@@ -56,3 +56,11 @@ with tempfile.TemporaryDirectory() as d:
     r = subprocess.run([str(p / 't')], capture_output=True, text=True)
     print(r.stdout + r.stderr)
     r.check_returncode()
+
+# 4u.2 review: the roam aims its 6 GHz join scan at the on-air channel number
+# (ieee80211_chan2number), not the table index (ieee80211_chan2ieee)
+w = (root / "AirportMtkWlan/WCL/WCL.cpp").read_text()
+i = w.index("bool AirportItlwmSkywalkInterface::startWCLRoam(")
+body = w[i:w.index("\n}\n", i)]
+assert "ieee80211_chan2number(ic, target->ni_chan)" in body and "chan2ieee" not in body, "startWCLRoam channel"
+print("PASS: startWCLRoam uses the on-air channel number")

@@ -696,6 +696,9 @@ struct mwx_softc {
 	uint32_t		sc_7927_wd_window_mark;
 	/* phase 4k: TX status of chosen frames */
 	volatile uint32_t	sc_7927_probe_acks;	/* null probes acked */
+	volatile uint32_t	sc_7927_probe_nacks;	/* 4u.2: and not acked */
+	uint32_t		sc_7927_wd_nack_mark;
+	bool			sc_7927_wd_idle;	/* 4u.2: probing an idle link */
 	volatile uint32_t	sc_7927_txs_join_ack, sc_7927_txs_join_nack;
 	volatile uint32_t	sc_7927_txs_leave_ack, sc_7927_txs_leave_nack;
 	volatile uint8_t	sc_7927_txs_join_st, sc_7927_txs_leave_st;	/* subtype sent */
@@ -12696,6 +12699,8 @@ mt7927_hal_txs(void *arg, uint8_t pid, bool acked)
 	case MT7927_TXS_PID_PROBE:
 		if (acked)
 			OSIncrementAtomic((volatile SInt32 *)&sc->sc_7927_probe_acks);
+		else
+			OSIncrementAtomic((volatile SInt32 *)&sc->sc_7927_probe_nacks);
 		MWX_DEV_LOG(sc, "MT7927 link watchdog: null probe %s\n",
 		    acked ? "acked by the AP" : "not acked");
 		break;
@@ -12817,12 +12822,14 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 	struct ieee80211com *ic = &sc->sc_ic;
 	uint32_t loss, dumps, rxt, txt, windows;
 	const char *why = NULL;
+	bool idle = false;		/* 4u.2: the "no frame" reason */
 
 	if (!sc->sc_7927_assoc || ic->ic_state != IEEE80211_S_RUN ||
 	    ic->ic_bss == NULL || !ic->ic_bss->ni_port_valid) {
 		sc->sc_7927_run_polls = 0;
 		sc->sc_7927_wd_probes = 0;
 		sc->sc_7927_csa_verifying = false;
+		sc->sc_7927_wd_idle = false;
 		return;
 	}
 	sc->sc_7927_run_polls++;
@@ -12853,16 +12860,35 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 		uint32_t heard = mt7927_rx_from_bss(sc);
 
 		if (heard != sc->sc_7927_wd_rx_mark) {
-			MWX_DEV_LOG(sc, "MT7927 link watchdog: the AP answered "
-			    "probe %u, staying\n", sc->sc_7927_wd_probes);
+			/* 4u.2 review: an idle link answers every 30 s, quietly */
+			if (!sc->sc_7927_wd_idle)
+				MWX_DEV_LOG(sc, "MT7927 link watchdog: the AP "
+				    "answered probe %u, staying\n",
+				    sc->sc_7927_wd_probes);
 			sc->sc_7927_wd_probes = 0;
 			sc->sc_7927_csa_verifying = false;
+			sc->sc_7927_wd_idle = false;
 		} else if (sc->sc_7927_wd_probes < 3) {
 			sc->sc_7927_wd_probes++;
 			mt7927_probe_ap(sc);
 			return;
 		} else {
 			sc->sc_7927_wd_probes = 0;
+			/*
+			 * 4u.2 review: on an idle link the AP's answers can be
+			 * the null probes' ACKs alone (its beacons come from
+			 * the transmitted BSSID of an MBSSID set). Leave only
+			 * if TX status said "not acked"; without any status,
+			 * stay (and say so), as before this phase.
+			 */
+			if (sc->sc_7927_wd_idle &&
+			    sc->sc_7927_probe_nacks == sc->sc_7927_wd_nack_mark) {
+				sc->sc_7927_wd_idle = false;
+				MWX_DEV_LOG(sc, "MT7927 link watchdog: no TX "
+				    "status for the 3 null probes, staying\n");
+				return;
+			}
+			sc->sc_7927_wd_idle = false;
 			if (sc->sc_7927_csa_verifying) {
 				/* review S4: not throttled, and named */
 				sc->sc_7927_csa_verifying = false;
@@ -12932,6 +12958,21 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 			else
 				why = "no receive airtime for 30 s";
 		}
+		/*
+		 * Phase 4u.2 (hardware, Nov 16): the near Deco unplugged, the
+		 * Mac stayed "connected" to it for 3 minutes with no internet.
+		 * The far Deco shares its 6 GHz channel, so there was always
+		 * receive airtime and the test above never fired. mac80211's
+		 * connection monitor goes by the AP alone: no frame from it
+		 * (and no ACK) for IEEE80211_CONNECTION_IDLE_TIME, 30 s, and
+		 * it probes (ieee80211_sta_conn_mon_timer). Same here; an AP
+		 * that is there ACKs the null probe and we stay.
+		 */
+		else if (sc->sc_7927_run_polls > 35 &&
+		    heard == sc->sc_7927_wd_window_mark) {
+			why = "no frame from the AP for 30 s";
+			idle = true;
+		}
 		sc->sc_7927_wd_window_mark = heard;
 	}
 	if (why == NULL || (sc->sc_flags & MWX_FLAG_SCANNING))
@@ -12939,8 +12980,11 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 	if (sc->sc_7927_wd_probes == 0) {
 		sc->sc_7927_wd_probes = 1;
 		sc->sc_7927_wd_rx_mark = mt7927_rx_from_bss(sc);
-		MWX_DEV_LOG(sc, "MT7927 link watchdog: %s (tx airtime %u us), "
-		    "asking the AP\n", why, txt);
+		sc->sc_7927_wd_nack_mark = sc->sc_7927_probe_nacks;
+		sc->sc_7927_wd_idle = idle;
+		if (!idle)
+			MWX_DEV_LOG(sc, "MT7927 link watchdog: %s (tx airtime "
+			    "%u us), asking the AP\n", why, txt);
 		mt7927_probe_ap(sc);
 		return;
 	}

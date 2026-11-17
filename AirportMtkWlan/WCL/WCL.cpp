@@ -1110,9 +1110,14 @@ void AirportItlwmSkywalkInterface::checkWCLRoam()
     if (go || (wanted && roamConfirm.armed && roamLastLogMs != roamConfirm.sampleMs) ||
         now - roamLastLogMs >= 30000) {
         roamLastLogMs = wanted ? roamConfirm.sampleMs : now;
+        // 4u.2: ether_sprintf has one static buffer; two in one call printed
+        // the second address twice
+        char curName[18], bestName[18];
+        snprintf(curName, sizeof(curName), "%s", ether_sprintf(bss->ni_macaddr));
+        snprintf(bestName, sizeof(bestName), "%s",
+                 best ? ether_sprintf(best->ni_macaddr) : "none");
         XYLog("WCL roam check: %s at %d dBm (average), best other AP %s at %d dBm%s\n",
-              ether_sprintf(bss->ni_macaddr), cur,
-              best ? ether_sprintf(best->ni_macaddr) : "none", best ? bestRssi : 0,
+              curName, cur, bestName, best ? bestRssi : 0,
               go ? ": roaming" : wanted ? ": waiting for a second reading" : "");
     }
     if (wanted)
@@ -1221,7 +1226,9 @@ bool AirportItlwmSkywalkInterface::startWCLRoam(ieee80211_node *target)
     roamLastTryMs = now;
     uint8_t to[6];
     memcpy(to, target->ni_macaddr, 6);
-    uint8_t chan = uint8_t(ieee80211_chan2ieee(ic, target->ni_chan));
+    // 4u.2 review: the on-air number (6 GHz 165, not its table index 223),
+    // as the 4p one-channel join scan and its (n - 1) % 4 test expect
+    uint8_t chan = uint8_t(ieee80211_chan2number(ic, target->ni_chan));
     bool sixGHz = IEEE80211_IS_CHAN_6GHZ(target->ni_chan);
     memcpy(roamFromBSSID, joinBSSID, 6);
 
@@ -1243,9 +1250,10 @@ bool AirportItlwmSkywalkInterface::startWCLRoam(ieee80211_node *target)
                                  IEEE80211_REASON_AUTH_LEAVE);
     }
     ic->ic_deauth_reason = IEEE80211_REASON_AUTH_LEAVE;
+    char fromName[18];      // 4u.2: one static ether_sprintf buffer
+    snprintf(fromName, sizeof(fromName), "%s", ether_sprintf(roamFromBSSID));
     XYLog("WCL roam: from %s, deauth -> %d; to %s on channel %u%s\n",
-          ether_sprintf(roamFromBSSID), rv, ether_sprintf(to), chan,
-          sixGHz ? " (6 GHz)" : "");
+          fromName, rv, ether_sprintf(to), chan, sixGHz ? " (6 GHz)" : "");
     // Aim the join at the target; the network's credentials (PSK, SAE
     // password and PT: the same SSID) stay as the join set them.
     memcpy(ic->ic_des_bssid, to, 6);
