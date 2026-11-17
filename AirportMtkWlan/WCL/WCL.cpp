@@ -1051,9 +1051,105 @@ static constexpr uint64_t kRoamSettleMs = 60000;
 static constexpr uint64_t kRoamRetryMs = 60000;
 static constexpr uint64_t kRoamBlockMs = 300000;
 static constexpr uint64_t kRoamHeardMs = 30000;
+// 4u.3: after link loss an older reading still beats macOS's rejoin; a
+// stale one costs one failed roam (10-15 s), then the leave as before
+static constexpr uint64_t kRoamLostHeardMs = 120000;
 static constexpr uint64_t kRoamScanMs = 15000;     // a Mac's low-RSSI roam scans: 30 s
 static constexpr uint32_t kRoamTimeoutMs = 10000;       // 6 GHz: its channel alone
 static constexpr uint32_t kRoamSweepTimeoutMs = 15000;  // otherwise a full sweep first
+
+/*
+ * The strongest other AP of our network (same SSID, a shared AKM, no failed
+ * join, not blocked after a failed roam) heard in the last heardMs.
+ */
+ieee80211_node *AirportItlwmSkywalkInterface::findRoamCandidate(uint64_t heardMs, int *rssi)
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    ieee80211_node *bss = ic->ic_bss, *best = NULL, *ni;
+    uint64_t now = airport_up_time();
+    int bestRssi = -128;
+    RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+        if (ni == bss || IEEE80211_ADDR_EQ(ni->ni_macaddr, bss->ni_macaddr) ||
+            ni->ni_esslen != bss->ni_esslen ||
+            memcmp(ni->ni_essid, bss->ni_essid, bss->ni_esslen) != 0 ||
+            !(ni->ni_rsnakms & bss->ni_rsnakms) || ni->ni_fails != 0 ||
+            ni->ni_age_ts == 0 || now - ni->ni_age_ts > heardMs ||
+            ni->ni_rssi == 0 || ni->ni_chan == NULL ||
+            ni->ni_chan == IEEE80211_CHAN_ANYC)
+            continue;
+        if (now < roamBlockUntilMs && IEEE80211_ADDR_EQ(ni->ni_macaddr, roamBlockBSSID))
+            continue;
+        int r = int(ni->ni_rssi) - 100;
+        if (r > bestRssi) {
+            bestRssi = r;
+            best = ni;
+        }
+    }
+    *rssi = bestRssi;
+    return best;
+}
+
+/*
+ * Phase 4u.3: the link watchdog found our AP gone (IEEE80211_EVT_LINK_LOST,
+ * on the command gate, before its leave). Roam to another AP of the network
+ * if one was heard, as a Mac's firmware does on beacon loss; no signal rule
+ * (ours is gone) and no settle or retry wait. True if the roam started;
+ * otherwise the HAL leaves and macOS rejoins as before.
+ */
+bool AirportItlwmSkywalkInterface::roamAllowed()
+{
+    static int disabled = -1;
+    if (disabled < 0) {
+        char v[8];
+        disabled = PE_parse_boot_argn("-mtk7927noroam", v, sizeof(v)) ? 1 : 0;
+    }
+    ieee80211com *ic = fHalService->get80211Controller();
+    return !(disabled || wclStopping || roamPending || joinPending || scanPending ||
+        !portAuthorized || ic->ic_opmode != IEEE80211_M_STA ||
+        ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL ||
+        (ic->ic_flags & IEEE80211_F_BGSCAN) ||
+        ic->ic_wcl_enterprise || !(ic->ic_flags & IEEE80211_F_PSK) ||
+        !(ic->ic_flags & IEEE80211_F_RSNON));
+}
+
+/*
+ * Phase 4u.3 (review): the watchdog started asking the AP (LINK_DOUBT). On a
+ * strong link no roam scans run, so the other APs' readings can be minutes
+ * old; look once now (the probes take 3 s; a mesh shares our channel). Not
+ * if a candidate is fresh, nor more than every 30 s (an idle link whose
+ * beacons the firmware filters is asked every 30 s).
+ */
+void AirportItlwmSkywalkInterface::roamScanForLinkDoubt()
+{
+    if (!roamAllowed() || roamScanPending)
+        return;
+    uint64_t now = airport_up_time();
+    int rssi;
+    if (findRoamCandidate(kRoamHeardMs, &rssi) != NULL || now - roamLastScanMs < 30000)
+        return;
+    startWCLRoamScan();
+}
+
+bool AirportItlwmSkywalkInterface::roamAfterLinkLoss()
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    if (!roamAllowed())
+        return false;
+    int rssi = -128;
+    ieee80211_node *best = findRoamCandidate(kRoamLostHeardMs, &rssi);
+    char lostName[18];      // one static ether_sprintf buffer
+    snprintf(lostName, sizeof(lostName), "%s", ether_sprintf(ic->ic_bss->ni_macaddr));
+    if (best == NULL) {
+        XYLog("WCL roam: %s gone, no other AP of the network heard in %llu s: "
+              "leaving\n", lostName, kRoamLostHeardMs / 1000);
+        return false;
+    }
+    XYLog("WCL roam: %s gone, to %s (%d dBm, heard %llu ms ago)\n", lostName,
+          ether_sprintf(best->ni_macaddr), rssi, airport_up_time() - best->ni_age_ts);
+    roamConfirm.armed = false;
+    roamScanPending = false;
+    return startWCLRoam(best);
+}
 
 void AirportItlwmSkywalkInterface::checkWCLRoam()
 {
@@ -1082,25 +1178,8 @@ void AirportItlwmSkywalkInterface::checkWCLRoam()
         roamScanIntervalMs = 0;
         return;
     }
-    ieee80211_node *best = NULL, *ni;
     int bestRssi = -128;
-    RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
-        if (ni == bss || IEEE80211_ADDR_EQ(ni->ni_macaddr, bss->ni_macaddr) ||
-            ni->ni_esslen != bss->ni_esslen ||
-            memcmp(ni->ni_essid, bss->ni_essid, bss->ni_esslen) != 0 ||
-            !(ni->ni_rsnakms & bss->ni_rsnakms) || ni->ni_fails != 0 ||
-            ni->ni_age_ts == 0 || now - ni->ni_age_ts > kRoamHeardMs ||
-            ni->ni_rssi == 0 || ni->ni_chan == NULL ||
-            ni->ni_chan == IEEE80211_CHAN_ANYC)
-            continue;
-        if (now < roamBlockUntilMs && IEEE80211_ADDR_EQ(ni->ni_macaddr, roamBlockBSSID))
-            continue;
-        int r = int(ni->ni_rssi) - 100;
-        if (r > bestRssi) {
-            bestRssi = r;
-            best = ni;
-        }
-    }
+    ieee80211_node *best = findRoamCandidate(kRoamHeardMs, &bestRssi);
     bool wanted = best != NULL && AirportWCL::roamWanted(cur, bestRssi);
     bool go = false;
     if (!wanted)
@@ -1528,6 +1607,12 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
         }
         case IEEE80211_EVT_ROAM_TICK:       // phase 4u: about every 2 s in RUN
             checkWCLRoam();
+            break;
+        case IEEE80211_EVT_LINK_LOST:       // phase 4u.3: before the HAL's leave
+            ic->ic_wcl_link_lost_roamed = roamAfterLinkLoss();
+            break;
+        case IEEE80211_EVT_LINK_DOUBT:      // 4u.3 review: the HAL asks the AP
+            roamScanForLinkDoubt();
             break;
         case IEEE80211_EVT_SCAN_DONE:
             if (roamScanPending) {          // phase 4u: our roam scan ended

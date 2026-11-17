@@ -699,6 +699,7 @@ struct mwx_softc {
 	volatile uint32_t	sc_7927_probe_nacks;	/* 4u.2: and not acked */
 	uint32_t		sc_7927_wd_nack_mark;
 	bool			sc_7927_wd_idle;	/* 4u.2: probing an idle link */
+	bool			sc_7927_leave_csa;	/* 4u.3: a channel-switch leave */
 	volatile uint32_t	sc_7927_txs_join_ack, sc_7927_txs_join_nack;
 	volatile uint32_t	sc_7927_txs_leave_ack, sc_7927_txs_leave_nack;
 	volatile uint8_t	sc_7927_txs_join_st, sc_7927_txs_leave_st;	/* subtype sent */
@@ -12841,6 +12842,7 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 	if (sc->sc_7927_csa_leave) {
 		sc->sc_7927_csa_leave = false;
 		sc->sc_7927_last_recovery = 0;	/* not throttled */
+		sc->sc_7927_leave_csa = true;	/* 4u.3: the AP moved: no roam */
 		mt7927_link_leave(sc, sc->sc_7927_csa_why != NULL ?
 		    sc->sc_7927_csa_why : "channel switch", 0, 0, 0);
 		return;
@@ -12893,6 +12895,7 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 				/* review S4: not throttled, and named */
 				sc->sc_7927_csa_verifying = false;
 				sc->sc_7927_last_recovery = 0;
+				sc->sc_7927_leave_csa = true;	/* 4u.3 */
 				mt7927_link_leave(sc, "no answer from the AP on its "
 				    "new channel after the switch", 0,
 				    sc->sc_7927_bcn_loss_seen, 0);
@@ -12986,6 +12989,11 @@ mt7927_link_watchdog(struct mwx_softc *sc)
 			MWX_DEV_LOG(sc, "MT7927 link watchdog: %s (tx airtime "
 			    "%u us), asking the AP\n", why, txt);
 		mt7927_probe_ap(sc);
+#ifdef AIRPORT_WCL
+		/* 4u.3 review: a fresh candidate for LINK_LOST, if it comes */
+		if (ic->ic_event_handler != NULL)
+			(*ic->ic_event_handler)(ic, IEEE80211_EVT_LINK_DOUBT, NULL);
+#endif
 		return;
 	}
 }
@@ -12996,7 +13004,13 @@ mt7927_link_leave(struct mwx_softc *sc, const char *why, uint32_t txt,
     uint32_t loss, uint32_t dumps)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
+	/*
+	 * 4u.3 review: after a channel switch the AP is there, only moved (and
+	 * a mesh's other nodes with it): leave and let macOS find it again.
+	 */
+	bool csa = sc->sc_7927_leave_csa;
 
+	sc->sc_7927_leave_csa = false;
 	if (sc->sc_7927_last_recovery != 0 &&
 	    sc->sc_7927_poll - sc->sc_7927_last_recovery < 60) {
 		MWX_DEV_LOG(sc, "MT7927 link watchdog: %s (tx airtime %u us), "
@@ -13006,6 +13020,30 @@ mt7927_link_leave(struct mwx_softc *sc, const char *why, uint32_t txt,
 	}
 	sc->sc_7927_last_recovery = sc->sc_7927_poll;
 	sc->sc_7927_recoveries++;
+#ifdef AIRPORT_WCL
+	/*
+	 * Phase 4u.3 (hardware, Nov 16): after this leave macOS rejoined the
+	 * AP that had gone, from its 12 s old scan list, failed after 10 s and
+	 * then held the network as "already failed" for 38 s more. A Mac's
+	 * firmware roams on beacon loss instead (RoamReasonBeaconLost): the
+	 * front end tries another AP of the network it heard, if any.
+	 */
+	if (!csa && ic->ic_event_handler != NULL) {
+		ic->ic_wcl_link_lost_roamed = false;
+		(*ic->ic_event_handler)(ic, IEEE80211_EVT_LINK_LOST, NULL);
+		if (ic->ic_wcl_link_lost_roamed) {
+			ic->ic_wcl_link_lost_roamed = false;
+			MWX_DEV_LOG(sc, "MT7927 link watchdog: %s (tx airtime %u "
+			    "us, %u beacon loss events, %u coredumps): roaming "
+			    "from %s to another AP of the network (recovery "
+			    "#%u)\n", why, txt, loss, dumps,
+			    ether_sprintf(sc->sc_7927_bss.bssid),
+			    sc->sc_7927_recoveries);
+			sc->sc_7927_run_polls = 0;
+			return;
+		}
+	}
+#endif
 	MWX_DEV_LOG(sc, "MT7927 link watchdog: %s (tx airtime %u us, %u beacon "
 	    "loss events, %u coredumps): leaving %s so it can be joined again "
 	    "(recovery #%u)\n", why, txt, loss, dumps,

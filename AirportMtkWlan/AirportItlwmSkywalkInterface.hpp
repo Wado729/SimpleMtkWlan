@@ -451,6 +451,10 @@ private:
     void synthesizeWCLFirstBeacon();
     // Phase 4u: driver-side roaming between APs of the joined network
     void checkWCLRoam();
+    struct ieee80211_node *findRoamCandidate(uint64_t heardMs, int *rssi);
+    bool roamAfterLinkLoss();
+    bool roamAllowed();
+    void roamScanForLinkDoubt();
     bool startWCLRoam(struct ieee80211_node *);
     void finishWCLRoam(bool ok, const char *why);
     void syncLinkAfterRoam();

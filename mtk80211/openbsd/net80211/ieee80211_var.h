@@ -488,6 +488,7 @@ struct ieee80211com {
     bool ic_wcl_scan_restart_supported;   /* the HAL consumes ic_wcl_scan_restart (MT7927) */
     uint8_t ic_wcl_join_chan6g;           /* phase 4g: the 6 GHz channel of macOS's join, 0 if none */
     uint8_t ic_wcl_join_scans;            /* phase 4p: join scans of that channel alone */
+    bool ic_wcl_link_lost_roamed;         /* phase 4u.3: the front end roams instead of the leave */
 #endif
     /* The channel width has changed (20<->2040) */
     void            (*ic_update_chw)(struct ieee80211com *);
@@ -769,6 +770,18 @@ struct ieee80211_ess {
 #define IEEE80211_EVT_BEACON_6G                 9
 /* Phase 4u: about every 2 s while associated (the front end's roam check) */
 #define IEEE80211_EVT_ROAM_TICK                 10
+/*
+ * Phase 4u.3: the driver found the AP gone (link watchdog) and is about to
+ * leave. The front end may roam to another AP of the network instead, and
+ * then sets ic_wcl_link_lost_roamed (synchronous, on the command gate).
+ */
+#define IEEE80211_EVT_LINK_LOST                 11
+/*
+ * Phase 4u.3 (review): the link watchdog starts asking the AP. The front end
+ * may look for another AP of the network meanwhile (a roam scan), so that
+ * LINK_LOST has a fresh candidate.
+ */
+#define IEEE80211_EVT_LINK_DOUBT                12
 struct ieee80211_beacon6g_event {
     const uint8_t *bssid;
     const uint8_t *ssid;

@@ -36,12 +36,14 @@ enum { IEEE80211_M_STA = 1, IEEE80211_M_HOSTAP = 2 };
 #define IEEE80211_FC0_SUBTYPE_DEAUTH 0xc0
 #define IEEE80211_REASON_ASSOC_EXPIRE 4
 #define IEEE80211_EVT_STA_DEAUTH 7
+#define IEEE80211_EVT_LINK_LOST 11
+#define IEEE80211_EVT_LINK_DOUBT 12
 struct CTimeout {};
 struct ieee80211_node { uint8_t ni_macaddr[6]; int ni_port_valid; };
 struct ifn { const char *if_xname; };
 struct ieee80211com { int ic_opmode; int ic_state; ieee80211_node *ic_bss; CTimeout *ic_assoc_to;
   uint8_t ic_assoc_retry, ic_assoc_tries, ic_assoc_reassoc, ic_leave_pending; ifn ic_if; int ic_mgt_timer; int ic_deauth_reason;
-  void (*ic_event_handler)(ieee80211com*, int, void*); };
+  void (*ic_event_handler)(ieee80211com*, int, void*); bool ic_wcl_link_lost_roamed; };
 static int armed = -1, sends_assoc, sends_probe, sends_deauth, events, newstates, last_arg;
 static int timeout_add_msec(CTimeout **, int ms) { armed = ms; return 1; }
 static const char *ether_sprintf(const uint8_t *) { return "ap"; }
@@ -53,14 +55,18 @@ static int send_mgmt(ieee80211com *ic, ieee80211_node *, int type, int arg) {
   return 0; }
 #define IEEE80211_SEND_MGMT(ic, ni, t, a) send_mgmt(ic, ni, t, a)
 static void ieee80211_new_state(ieee80211com *ic, int st, int) { ic->ic_state = st; newstates++; }
-static void evh(ieee80211com *, int e, void *) { if (e == IEEE80211_EVT_STA_DEAUTH) events++; }
+static int roam_avail, lost_events, doubt_events;
+static void evh(ieee80211com *ic, int e, void *) { if (e == IEEE80211_EVT_STA_DEAUTH) events++;
+  if (e == IEEE80211_EVT_LINK_LOST) { lost_events++; ic->ic_wcl_link_lost_roamed = roam_avail; }
+  if (e == IEEE80211_EVT_LINK_DOUBT) doubt_events++; }
 ''' + defs + fn(p, "ieee80211_assoc_arm", "void") + fn(p, "ieee80211_assoc_timeout", "void") + \
    fn(p, "ieee80211_assoc_begin", "static void") + fn(p, "ieee80211_assoc_comeback", "void") + r'''
+#define AIRPORT_WCL 1
 struct mt7927_bringup {};
 struct mt7927_bss { uint8_t bssid[6]; };
 struct mwx_softc { ieee80211com sc_ic; bool sc_7927_assoc; uint32_t sc_7927_run_polls, sc_7927_bcn_loss_seen, sc_7927_mib_seen,
   sc_7927_recoveries, sc_7927_last_recovery, sc_7927_poll, sc_7927_rx_bcn, sc_7927_rx_mcast, sc_7927_rx_ucast, sc_7927_rx_bss_mgt,
-  sc_7927_wd_probes, sc_7927_wd_rx_mark, sc_7927_wd_window_mark, sc_7927_probe_acks, sc_7927_probe_nacks, sc_7927_wd_nack_mark; bool sc_7927_wd_idle; int sc_flags; bool sc_7927_csa_leave, sc_7927_csa_verify, sc_7927_bcnft_on, sc_7927_csa_verifying; const char *sc_7927_csa_why; mt7927_bringup *sc_7927; struct { int band_idx; } sc_vif; mt7927_bss sc_7927_bss; };
+  sc_7927_wd_probes, sc_7927_wd_rx_mark, sc_7927_wd_window_mark, sc_7927_probe_acks, sc_7927_probe_nacks, sc_7927_wd_nack_mark; bool sc_7927_wd_idle, sc_7927_leave_csa; int sc_flags; bool sc_7927_csa_leave, sc_7927_csa_verify, sc_7927_bcnft_on, sc_7927_csa_verifying; const char *sc_7927_csa_why; mt7927_bringup *sc_7927; struct { int band_idx; } sc_vif; mt7927_bss sc_7927_bss; };
 static uint32_t E_loss, E_rxt, E_windows;
 static void mt7927_engine_link(mt7927_bringup *, int, uint32_t *loss, uint32_t *dumps, uint32_t *rxt, uint32_t *txt, uint32_t *w) {
   *loss = E_loss; *dumps = 0; *rxt = E_rxt; *txt = 0; *w = E_windows; }
@@ -154,6 +160,20 @@ int main() {
   mt7927_link_watchdog(&sc); for (int i = 0; i < 40; i++) { sc.sc_7927_poll++; mt7927_link_watchdog(&sc); }
   E_windows = 14; sc.sc_7927_poll++; mt7927_link_watchdog(&sc); sc.sc_7927_poll++; mt7927_link_watchdog(&sc);
   assert(sc.sc_7927_wd_probes == 0 && newstates == 2);
+  /* phase 4u.3: the front end roams to another AP instead of the leave */
+  ack_nulls = 0; nack_nulls = 1; roam_avail = 1; sc.sc_7927_last_recovery = 0;
+  int le = lost_events, dd = sends_deauth, ns = newstates, rc = sc.sc_7927_recoveries;
+  E_windows = 15; sc.sc_7927_poll++; mt7927_link_watchdog(&sc);   /* the ack fell in this window */
+  E_windows = 16; sc.sc_7927_poll++; mt7927_link_watchdog(&sc);
+  for (int i = 0; i < 3; i++) { sc.sc_7927_poll++; mt7927_link_watchdog(&sc); }
+  assert(lost_events == le + 1 && sends_deauth == dd && newstates == ns && events == 2);
+  assert(sc.sc_7927_recoveries == rc + 1 && sc.sc_7927_run_polls == 0 && !sc.sc_ic.ic_wcl_link_lost_roamed);
+  assert(doubt_events >= 1);                       /* raised when probing starts */
+  /* a channel-switch leave never roams */
+  sc.sc_ic.ic_state = IEEE80211_S_RUN; sc.sc_7927_run_polls = 5; sc.sc_7927_csa_leave = true; sc.sc_7927_csa_why = "csa";
+  le = lost_events; dd = sends_deauth;
+  sc.sc_7927_poll++; mt7927_link_watchdog(&sc);
+  assert(lost_events == le && sends_deauth == dd + 1 && !sc.sc_7927_leave_csa);
   printf("PASS\n"); return 0;
 }
 '''
