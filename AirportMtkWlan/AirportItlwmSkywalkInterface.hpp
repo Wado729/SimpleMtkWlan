@@ -454,6 +454,11 @@ private:
     bool startWCLRoam(struct ieee80211_node *);
     void finishWCLRoam(bool ok, const char *why);
     void syncLinkAfterRoam();
+    void startWCLRoamScan();
+    bool roamScanPending = false;
+    uint64_t roamLastScanMs = 0;
+    uint64_t roamScanIntervalMs = 0;
+    uint32_t roamScanCount = 0;
     void abortWCLRoam(IOReturn status, const char *why);
     bool publishRoamBss();
     AirportWCL::RoamConfirm roamConfirm = {};

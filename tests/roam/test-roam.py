@@ -15,8 +15,9 @@ def grab(start, end_marker):
     return s[i:s.index(end_marker, i) + len(end_marker)]
 consts = grab('static constexpr int kRoamTriggerDbm', 'kRoamDeltaDb = 8;')
 wanted = grab('inline bool roamWanted(', '\n}\n')
+set6g = grab('inline bool set6gChannel(', '\n}\n')
 confirm = grab('struct RoamConfirm {', '\n}\n')
-pre = '#include <cassert>\n#include <cstdint>\n#include <cstdio>\n#include <cstring>\nnamespace AirportWCL {\n'
+pre = '#include <cassert>\n#include <cstdint>\n#include <cstdio>\n#include <cstring>\n#include <cstddef>\nnamespace AirportWCL {\n'
 main = r'''
 }
 using namespace AirportWCL;
@@ -34,12 +35,22 @@ int main() {
     assert(!roamConfirmed(c, a, 30000));    /* after a go: arms again */
     assert(!roamConfirmed(c, b, 31000));    /* another AP: re-arms for it */
     assert(roamConfirmed(c, b, 52000));
-    puts("PASS: -72 dBm / +8 dB rule; two separate readings of the same AP");
+    /* 4u.1: the 6 GHz request bitmap, read as mt7927_hal_scan reads it */
+    uint8_t bm[30] = {};
+    assert(set6gChannel(bm, sizeof(bm), 165));
+    assert(!set6gChannel(bm, sizeof(bm), 165));      /* already there */
+    assert(!set6gChannel(bm, sizeof(bm), 0) && !set6gChannel(bm, sizeof(bm), 234));
+    for (unsigned psc = 5; psc <= 229; psc += 16) set6gChannel(bm, sizeof(bm), psc);
+    int picked = 0;
+    for (unsigned c6 = 1; c6 <= 233; c6++)
+        if (bm[c6 / 8] & (1U << (c6 % 8))) { picked++; assert(c6 == 165 || (c6 - 5) % 16 == 0); }
+    assert(picked == 15);                               /* the 15 PSCs (165 is one) */
+    puts("PASS: -72 dBm / +8 dB rule; two separate readings; 6 GHz request bitmap");
 }
 '''
 with tempfile.TemporaryDirectory() as d:
     p = Path(d)
-    (p / 't.cpp').write_text(pre + consts + '\n' + wanted + confirm + main)
+    (p / 't.cpp').write_text(pre + set6g + consts + '\n' + wanted + confirm + main)
     subprocess.run(['clang++', '-std=c++14', '-fsanitize=address,undefined', '-g',
                     str(p / 't.cpp'), '-o', str(p / 't')], check=True)
     r = subprocess.run([str(p / 't')], capture_output=True, text=True)

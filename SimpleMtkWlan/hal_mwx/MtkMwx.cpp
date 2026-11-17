@@ -12998,6 +12998,16 @@ mt7927_hal_poll(struct mwx_softc *sc)
 		sc->sc_7927_scan_ticks = 0;
 	}
 	mt7927_join_poll(sc);
+#ifdef AIRPORT_WCL
+	/*
+	 * Phase 4u (hardware, Nov 16): the roam check ran from the beacon
+	 * path, but in RUN the firmware beacon filter (4l, as Linux) passes no
+	 * beacons, so it never ran. A tick from here instead.
+	 */
+	if ((sc->sc_7927_poll % 2) == 0 && sc->sc_ic.ic_state == IEEE80211_S_RUN &&
+	    sc->sc_ic.ic_event_handler != NULL)
+		(*sc->sc_ic.ic_event_handler)(&sc->sc_ic, IEEE80211_EVT_ROAM_TICK, NULL);
+#endif
 	/* phase 4t: the signal over the last 30 s, for the log */
 	if ((sc->sc_7927_poll % 30) == 0 && sc->sc_7927_sig_n != 0 &&
 	    sc->sc_ic.ic_state == IEEE80211_S_RUN) {

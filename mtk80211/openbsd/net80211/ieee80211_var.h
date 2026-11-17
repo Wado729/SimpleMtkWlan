@@ -767,6 +767,8 @@ struct ieee80211_ess {
  * is no node: the front end publishes it to macOS as it is.
  */
 #define IEEE80211_EVT_BEACON_6G                 9
+/* Phase 4u: about every 2 s while associated (the front end's roam check) */
+#define IEEE80211_EVT_ROAM_TICK                 10
 struct ieee80211_beacon6g_event {
     const uint8_t *bssid;
     const uint8_t *ssid;

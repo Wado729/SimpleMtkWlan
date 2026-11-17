@@ -101,6 +101,17 @@ struct RoamStatus {
 static_assert(sizeof(RoamStatus) == 0xa8, "RoamStatus size");
 static constexpr uint32_t kRoamReasonLowRSSI = 0xe0820c01;
 
+// Phase 4u.1: one 6 GHz channel into a scan request's bitmap by channel
+// number (byte num / 8, bit num % 8), as macOS's requests are parsed below
+// and mt7927_hal_scan reads it. True if newly set (host-tested in tests/roam).
+inline bool set6gChannel(uint8_t *bitmap, size_t length, unsigned num)
+{
+    if (num == 0 || num > 233 || num / 8 >= length || (bitmap[num / 8] & (1U << (num % 8))))
+        return false;
+    bitmap[num / 8] |= uint8_t(1U << (num % 8));
+    return true;
+}
+
 // Phase 4u: the roam decision (host-tested in tests/roam). Like a Mac with
 // default settings: a weak link and another AP clearly stronger.
 static constexpr int kRoamTriggerDbm = -72;

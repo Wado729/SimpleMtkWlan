@@ -763,6 +763,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     ic->ic_flags |= IEEE80211_F_DESBSSID;
     ic->ic_wcl_join_requested = true;
     ic->ic_wcl_scan_requested = false;
+    roamScanPending = false;            // phase 4u.1
     current_authtype_lower = join.lowerAuth;
     current_authtype_upper = join.upperAuth;
     explicit_bzero(&join, sizeof(join));
@@ -883,6 +884,8 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork(const char *why)
     ieee80211com *ic = fHalService->get80211Controller();
     bool abandonedRoam = roamPending;   // phase 4u: macOS's leave or join ends a roam
     abortWCLRoam(kIOReturnAborted, why);
+    roamScanPending = false;            // 4u.1 review
+    roamScanIntervalMs = 0;
     XYLog("WCL leave (%s): state %d joinPending %d assoc %d firstBeacon %d bssValid %d "
         "join beacons %u assoc beacons %u port %d\n", why, ic->ic_state, joinPending,
         assocNotified, firstBeaconNotified, wclBssValid, wclJoinBeacons,
@@ -1048,6 +1051,7 @@ static constexpr uint64_t kRoamSettleMs = 60000;
 static constexpr uint64_t kRoamRetryMs = 60000;
 static constexpr uint64_t kRoamBlockMs = 300000;
 static constexpr uint64_t kRoamHeardMs = 30000;
+static constexpr uint64_t kRoamScanMs = 15000;     // a Mac's low-RSSI roam scans: 30 s
 static constexpr uint32_t kRoamTimeoutMs = 10000;       // 6 GHz: its channel alone
 static constexpr uint32_t kRoamSweepTimeoutMs = 15000;  // otherwise a full sweep first
 
@@ -1066,12 +1070,16 @@ void AirportItlwmSkywalkInterface::checkWCLRoam()
         !(ic->ic_flags & IEEE80211_F_RSNON))
         return;
     uint64_t now = airport_up_time();
+    // review: a completion the HAL drops never ends roamScanPending
+    if (roamScanPending && now - roamLastScanMs > 20000)
+        roamScanPending = false;
     if (now - linkUpMs < kRoamSettleMs || now - roamLastTryMs < kRoamRetryMs)
         return;
     ieee80211_node *bss = ic->ic_bss;
     int cur = int(bss->ni_rssi) - 100;      // dBm, averaged (phase 4t)
     if (bss->ni_rssi == 0 || cur > AirportWCL::kRoamTriggerDbm) {
         roamConfirm.armed = false;
+        roamScanIntervalMs = 0;
         return;
     }
     ieee80211_node *best = NULL, *ni;
@@ -1107,8 +1115,103 @@ void AirportItlwmSkywalkInterface::checkWCLRoam()
               best ? ether_sprintf(best->ni_macaddr) : "none", best ? bestRssi : 0,
               go ? ": roaming" : wanted ? ": waiting for a second reading" : "");
     }
+    if (wanted)
+        roamScanIntervalMs = 0;     // something better heard: scan again soon
+    if (go && roamScanPending) {    // review: not on top of our running scan
+        go = false;
+        roamConfirm.armed = true;   // the confirmed reading still counts
+        roamConfirm.sampleMs = 0;
+    }
     if (go)
         startWCLRoam(best);
+    else if (!roamScanPending &&
+             now - roamLastScanMs >= (roamScanIntervalMs ? roamScanIntervalMs : kRoamScanMs))
+        startWCLRoamScan();
+}
+
+/*
+ * Phase 4u (hardware, Nov 16): on the far Deco no other AP was ever heard
+ * fresh enough: macOS skips its own roam scans here ("SKIPPING RoamScan;
+ * Env:0 isDualBand:0") and its other scans are minutes apart, and the
+ * firmware filters other APs' beacons in RUN. A Mac's firmware roam-scans
+ * itself on a weak link (WCL's roam profile below -75 dBm: every 30 s).
+ * Here every 15 s while the link is weak: the channels where APs of this
+ * network were heard and our own, through the associated-scan path macOS's
+ * scans use (a 6 GHz channel of our own does not leave the home channel).
+ */
+void AirportItlwmSkywalkInterface::startWCLRoamScan()
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    roamLastScanMs = airport_up_time();
+    if (roamScanPending || scanPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
+        return;
+    // review: back off (15, 30, 60 s) while the scans find nothing better
+    roamScanIntervalMs = roamScanIntervalMs == 0 ? kRoamScanMs :
+        (roamScanIntervalMs * 2 > 4 * kRoamScanMs ? 4 * kRoamScanMs : roamScanIntervalMs * 2);
+    ieee80211_node *bss = ic->ic_bss, *ni;
+    uint8_t bitmap[sizeof(ic->ic_wcl_scan_channels)] = {};
+    uint8_t six[sizeof(ic->ic_wcl_scan_channels6g)] = {};
+    unsigned n6 = 0, n = 0;
+    // review: a bitmap by 6 GHz channel number, as WCL.hpp builds macOS's
+    // requests and mt7927_hal_scan reads it
+    auto add6 = [&](unsigned num) {
+        if (AirportWCL::set6gChannel(six, sizeof(six), num)) {
+            n6++;
+            n++;
+        }
+    };
+    auto add = [&](const ieee80211_channel *c) {
+        if (c == NULL || c == IEEE80211_CHAN_ANYC)
+            return;
+        if (IEEE80211_IS_CHAN_6GHZ(c)) {
+            add6(unsigned(ieee80211_chan2number(ic, c)));
+        } else {
+            unsigned idx = unsigned(c - ic->ic_channels);
+            if (idx / 8 < sizeof(bitmap) && !(bitmap[idx / 8] & (1U << (idx % 8)))) {
+                bitmap[idx / 8] |= uint8_t(1U << (idx % 8));
+                n++;
+            }
+        }
+    };
+    add(bss->ni_chan);
+    RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+        if (n >= 8)
+            break;
+        if (ni != bss && ni->ni_esslen == bss->ni_esslen &&
+            memcmp(ni->ni_essid, bss->ni_essid, bss->ni_esslen) == 0)
+            add(ni->ni_chan);
+    }
+    // review: every 4th roam scan wider, for an AP never heard or aged out:
+    // on 6 GHz the preferred scanning channels (5, 21, ... 229), else the
+    // channels of our band
+    bool wide = (++roamScanCount % 4) == 0;
+    if (wide && IEEE80211_IS_CHAN_6GHZ(bss->ni_chan)) {
+        for (unsigned psc = 5; psc <= 229; psc += 16)
+            add6(psc);
+    } else if (wide) {
+        bool two = IEEE80211_IS_CHAN_2GHZ(bss->ni_chan);
+        for (ieee80211_channel *c = &ic->ic_channels[1];
+             c <= &ic->ic_channels[IEEE80211_CHAN_MAX]; c++)
+            if (c->ic_flags != 0 && !IEEE80211_IS_CHAN_6GHZ(c) &&
+                bool(IEEE80211_IS_CHAN_2GHZ(c)) == two)
+                add(c);
+    }
+    memcpy(ic->ic_wcl_scan_channels, bitmap, sizeof(bitmap));
+    memcpy(ic->ic_wcl_scan_channels6g, six, sizeof(six));
+    ic->ic_wcl_scan_requested = true;
+    ic->ic_wcl_scan_restricted = true;
+    ic->ic_wcl_scan_active = false;
+    ic->ic_wcl_scan_ssid_length = 0;
+    roamScanPending = true;
+    ieee80211_begin_cache_bgscan(&ic->ic_if);
+    bool started = (ic->ic_flags & IEEE80211_F_BGSCAN) != 0;
+    if (!started) {
+        roamScanPending = false;
+        ic->ic_wcl_scan_requested = false;
+        ic->ic_wcl_scan_restricted = false;
+    }
+    XYLog("WCL roam scan: %u channel(s)%s%s%s, next in %llu s\n", n, n6 ? ", 6 GHz" : "",
+          wide ? " (wide)" : "", started ? "" : ": not started", roamScanIntervalMs / 1000);
 }
 
 bool AirportItlwmSkywalkInterface::startWCLRoam(ieee80211_node *target)
@@ -1319,6 +1422,7 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
         case IEEE80211_EVT_DRIVER_STOPPED: {
             bool ready = code == IEEE80211_EVT_DRIVER_READY;
             if (!ready) {
+                roamScanPending = false;    // 4u.1 review
                 if (roamPending) {      // phase 4u (review: 80 too, timer off)
                     abortWCLRoam(kIOReturnOffline, "driver stopped");
                     syncLinkAfterRoam();
@@ -1402,8 +1506,6 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
 #endif
                     updateWCLLinkQuality();
                 }
-                if (portAuthorized && (wclLqmBeacons % 20 == 0))
-                    checkWCLRoam();     // phase 4u: about every 2 s
             }
             if (scanPending || joinPending || ic->ic_state == IEEE80211_S_SCAN ||
                 ((portAuthorized || (roamPending && assocNotified)) &&  // phase 4u
@@ -1416,7 +1518,17 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                 notifyWCLFirstBeacon("beacon");
             break;
         }
+        case IEEE80211_EVT_ROAM_TICK:       // phase 4u: about every 2 s in RUN
+            checkWCLRoam();
+            break;
         case IEEE80211_EVT_SCAN_DONE:
+            if (roamScanPending) {          // phase 4u: our roam scan ended
+                roamScanPending = false;
+                if (!scanPending) {
+                    ic->ic_wcl_scan_requested = false;
+                    ic->ic_wcl_scan_restricted = false;
+                }
+            }
             // not the scan this request is waiting for (Ersiter does the same)
             if (scanPending && (scanDeferred || ic->ic_wcl_scan_restart))
                 break;
