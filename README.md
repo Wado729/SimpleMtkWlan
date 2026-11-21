@@ -1,304 +1,159 @@
-<!--
-  README.md
-  SimpleMtkWlan
+# AirportMT7927Wlan: MediaTek MT7927 Wi-Fi for macOS Sequoia
 
-  Created by laobamac (王孝慈) on 2026/5/5.
-  Copyright © 2026 laobamac (王孝慈). All rights reserved.
--->
-
-# SimpleMtkWlan
-
-[![Build](https://github.com/flxxxxddd/SimpleMtkWlan/actions/workflows/build.yml/badge.svg)](https://github.com/flxxxxddd/SimpleMtkWlan/actions/workflows/build.yml)
-[![Release](https://img.shields.io/github/v/release/flxxxxddd/SimpleMtkWlan)](https://github.com/flxxxxddd/SimpleMtkWlan/releases)
 [![License: GPL v2](https://img.shields.io/badge/license-GPLv2-blue.svg)](LICENSE)
 
-**Wi-Fi for MediaTek MT7921 / MT7921K (AMD RZ608) / MT7922 PCIe cards on macOS.**
+**Native macOS Wi-Fi for the MediaTek MT7927 (Filogic 380) card, `14c3:7927`.**
 
-An experimental macOS kernel extension, based on the OpenBSD `mwx(4)` driver and
-the itlwm-style `net80211` port. It comes in two flavours with the same
-hardware layer:
+This branch adds support for the **MediaTek MT7927** Wi-Fi 7 card (PCI `14c3:7927`,
+MT6639 family, connac3) to `AirportMT7927Wlan.kext`: the card appears as a real
+macOS Wi-Fi interface (Wi-Fi menu, System Settings, Keychain passwords, private
+Wi-Fi addresses), with no OCLP root patches.
 
-* **`AirportMT7927Wlan.kext`** — the card is a real macOS Wi-Fi interface: the
-  native Wi-Fi menu, System Settings, private Wi-Fi addresses, Keychain
-  passwords. Built for **macOS 26 Tahoe** (and Sequoia 15.2+), no OCLP root
-  patch, no IOSkywalkFamily downgrade.
-* **`SimpleMtkWlan.kext`** — the card is an Ethernet interface (`enX`);
-  networks are scanned and joined with the
-  [SimpleMTK](https://github.com/laobamac/SimpleMTKClient) menu-bar client.
-  Works on any macOS version the kext loads on.
+It is a hobby port, tested on **one machine with one router**, and only with the MT7927. Read the status
+below before you rely on it, and try it from a USB stick with a copy of your EFI
+first.
 
-> **Bluetooth** for the same card: **[SimpleMtkBtFw](https://github.com/flxxxxddd/SimpleMtkBtFw)**
-> (firmware loader + patcher; AirPods audio works).
+## Status
 
-> This fork contains the fixes needed to make **MT7921 / RZ608** actually work
-> (it was attaching but never passing traffic), plus 802.11n, 802.11ac
-> (VHT80) and the native Wi-Fi menu on Tahoe. See
-> [What changed in this fork](#what-changed-in-this-fork).
-
-> **MediaTek MT7927 (Wi-Fi 7 card, `14c3:7927`):** this branch adds it to
-> `AirportMT7927Wlan.kext` on **macOS Sequoia**: native Wi-Fi menu, 2.4/5/6 GHz,
-> Wi-Fi 6/6E up to 160 MHz, WPA3, roaming between mesh APs. Tested on one machine
-> with one router; see **[docs/MT7927.md](docs/MT7927.md)** for status, firmware
-> and installation.
-
-## Status (MT7921 / MT7922)
+Tested on: macOS **Sequoia 15.8.1** only, Intel i9-14900K, Gigabyte Z790 AORUS PRO X
+(onboard MT7927), OpenCore 1.0.1, a TP-Link Deco mesh (Wi-Fi 7, 2.4/5/6 GHz),
+WPA2/WPA3-Personal.
 
 | Feature | State |
 |---|---|
-| Probe, firmware load, MSI interrupts | ✅ |
-| Scan (2.4 GHz + 5 GHz) | ✅ |
-| WPA2-PSK (CCMP) association, 4-way handshake | ✅ |
-| Hardware RX decryption (software fallback for anything the chip misses) | ✅ |
-| Switching between networks / bands | ✅ |
-| 802.11n (HT20/HT40, MCS 0–15, SGI, RX STBC, WMM) | ✅ |
-| 802.11ac (VHT20/40/80, 2×2 MCS 0–9, RX STBC) | ✅ |
-| A-MPDU: RX Block Ack + TX aggregation | ✅ |
-| Hardware TX A-MSDU (inside A-MPDU), VHT beamformee | ✅ |
-| Auto-join at boot, 5 GHz preferred over 2.4 GHz of the same router | ✅ |
-| AUTH / ASSOC retransmission (lost frames no longer cost a full rescan) | ✅ |
-| Auto-recovery of a wedged chip (DMA stall watchdog, PCIe FLR at attach) | ✅ |
-| Native macOS Wi-Fi menu (IO80211Family / Skywalk), Tahoe | ✅ `AirportMtkWlan` |
-| Native Wi-Fi menu, Sequoia 15.2+ | ⚠️ builds, not tested on hardware with this HAL |
-| 802.11ax (HE) | ❌ not yet |
-| WPA3-only (SAE) networks | ❌ |
-| Sleep / wake (firmware reloaded on wake, reconnects by itself) | ✅ |
-| AirDrop / Handoff / Continuity (AWDL) | ❌ |
+| Firmware load, interrupts, DMA rings (connac3, as Linux `mt7925`) | ✅ |
+| Native Wi-Fi menu, auto-join, Keychain passwords (Sequoia build) | ✅ |
+| 2.4 GHz, 5 GHz and **6 GHz** scan and join | ✅ |
+| Wi-Fi 6 (802.11ax HE) up to **160 MHz**, incl. 6 GHz ("Wi-Fi 6E") | ✅ |
+| WPA2-Personal, **WPA3-Personal (SAE, incl. H2E)**, PMF | ✅ |
+| Hardware CCMP encryption/decryption, Block Ack (256) both ways | ✅ |
+| Join time | ✅ about 1.7 s to a WPA3 6 GHz network |
+| Roaming between mesh APs of one network, Mac-like thresholds (6 GHz −70 dBm / 12 dB better; 2.4/5 GHz −75 dBm / 12 dB) | ✅ |
+| Moving to another AP when the current one disappears | ✅ (hardware-tested once) |
+| Speed (6 GHz, 160 MHz, −70 dBm, 1 Gbit/s line) | ~415 Mbit/s down, ~550 Mbit/s up |
+| macOS Sequoia other than 15.8.1, macOS **Tahoe** | ❓ not tested |
+| Sleep / wake | ❓ not verified with MT7927 |
+| WPA2/WPA3-Enterprise, open/OWE and hidden networks, other routers | ❓ not tested |
+| Regulatory domain / 6 GHz power limits per country | ❓ one regulatory domain only, not reviewed |
+| Wi-Fi 7 (EHT, 320 MHz, MLO) | ❌ connects as Wi-Fi 6 |
+| Bluetooth of the MT7927 | ❌ not handled by this kext |
+| TX A-MSDU | ⚠️ off by default (opt-in, still being tested) |
+| AirDrop / AWDL | ❌ |
 
-### Tested hardware
+Known quirks and open observations on the test machine:
 
-| Card | PCI ID | macOS | Result |
-|---|---|---|---|
-| MediaTek MT7921K (AMD RZ608) | `14c3:0608` | 26.7.1 Tahoe, Intel desktop | `AirportMtkWlan`: native Wi-Fi menu, joins from Keychain, 50+ Mbit/s on 5 GHz VHT80 (weak signal, 100 Mbit/s line) |
-| MediaTek MT7921K (AMD RZ608) | `14c3:0608` | 15.8.1 Sequoia, Intel desktop | `SimpleMtkWlan`: 30–50 Mbit/s on 5 GHz VHT80 (a MacBook in the same spot gets ~85); 2.4 GHz works; joins automatically at boot |
-| MediaTek MT7922 (RZ616) | `14c3:0616` | 15.8.1 Sequoia | native Wi-Fi menu in [pengubow's fork](https://github.com/pengubow/SimpleMtkWlan) (its own HAL) |
-| MediaTek MT7922 | `14c3:7922` | Tahoe (upstream PR #5) | legacy 20 MHz on 5 GHz |
-| MediaTek MT7921 | `14c3:7961` | — | same chip family as RZ608, expected to work |
-
-Other MediaTek devices are not supported.
+* The firmware reports "beacon lost" about 30 s after each join while the link is
+  fine; the driver logs and ignores these reports.
+* The driver logs a lot; that is on purpose while it is young.
+* The test machine had two input/USB freezes while this driver was loaded. One
+  coincided with a display change under the third-party NVIDIA graphics driver; the
+  other (during video playback) is unexplained. Neither has been tied to this
+  driver, but you should know.
+* On the test machine, kernel logging goes quiet about two minutes after each boot
+  (cause unknown; the machine otherwise runs normally).
 
 ## Installation
 
-Use **either** `AirportMT7927Wlan.kext` **or** `SimpleMtkWlan.kext`, never both:
-they match the same card.
+1. **Firmware.** The kext loads the MT7927 firmware from
+   `/Library/Firmware/mediatek/mt7927/`. It comes from
+   [linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/mediatek/mt7927)
+   under the MediaTek licence ([LICENCE.mediatek](LICENCE.mediatek)):
 
-### Native Wi-Fi menu (AirportMtkWlan, Tahoe)
+   | File | SHA-256 |
+   |---|---|
+   | `WIFI_MT6639_PATCH_MCU_2_1_hdr.bin` | `7a5aacf68ed8526c1d94ba962f84046496b3909562decf8bb690cfbd8de5b65e` |
+   | `WIFI_RAM_CODE_MT6639_2_1.bin` | `e841f5ed4fe547ff2f15275a2f330bb19a253db92e3e59cbdfd8581d72b2582d` |
 
-1. Download `AirportMtkWlan-Tahoe-x.y.z-RELEASE.zip` (or `-Sequoia-` for macOS
-   15.2+) from [Releases](https://github.com/flxxxxddd/SimpleMtkWlan/releases).
-2. Copy `AirportMT7927Wlan.kext` to `EFI/OC/Kexts/` and add it to
-   `Kernel → Add` (same entry as below, `BundlePath` `AirportMT7927Wlan.kext`,
-   `ExecutablePath` `Contents/MacOS/AirportMT7927Wlan`). Set `MinKernel`
-   `25.0.0` / `MaxKernel` `25.99.99` for the Tahoe build (`24.2.0` /
-   `24.99.99` for Sequoia): each build only fits that IO80211 version and
-   would panic on the other.
-3. `Kernel → Quirks → DisableIoMapper` = `true` (the driver does not support
-   AppleVTD DMA remapping yet).
-4. **Do not** apply OCLP "Modern Wireless" root patches and **do not** block
-   or replace `IOSkywalkFamily` / inject `IO80211FamilyLegacy`: this kext uses
-   the system's own Wi-Fi stack. Remove such leftovers from Intel/Broadcom
-   guides.
-5. Disable `SimpleMtkWlan.kext` if present and quit / remove the SimpleMTK app.
-6. Make sure the card is not hidden (step 4 below), reboot and pick a network
-   in the Wi-Fi menu.
+   The [install script](tools/install-mt7927-firmware.sh) downloads both, checks
+   these sums and installs them (it is also in the release zip):
 
-`itlwm_he=1` turns on 802.11ax capabilities (experimental, off by default).
+   ```sh
+   sudo ./install-mt7927-firmware.sh          # from the release zip
+   sudo ./tools/install-mt7927-firmware.sh    # from a clone of this branch
+   ```
 
-### SimpleMtkWlan + SimpleMTK app
+   Or copy the two files there by hand (`root:wheel`, mode 644).
 
-1. Download the latest `SimpleMtkWlan-x.y.z-RELEASE.zip` from
-   [Releases](https://github.com/flxxxxddd/SimpleMtkWlan/releases) (or build it yourself, see below).
-2. Copy `SimpleMtkWlan.kext` to `EFI/OC/Kexts/`.
-3. Add it to `config.plist → Kernel → Add`:
+2. **Kext.** Download the release zip (or build it, below), copy
+   `AirportMT7927Wlan.kext` to `EFI/OC/Kexts/` and add it to `Kernel → Add`:
 
    ```xml
    <dict>
        <key>Arch</key>           <string>x86_64</string>
-       <key>BundlePath</key>     <string>SimpleMtkWlan.kext</string>
-       <key>Comment</key>        <string>MediaTek Wi-Fi</string>
+       <key>BundlePath</key>     <string>AirportMT7927Wlan.kext</string>
+       <key>Comment</key>        <string>MT7927 Wi-Fi</string>
        <key>Enabled</key>        <true/>
-       <key>ExecutablePath</key> <string>Contents/MacOS/SimpleMtkWlan</string>
-       <key>MaxKernel</key>      <string></string>
-       <key>MinKernel</key>      <string></string>
+       <key>ExecutablePath</key> <string>Contents/MacOS/AirportMT7927Wlan</string>
+       <key>MaxKernel</key>      <string>24.99.99</string>
+       <key>MinKernel</key>      <string>24.2.0</string>
        <key>PlistPath</key>      <string>Contents/Info.plist</string>
    </dict>
    ```
 
-4. **Make sure the card is not hidden.** Many prebuilt EFIs ship an SSDT
-   (e.g. `SSDT-Disable_Network_*.aml`) that replaces the card's `vendor-id` /
-   `device-id` with `0xFFFF` so macOS ignores it. Disable it, otherwise the
-   driver never matches. `ioreg -l | grep -A40 'pci14c3'` should show
-   `vendor-id = <c3140000>`.
-5. Install [SimpleMTK](https://github.com/laobamac/SimpleMTKClient), reboot and
-   join a network from the menu bar.
+   This is the Sequoia build: it only fits Sequoia's IO80211 (kernel 24.x). The
+   range admits 15.2 and later, but only 15.8.1 has been run.
 
-Optional boot-args: `-novht`, `-noht40`, `-mtknoamsdu` (no TX A-MSDU).
+   The kext also matches MT7921 / MT7922 cards (upstream code, untested on this
+   branch), so it **replaces** upstream's AirportMtkWlan / AirportMT7927Wlan rather
+   than sitting beside it; never load it together with `SimpleMtkWlan.kext`.
 
-## Troubleshooting
+3. `Kernel → Quirks → DisableIoMapper` = `true`. (The driver does not support
+   AppleVTD DMA remapping yet, so setups that need AppleVTD cannot use it.)
 
-* **Read the driver log.** The driver keeps a persistent ring buffer that
-  survives a failed start and is readable without root:
+4. Remove other Wi-Fi workarounds: no OCLP "Modern Wireless" root patch, no
+   `IOSkywalkFamily` block, no `IO80211FamilyLegacy`, no AirportItlwm. No boot-args
+   are needed.
 
-  ```sh
-  ./tools/mtklog.sh > mtk.txt
-  ```
+5. Reboot and pick a network in the Wi-Fi menu.
 
-  A periodic `stats` line shows RX counters, hardware vs software decryption
-  (`rx_hwdec` / `rx_swdec`) and the reasons frames are dropped. Both kexts
-  write the same log.
-* **No Wi-Fi in the menu with AirportMtkWlan.** Check that only one of the
-  two kexts is enabled, that no OCLP wireless patch / `IOSkywalkFamily` block
-  is active, that `DisableIoMapper` is on and that the build matches your
-  macOS (Tahoe vs Sequoia). `ioreg -l -w0 | grep IO80211InterfaceRole` should
-  print `Infrastructure`.
-* **"SimpleMtkWlan is not running" after a reboot.** A warm reboot does not
-  power-cycle an M.2 card. The driver now recovers the chip automatically
-  (WFSYS reset, then PCIe function-level reset); if it still fails, shut the
-  machine down completely and power it on again.
-* **Slow speed.** Check `rx_swdec` in the stats line: it should stay small
-  compared to `rx_hwdec`. Speed tests are only meaningful with the SimpleMTK
-  menu closed (the client triggers scans; they are throttled to one per two
-  minutes while connected).
-* **A 2.4 GHz wireless mouse/keyboard stutters while Wi-Fi is on 2.4 GHz.**
-  That is RF coexistence in the same band, not a driver bug: keep the card on
-  5 GHz (leave only the 5 GHz network in SimpleMTK) or move the dongle away
-  from the antennas with a USB extension.
-* **Slow to connect after boot.** The network is chosen by the SimpleMTK app,
-  which only starts after login; the driver scans until then.
-* **Throughput below a real Mac.** On weak signal the AP mostly sends VHT
-  MCS 3–4 (see the `rxrate` line). Block Ack Request frames are not delivered
-  by the firmware, so the rare reorder gaps close by a 100 ms timeout
-  (`ba gap_timeout`).
-* Unrelated kernel panics (`element modified after free` at ~2 s of uptime)
-  were caused by `NVMeFix.kext` on the test machine, not by this driver.
+**Going back:** disable the `Kernel → Add` entry, or boot once with the boot-arg
+`-mtk7927off`, which makes the kext leave the MT7927 alone.
 
 ## Building
 
-Requirements: macOS with Xcode (command line tools are not enough). The kernel
-headers come from [acidanthera/MacKernelSDK](https://github.com/acidanthera/MacKernelSDK),
-which is a git submodule.
-
 ```sh
-git clone --recurse-submodules https://github.com/flxxxxddd/SimpleMtkWlan.git
-cd SimpleMtkWlan
-xcodebuild -project SimpleMtkWlan.xcodeproj -scheme SimpleMtkWlan \
-  -configuration Release -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
-# -> build/Build/Products/Release/SimpleMtkWlan.kext
+git submodule update --init
+AIRPORT_OS=sequoia ./build-macos.sh Release AirportMtkWlan
+# -> build/Release/sequoia/AirportMT7927Wlan.kext
+kmutil libraries -p build/Release/sequoia/AirportMT7927Wlan.kext --undef-symbols
 ```
 
-Already cloned without submodules? `git submodule update --init`.
+Host-side unit tests (no Mac needed): `sh tests/run-all.sh`.
 
-> **Do a clean build (`rm -rf build`) after editing headers in `mtk80211/` or
-> `include/`.** They are on the system header search path, which Xcode does
-> not track for dependencies, so stale objects would otherwise be linked.
+## Logs
 
-The native Wi-Fi kext is built with a script (not part of the Xcode project):
+The driver keeps a ring buffer readable without root:
 
 ```sh
-./build-macos.sh Release AirportMtkWlan                        # Tahoe (default)
-AIRPORT_OS=sequoia ./build-macos.sh Release AirportMtkWlan     # Sequoia 15.2+
-# -> build/Release/{tahoe,sequoia}/AirportMT7927Wlan.kext
+./tools/mtklog.sh > mtk.txt
 ```
 
-Host tests (extract real driver functions and run them against stubs with
-ASan/UBSan):
+Lines from the MT7927 engine start with `MT7927`; the Wi-Fi front end's with `WCL`.
 
-```sh
-./tests/run-all.sh
-```
+## Where the code is
 
-CI builds Debug and Release on every push and pull request; pushing a tag
-`vX.Y.Z` publishes a GitHub release with the zipped kexts.
+* `SimpleMtkWlan/hal_mwx/MtkMwx.cpp`: the MT7927 engine (bring-up, firmware,
+  MCU commands, RX/TX, scan, join, link watchdog), following Linux `mt7925`/`mt76`.
+* `AirportMtkWlan/WCL/`: the macOS Wi-Fi (IO80211 WCL) front end: scans, joins,
+  WPA3, roaming.
+* `mtk80211/openbsd/net80211/`: the 802.11 stack (SAE, 6 GHz, HE additions).
+* `tests/`: host-side tests for all of the above.
 
-## Repository layout
+## About this fork
 
-| Path | Contents |
-|---|---|
-| `SimpleMtkWlan/SimpleMtkWlan.cpp` | IOEthernetController front end (SimpleMtkWlan.kext), watchdog |
-| `AirportMtkWlan/` | IO80211 / Skywalk front end (AirportMT7927Wlan.kext), from AirportItlwm (WCL) |
-| `include/Airport/` | IO80211Family / Skywalk headers (`macOS15`, `macOS26` ABI sets) |
-| `SimpleMtkWlan/MtkLog.cpp` | persistent debug log shared by both kexts |
-| `build-macos.sh` | builds AirportMtkWlan (and SimpleMtkWlan) without Xcode project changes |
-| `SimpleMtkWlan/MtkWlanUserClient.cpp` | IOUserClient used by the SimpleMTK app |
-| `SimpleMtkWlan/hal_mwx/` | MT7921/MT7922 hardware layer (port of OpenBSD `mwx`) |
-| `mtk80211/` | `net80211` and BSD/Linux compatibility layer |
-| `include/` | HAL interfaces, embedded firmware (`FwBinary.cpp`), client API |
-| `tests/` | host tests |
-| `tools/mtklog.sh` | dumps the driver log |
-| `MacKernelSDK/` | submodule with kernel headers |
-
-## What changed in this fork
-
-On top of upstream and [PR #5](https://github.com/laobamac/SimpleMtkWlan/pull/5)
-(association context, TX serialization, packet ownership):
-
-* **Firmware load:** firmware chunks no longer need 16 KB jumbo mbuf clusters
-  (they were unavailable at boot → `ENOMEM`, no MAC address, no interface).
-* **Interrupts:** register the real MSI vector instead of INTx and stop setting
-  the MSI enable bit by hand (the device stopped raising INTx and only got
-  serviced through a shared line); drain pending status before re-enabling.
-* **TX DMA stall:** multi-mbuf frames are linearized into one cluster; the
-  WFDMA stalled forever on the first DHCP frame.
-* **Group traffic:** the chip does not decrypt group-addressed frames, so
-  broadcast ARP/DHCP was dropped. Keys are now also set up for `net80211`
-  software CCMP as a fallback.
-* **Network switching:** send the deauth to the old AP on its channel before
-  switching, ignore stale disassoc frames while authenticating, and remove the
-  peer station / disable the BSS in firmware when leaving (otherwise hardware
-  decryption stopped after the first switch).
-* **Roaming:** RSSI-triggered background roaming is disabled (it hopped between
-  2.4 and 5 GHz networks of the same router every few seconds).
-* **Throughput:** background scans while associated are throttled.
-* **802.11n:** HT capabilities, WMM, full peer STA record on association, RX
-  Block Ack and TX A-MPDU sessions passed to the firmware. HT 20/40 is
-  advertised (APs only send 80 MHz to clients that claim 40 MHz support).
-* **802.11ac:** VHT capabilities, STA_REC_VHT, operating width (20/40/80 MHz)
-  taken from the association, RX STBC; per-interval RX rate histogram in the
-  debug log.
-* **Joining:** 5 GHz preferred when within 15 RSSI points of 2.4 GHz, stale
-  peer records and stale scan results cleaned up, deauth before the first
-  AUTH and on stop, AUTH/ASSOC retransmitted up to 3 times (one lost
-  association response used to cost ~20 s).
-* **Robustness:** DMA stall watchdog with hard reset + firmware reload, chip
-  recovery at attach (WFSYS reset → PCIe FLR), TXWI leak fix.
-* **Debuggability:** persistent `MtkDebugLog` ring buffer published on the PCI
-  device, periodic hardware/stats dump, quiet logging on the data path.
-* **Native Wi-Fi menu (AirportMtkWlan):** laobamac's AirportItlwm Tahoe/Sequoia
-  (WCL) front end, as adapted to the MediaTek HAL by pengubow, on top of this
-  fork's MT7921 hardware layer. Changes for this card: Tahoe ABI build, the
-  front end's watchdog drives the HAL housekeeping (stall recovery,
-  AUTH/ASSOC retransmit), no manual MSI enable, shared persistent log, link
-  rate from the measured RX rate, and short scans macOS asks for allowed while
-  connected (full sweeps stay throttled).
-* **TX path:** data frames go to the hardware queue of their access
-  category (everything was on VO), no per-frame TX status events, Block Ack
-  disabled for TIDs without an agreement, output pauses when the TX ring is
-  full instead of dropping packets, hardware A-MSDU inside A-MPDU when the AP
-  allows it. VHT SU/MU beamformee and HT LDPC are advertised (Linux defaults).
-* **Sleep / wake:** the card is powered off in S3. On sleep the driver leaves
-  the network and masks interrupts; on wake it takes the chip back (WFSYS
-  reset / PCIe FLR if needed) and reloads the firmware. Before, the first
-  interrupt after wake read a stale DMA ring and panicked.
-* **Build:** builds from a clean clone (MacKernelSDK submodule, no absolute
-  paths), host tests fixed, CI + releases.
-
-## License
-
-GPLv2, see [LICENSE](LICENSE). Some files carry additional or more specific
-notices inherited from upstream GPL/BSD/OpenBSD/NetBSD/FreeBSD components;
-those apply to their respective files. Firmware is redistributed under the
-MediaTek firmware license (as in linux-firmware), see [LICENCE.mediatek](LICENCE.mediatek).
+This is a fork of [flxxxxddd/SimpleMtkWlan](https://github.com/flxxxxddd/SimpleMtkWlan),
+a driver for MediaTek **MT7921 / MT7922** cards. This branch adds the MT7927 and is
+only tested with the MT7927. The MT7921/MT7922 code from upstream is still in
+the tree and the kext still matches those cards, but it has **not been tested on
+this branch**: if you have one of those cards, use
+[upstream's releases](https://github.com/flxxxxddd/SimpleMtkWlan/releases).
+Upstream's README is kept in [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md),
+and [CREDITS.md](CREDITS.md) lists everyone whose work this builds on.
 
 ## Credits
 
-* [laobamac (王孝慈)](https://github.com/laobamac) — SimpleMtkWlan and SimpleMTK
-* [mavizao](https://github.com/mavizao) — PR #5 (MT7922 association/TX fixes, host tests)
-* [pengubow](https://github.com/pengubow/SimpleMtkWlan) — AirportMtkWlan: AirportItlwm's native Wi-Fi front end on the MediaTek HAL (WCL scan/join hooks, private address, Infrastructure role fix, passphrase joins, command-gate sleep)
-* [laobamac/itlwm](https://github.com/laobamac/itlwm) — AirportItlwm for Sequoia/Tahoe (WCL layer, macOS 15/26 IO80211 headers, TX pull model, link quality)
-* OpenBSD `mwx(4)` driver authors
-* [OpenIntelWireless/itlwm](https://github.com/OpenIntelWireless/itlwm) (zxystd) — net80211 port, driver architecture and the original AirportItlwm
-* Linux [mt76](https://github.com/openwrt/mt76) — hardware reference
-* [acidanthera](https://github.com/acidanthera) — MacKernelSDK
-
-Related: [SimpleMtkBtFw](https://github.com/flxxxxddd/SimpleMtkBtFw) — Bluetooth for MT7921 / RZ608 / MT7922.
-
-See also [CREDITS.md](CREDITS.md).
+Built on SimpleMtkWlan by laobamac, flxxxxddd, pengubow and contributors (OpenBSD `mwx(4)`,
+itlwm/AirportItlwm), with the Linux `mt76`/`mt7925` driver as the reference.
+MT7927 port by [@Wado729](https://github.com/Wado729), developed with Claude
+(Anthropic). Licence: GPL-2.0, as the rest of the project; the firmware is
+MediaTek's, under its own licence.
