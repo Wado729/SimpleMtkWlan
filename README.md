@@ -35,7 +35,13 @@ hardware layer:
 > (VHT80) and the native Wi-Fi menu on Tahoe. See
 > [What changed in this fork](#what-changed-in-this-fork).
 
-## Status
+> **MediaTek MT7927 (Wi-Fi 7 card, `14c3:7927`):** this branch adds it to
+> `AirportMT7927Wlan.kext` on **macOS Sequoia**: native Wi-Fi menu, 2.4/5/6 GHz,
+> Wi-Fi 6/6E up to 160 MHz, WPA3, roaming between mesh APs. Tested on one machine
+> with one router; see **[docs/MT7927.md](docs/MT7927.md)** for status, firmware
+> and installation.
+
+## Status (MT7921 / MT7922)
 
 | Feature | State |
 |---|---|
@@ -280,7 +286,7 @@ On top of upstream and [PR #5](https://github.com/laobamac/SimpleMtkWlan/pull/5)
 GPLv2, see [LICENSE](LICENSE). Some files carry additional or more specific
 notices inherited from upstream GPL/BSD/OpenBSD/NetBSD/FreeBSD components;
 those apply to their respective files. Firmware is redistributed under the
-MediaTek firmware license (as in linux-firmware).
+MediaTek firmware license (as in linux-firmware), see [LICENCE.mediatek](LICENCE.mediatek).
 
 ## Credits
 
